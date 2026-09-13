@@ -564,7 +564,7 @@ def test_billing_intl_split():
 
 
 def test_current_models_intl_condition():
-    """默认视图合并有额度的国际来源；显式地域内部过滤仍相互隔离。"""
+    """默认视图合并国际来源；余额不参与发布，能力过滤与显式地域过滤仍相互隔离。"""
     import converter
     with tempfile.TemporaryDirectory() as td, patch.dict(converter.CONFIG, {
             "cred_pool": None, "cred": None, "model_catalogs": {}, "ledger": None,
@@ -573,13 +573,13 @@ def test_current_models_intl_condition():
             "models_intl": [{"id": "gpt-5.5", "supportsToolCall": True},
                             {"id": "img-1", "supportsToolCall": False}]}):
         assert converter.current_models("cn") == ["glm-5.3", "auto"]
-        assert converter.current_models("intl") == []  # 无可信国际余额
-        assert set(converter.current_models()) == {"glm-5.3", "auto"}
+        assert converter.current_models("intl") == ["gpt-5.5"]  # 余额不参与发布，能力过滤生效
+        assert set(converter.current_models()) == {"glm-5.3", "gpt-5.5", "auto"}
         led = credits.CreditLedger(Path(td) / "l.json")
         led.update_credits("ai", {"credits": 0.0, "segments": [], "intl": True})
         converter.CONFIG["ledger"] = led
-        assert converter.current_models("intl") == []  # 国际额度为 0
-        assert set(converter.current_models()) == {"glm-5.3", "auto"}
+        assert converter.current_models("intl") == ["gpt-5.5"]  # 国际额度为 0 仍发布
+        assert set(converter.current_models()) == {"glm-5.3", "gpt-5.5", "auto"}
         led.update_credits("ai", {"credits": 120.0, "segments": [
             {"remaining": 120.0, "total": 120.0, "expires_at": None}], "intl": True})
         assert converter.current_models("intl") == ["gpt-5.5"]

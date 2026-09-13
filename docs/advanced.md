@@ -87,8 +87,8 @@ Credential domain / token issuer determine the product identity. Chat and refres
 | `intl-work` | `https://www.workbuddy.ai` |
 
 - By default, accounts are selected only for models supported by their own trusted catalog; catalogs and balances are never borrowed across accounts. Concrete zero-multiplier models take priority, followed by expiring-credit priority, cooldowns and session stickiness.
-- Zero-balance accounts leave paid-model rotation but can still serve concrete zero-multiplier models declared by their own catalog; they rejoin once balance recovers. International paid models need a known positive balance, with an exception for concrete zero-multiplier models.
-- `auto` schedules an account's default, not any model. International accounts need positive balance and `default-model` in their catalog; domestic WorkBuddy must declare `auto`, and domestic CLI needs a known nonempty usable catalog. `auto` does not receive the concrete zero-multiplier balance exemption.
+- Credit balance and multipliers are display- and ordering-only: zero or unknown balances never restrict which catalog-declared models an account can serve.
+- `auto` schedules an account's default, not any model. International accounts need `default-model` in their catalog; domestic WorkBuddy must declare `auto`, and domestic CLI needs a known nonempty usable catalog.
 - WebUI region, product and credential bindings strictly limit candidates; unavailable bindings never fall back to unselected accounts. Disabled models also reject direct requests. Renaming hides the original ID unless you choose to retain it.
 - Sent requests are not replayed against another account because of account availability or HTTP errors; later requests select again. Pending catalog/credential readiness usually returns 503 with `Retry-After`; unsupported or disabled models return 404.
 

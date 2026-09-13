@@ -139,8 +139,6 @@ class Management:
                                      for item in self.gateway._usable_models(models)) and not (
                                          source == "auto" and profile == "cn-cli" and self.gateway._usable_models(models)):
                             reason = "账号自身目录不支持模型"
-                    if reason is None and not (pool._has_credit(entry, profile) or pool._model_free(entry, source)):
-                        reason = "额度不足或未知"
                 item = {"id": identity, "name": Path(entry["id"]).name, "profile": profile}
                 if reason:
                     rejected.append({**item, "reason": reason})

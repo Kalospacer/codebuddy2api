@@ -369,21 +369,23 @@ class RegionRoutingTests(unittest.TestCase):
                 self.post_ok(endpoint, self.payload(endpoint), expected)
                 self.post_rejected(endpoint, self.payload(endpoint, absent + "-cli-only"))
 
-    def test_intl_requires_known_positive_balance_not_domestic_fallback(self):
+    def test_intl_routes_without_known_positive_balance(self):
         for balance in (None, 0, -1):
             with self.subTest(balance=balance):
                 self.configure(balances={"intl-cli": balance, "intl-work": balance})
                 for endpoint in GENERATIONS:
-                    self.post_rejected(endpoint, self.payload(endpoint, "intl-cli-only"))
-                    self.post_ok(endpoint, self.payload(endpoint), {"cn-cli", "cn-work"})
+                    self.post_ok(endpoint, self.payload(endpoint, "intl-cli-only"), {"intl-cli"})
+                    self.post_ok(endpoint, self.payload(endpoint), set(PROFILES))
 
-    def test_unknown_or_zero_balance_is_not_a_rotation_candidate(self):
+    def test_unknown_or_zero_balance_still_rotates(self):
         for unavailable in PROFILES:
             for balance in ((None, 0) if unavailable.startswith("intl-") else (0,)):
                 self.configure(balances={unavailable: balance})
-                expected = set(PROFILES) - {unavailable}
+                seen = set()
                 for _ in range(6):
-                    self.post_ok("chat/completions", self.payload(), expected)
+                    request, _ = self.post_ok("chat/completions", self.payload(), set(PROFILES))
+                    seen.add(request.headers["x-user-id"])
+                self.assertIn(unavailable, seen)
 
     def test_unknown_or_empty_catalog_never_borrows_other_profile_models(self):
         for unavailable in PROFILES:
@@ -514,24 +516,19 @@ class RegionRoutingTests(unittest.TestCase):
             self.assertGreaterEqual(response.json()["input_tokens"], 0)
         self.assertFalse(self.requests)
 
-    def test_models_does_not_publish_missing_or_unfunded_product_catalog(self):
-        for profiles, balances, eligible in (
-                (("cn-cli", "cn-work", "intl-cli"), {}, ("cn-cli", "cn-work", "intl-cli")),
-                (PROFILES, {"intl-cli": None, "intl-work": 0}, ("cn-cli", "cn-work")),
-                (("intl-cli", "intl-work"), {"intl-cli": None, "intl-work": 0}, ())):
+    def test_models_publishes_configured_product_catalogs_regardless_of_balance(self):
+        for profiles, balances in (
+                (("cn-cli", "cn-work", "intl-cli"), {}),
+                (PROFILES, {"intl-cli": None, "intl-work": 0}),
+                (("intl-cli", "intl-work"), {"intl-cli": None, "intl-work": 0})):
             self.configure(profiles=profiles, balances=balances)
             response = self.client.get("/v1/models")
-            self.assertIn(response.status_code, (200, 503), response.text)
-            if eligible:
-                self.assertEqual(response.status_code, 200, response.text)
-            if response.status_code == 200:
-                expected = {m["id"] for profile in eligible for m in catalogs()[profile]}
-                self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
-                if not eligible:
-                    self.assertEqual(response.json()["data"], [])
+            self.assertEqual(response.status_code, 200, response.text)
+            expected = {m["id"] for profile in profiles for m in catalogs()[profile]}
+            self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
         self.assertFalse(self.requests)
 
-    def test_same_profile_accounts_cannot_borrow_catalog_or_balance(self):
+    def test_same_profile_accounts_cannot_borrow_catalogs(self):
         second = "intl-cli-second"
         self.add_account(second, "intl-cli")
         for balance in (None, 0, 100):
@@ -539,19 +536,15 @@ class RegionRoutingTests(unittest.TestCase):
                 with self.subTest(balance=balance, catalog=missing):
                     self.configure(profiles=("intl-cli", second), balances={"intl-cli": balance})
                     self.account_catalogs({"intl-cli": [model("first-only")], second: missing})
-                    if balance == 100:
-                        self.post_ok("chat/completions", self.payload(selected_model="first-only"), {"intl-cli"})
-                    else:
-                        self.post_rejected("chat/completions", self.payload(selected_model="first-only"))
+                    self.post_ok("chat/completions", self.payload(selected_model="first-only"), {"intl-cli"})
                     if missing:
                         self.post_ok("chat/completions", self.payload(selected_model="second-only"), {second})
                     else:
                         self.post_rejected("chat/completions", self.payload(selected_model="second-only"))
                     response = self.client.get("/v1/models")
-                    self.assertIn(response.status_code, (200, 503), response.text)
-                    if response.status_code == 200:
-                        expected = ({"first-only"} if balance == 100 else set()) | ({"second-only"} if missing else set())
-                        self.assertEqual({m["id"] for m in response.json()["data"]}, expected)
+                    self.assertEqual(response.status_code, 200, response.text)
+                    expected = {"first-only"} | ({"second-only"} if missing else set())
+                    self.assertEqual({m["id"] for m in response.json()["data"]}, expected)
 
     def test_auto_maps_to_each_accounts_declared_default_and_rotates(self):
         tables = catalogs()

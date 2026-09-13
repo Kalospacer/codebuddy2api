@@ -643,27 +643,6 @@ class CredentialPool:
         profile = cls._entry_profile(entry)
         return profile_site(profile) if profile else None
 
-    def _zero_balance(self, entry, profile) -> bool:
-        """该账号已确认余额为 0：只能使用目录声明的零倍率模型。"""
-        balance = (self._ledger.entry(entry["id"]).get("credits") or {}) if self._ledger else {}
-        if not balance:
-            return False
-        try:
-            return (bool(balance.get("intl")) == (profile_region(profile) == "intl")
-                    and float(balance.get("credits") or 0) <= 0)
-        except (TypeError, ValueError):
-            return False
-
-    def _has_credit(self, entry, profile):
-        balance = (self._ledger.entry(entry["id"]).get("credits") or {}) if self._ledger else {}
-        if not balance:
-            return profile_region(profile) == "cn"
-        try:
-            return (bool(balance.get("intl")) == (profile_region(profile) == "intl")
-                    and float(balance.get("credits") or 0) > 0)
-        except (TypeError, ValueError):
-            return False
-
     def _eligible(self, entry, model, *, region=None, profile=None):
         if not model_policy.route_allowed(CONFIG, entry, model):
             return False
@@ -696,9 +675,7 @@ class CredentialPool:
                            and len(configured) == 1)
             if model and not (supported or cli_auto or passthrough):
                 return False
-        # 零余额账号退出付费模型轮询，只保留自身目录声明为 x0.00 的模型。
-        return (not model or self._has_credit(entry, profile)
-                or self._model_free(entry, model, profile=profile))
+        return True
 
     def _model_free(self, entry, model: str | None, *, profile=None) -> bool:
         """该凭证的账号目录是否把此模型声明为零计费（x0.00）。"""
@@ -1757,19 +1734,6 @@ def _catalog_pending(region: str | None = None) -> bool:
     return not any(_catalog_for(profile) is not None for profile in _configured_profiles(region))
 
 
-def _profile_has_credits(profile: str) -> bool:
-    pool = CONFIG.get("cred_pool")
-    if pool is None:
-        if profile_region(profile) == "cn":
-            return True
-        ledger = CONFIG.get("ledger")
-        return bool(ledger and any((entry.get("credits") or {}).get("intl")
-                                   and float((entry.get("credits") or {}).get("credits") or 0) > 0
-                                   for entry in ledger.snapshot().values()))
-    return any(pool._entry_profile(entry) == profile and pool._has_credit(entry, profile)
-               for entry in pool.entries() if model_policy.credential_enabled(CONFIG, entry))
-
-
 def current_models(region: str | None = None) -> list[str]:
     """合并账号可用的模型；客户端不用按地域改变请求地址。"""
     pool = CONFIG.get("cred_pool")
@@ -1787,31 +1751,18 @@ def current_models(region: str | None = None) -> list[str]:
                 profile = entry.get("profile")
                 if not profile or not _in_region(profile, region):
                     continue
-                # 零余额账号退出付费模型：不发布付费项，仅保留自身声明的零倍率模型。
-                zero = pool._zero_balance(entry, profile)
-                if not zero and not pool._has_credit(entry, profile):
-                    continue
                 account = accounts.get(entry.get("account_key")) or {}
                 if account.get("profile") != profile:
                     continue
                 models = _usable_models(account.get("models"))
-                if zero:
-                    models = [model for model in models if _free_multiplier(model.get("credits"))]
                 out.extend(model["id"] for model in models)
                 if profile in auto_profiles and models:
                     has_auto |= profile == "cn-cli" or any(model["id"] == _upstream_model("auto", profile) for model in models)
         else:
             for profile in sorted(configured):
-                entries = ([entry for entry in pool.entries() if pool._entry_profile(entry) == profile]
-                           if pool is not None else [])
-                # 该产品全部账号余额归零时，只发布自身目录声明的零倍率模型。
-                zero_only = bool(entries) and all(pool._zero_balance(entry, profile) for entry in entries)
-                if _profile_has_credits(profile) or zero_only:
-                    models = _models_for_profile(profile, configured)
-                    if zero_only:
-                        models = [model for model in models if _free_multiplier(model.get("credits"))]
-                    out.extend(model["id"] for model in models)
-                    has_auto |= bool(models) and profile in auto_profiles
+                models = _models_for_profile(profile, configured)
+                out.extend(model["id"] for model in models)
+                has_auto |= bool(models) and profile in auto_profiles
         if has_auto:
             out.append("auto")
         return list(dict.fromkeys(out))
@@ -1828,12 +1779,10 @@ def current_model_details(region: str | None = None) -> list[dict]:
     if pool is None:
         return list(details.values())
     with pool._lock:
-        def record(profile: str, item: dict, *, zero: bool) -> None:
+        def record(profile: str, item: dict) -> None:
             name = item.get("id")
             if name not in details:
                 return
-            if zero and not _free_multiplier(item.get("credits")):
-                return  # 零余额账号不参与付费模型的倍率展示
             value = _multiplier_value(item.get("credits"))
             if value is None:
                 return
@@ -1849,23 +1798,16 @@ def current_model_details(region: str | None = None) -> list[dict]:
                 profile = entry.get("profile")
                 if not profile or not _in_region(profile, region):
                     continue
-                zero = pool._zero_balance(entry, profile)
-                if not zero and not pool._has_credit(entry, profile):
-                    continue
                 account = accounts.get(entry.get("account_key")) or {}
                 if account.get("profile") != profile:
                     continue
                 for item in _usable_models(account.get("models")):
-                    record(profile, item, zero=zero)
+                    record(profile, item)
         else:
             configured = _configured_profiles(region)
             for profile in sorted(configured):
-                entries = [entry for entry in pool.entries() if pool._entry_profile(entry) == profile]
-                zero_only = bool(entries) and all(pool._zero_balance(entry, profile) for entry in entries)
-                if not (_profile_has_credits(profile) or zero_only):
-                    continue
                 for item in _models_for_profile(profile, configured):
-                    record(profile, item, zero=zero_only)
+                    record(profile, item)
     return list(details.values())
 
 
