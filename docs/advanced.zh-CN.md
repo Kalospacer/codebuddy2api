@@ -17,6 +17,7 @@ Compose 会显式传入部分环境变量及 CLI 参数，删除 `.env` 中的�
 | `--auth-file` | 扫描 `auth/` | 指定凭据文件，可重复传入；不再扫描其他文件 |
 | `--log` | 无 | 额外文本日志，50 MiB 轮转、保留 2 份；不影响默认 SQLite 审计 |
 | `--desensitize` | 关 | 适配固定 CLI 模板、压缩运行时提示、零宽脱敏关键词 |
+| `--tool-stream` / `CODEBUDDY2API_TOOL_STREAM` | `passthrough` | 带 tools 的流式请求：`passthrough` 逐帧直出；`aggregate` 聚合整条流并校验工具调用（损坏时重试）后整体返回 |
 | `--no-compact` | 关 | 配合脱敏保留主要行为指令，仍适配模板及裁剪元数据；不关闭 Responses 投影 |
 | `--skip-check` | 关 | 跳过启动预检 |
 | `--credit-price-cny` | `0.014` | 国内积分折算单价，元/Credit |

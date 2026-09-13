@@ -124,6 +124,17 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["outcome"], "cancelled")
         self.assertEqual(self.store.dashboard()["summary"]["cancelled"], 1)
 
+    async def test_disconnect_after_full_body_is_success(self):
+        async def receive():
+            return {"type": "http.disconnect"}
+        async def app(scope, receive, send):
+            observe_route("late-close-model", None, None, None)
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"data: [DONE]\n\n"})
+            await receive()  # client closes right after consuming the response
+        await self.invoke(app, receiver=receive)
+        self.assertEqual(self.only_record()["outcome"], "success")
+
     async def test_disconnect_and_failed_send_are_cancelled(self):
         async def receive():
             return {"type": "http.disconnect"}

@@ -17,6 +17,7 @@ Compose explicitly passes some environment variables and CLI flags, so deleting 
 | `--auth-file` | scan `auth/` | Explicit credential file, repeatable; disables scanning other files |
 | `--log` | none | Additional text logs, 50 MiB rotation and 2 backups; SQLite auditing remains enabled |
 | `--desensitize` | off | Adapt fixed CLI templates, compact runtime prompts and mask keywords with zero-width characters |
+| `--tool-stream` / `CODEBUDDY2API_TOOL_STREAM` | `passthrough` | Streaming requests that carry tools: `passthrough` forwards SSE frames as they arrive; `aggregate` buffers the whole stream, validates tool calls (retrying damaged ones) and returns them at once |
 | `--no-compact` | off | With desensitization, retain fuller instructions while adapting templates and pruning metadata; does not disable Responses projection |
 | `--skip-check` | off | Skip startup preflight |
 | `--credit-price-cny` | `0.014` | Domestic CNY per credit for billing conversion |

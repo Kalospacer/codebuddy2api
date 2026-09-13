@@ -1168,7 +1168,8 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "max_request_bytes": 32 * 1024 * 1024, "log_body_limit": 65536,
                 "usage_daily": None,     # 官方用量明细（日期×模型 credit），供 billing/usage 出 daily_costs
                 "credit_price_cny": None, "credit_price_usd": None, "usd_rate": None,
-                "desensitize": False, "no_compact": False}  # 单价 None=取 credits 模块默认
+                "desensitize": False, "no_compact": False,  # 单价 None=取 credits 模块默认
+                "tool_stream_passthrough": True}
 
 # 无感登录状态机（内存态；重启后未完成的登录需重新发起）
 _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
@@ -2277,7 +2278,9 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
 async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
     try:
-        async for line in _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, aggregate=bool(body.get("tools"))):
+        async for line in _chat_sse_lines(url, headers, body, model_name, t0, rid, cred,
+                                          aggregate=bool(body.get("tools"))
+                                          and not CONFIG.get("tool_stream_passthrough")):
             yield (_public_sse_line(line, model_name) + "\n").encode("utf-8")
     except (httpx.HTTPError, UpstreamResponseError) as error:
         status, raw = _upstream_failure(error, model_name, t0, rid)
@@ -2635,6 +2638,10 @@ def main():
     ap.add_argument("--auto-trial", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_AUTO_TRIAL", "false"),
                     help="自动领取国际 WorkBuddy 一次性体验积分，默认关闭")
+    ap.add_argument("--tool-stream", choices=("passthrough", "aggregate"),
+                    default=os.environ.get("CODEBUDDY2API_TOOL_STREAM", "passthrough"),
+                    help="带 tools 的流式请求：passthrough 逐帧直出（默认）；"
+                         "aggregate 聚合校验工具调用（损坏时重试）后整体返回")
     args = ap.parse_args()
     if args.image_policy not in ("truncate", "error"):
         ap.error("CODEBUDDY2API_IMAGE_POLICY 必须为 truncate 或 error")
@@ -2646,6 +2653,7 @@ def main():
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
     CONFIG["no_compact"] = args.no_compact
+    CONFIG["tool_stream_passthrough"] = args.tool_stream == "passthrough"
     CONFIG["credit_price_cny"] = args.credit_price_cny or None
     CONFIG["usd_rate"] = args.usd_rate or None
     CONFIG["credit_price_usd"] = args.credit_price_usd or None

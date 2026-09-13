@@ -348,7 +348,9 @@ class AuditMiddleware:
                     observation.fail("incomplete_response")
                 if observation.streaming and not observation.terminal and not cancelled and not observation.failed:
                     observation.fail("incomplete_stream")
-                outcome = "cancelled" if cancelled else (
+                # A client that closes the connection right after consuming the full
+                # body still delivered everything: that is success, not cancellation.
+                outcome = "cancelled" if (cancelled and not observation.body_finished) else (
                     "error" if observation.failed or not observation.status or observation.status >= 400 else "success")
                 observation.record.update(status_code=observation.status, outcome=outcome,
                                           streaming=observation.streaming,
