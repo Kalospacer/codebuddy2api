@@ -28,7 +28,7 @@ OAUTH_TIMEOUT_S = 600          # 授权等待超时秒数
 RESULT_RETENTION_S = 300       # 完成状态保留，供调用方重复轮询取结果
 REQUEST_TIMEOUT_S = 15.0
 
-# 各站点无感登录 apiHost（与 auth.domain 一致；签到/积分也打各自域名，不互用）
+# 各站点无感登录 apiHost（与 auth.domain 一致；积分也打各自域名，不互用）
 SITE_HOSTS = {
     "cn": "https://www.codebuddy.cn",
     "intl": "https://www.workbuddy.ai",

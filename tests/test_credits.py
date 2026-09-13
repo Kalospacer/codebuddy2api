@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""test_credits.py — 验证 credits.py 的签到判定/域名选择/积分分段/ledger 与快过期优先调度。
+"""test_credits.py — 验证 credits.py 的域名选择/积分分段/ledger 与快过期优先调度。
 
 直接运行：python3 tests/test_credits.py
 """
@@ -20,7 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允�
 from app import credits
 from app.credits import (
     AuthExpiredError, CreditLedger,
-    classify_checkin_result, token_issuer_origin, hosts_for_token,
+    token_issuer_origin, hosts_for_token,
     extract_segments, merge_segments, soonest_expiry,
 )
 
@@ -75,7 +75,7 @@ def test_financial_hints_rejected_before_network():
     ]
     with patch("app.credits.httpx.Client") as factory:
         for token, domain in invalid:
-            for operation in (hosts_for_token, credits.daily_checkin, credits.fetch_credits,
+            for operation in (hosts_for_token, credits.fetch_credits,
                               credits.fetch_request_usage):
                 with TestCase().assertRaises(ValueError):
                     operation(token, domain=domain)
@@ -90,8 +90,7 @@ def test_financial_profile_hosts_and_web_headers():
     for domain in ("www.codebuddy.cn", "copilot.tencent.com", "www.workbuddy.cn",
                    "www.codebuddy.ai", "www.workbuddy.ai"):
         host = "https://" + ("www.codebuddy.cn" if domain == "copilot.tencent.com" else domain)
-        for operation, path in ((credits.daily_checkin, credits.CHECKIN_PATHS[0]),
-                                (credits.fetch_credits, credits.RESOURCE_PATH),
+        for operation, path in ((credits.fetch_credits, credits.RESOURCE_PATH),
                                 (credits.fetch_request_usage, credits.USAGE_PATH)):
             client = MagicMock()
             client.post.return_value.status_code = 200
@@ -119,12 +118,11 @@ def test_financial_profile_hosts_and_web_headers():
 
 
 def test_financial_failures_stay_on_profile():
-    """保留原 POST 尝试次数/同 host 签到路径，失败也不转发 token 到其他产品。"""
+    """保留原 POST 尝试次数，失败也不转发 token 到其他产品。"""
     for domain in ("", "www.codebuddy.cn", "www.workbuddy.cn", "www.codebuddy.ai", "www.workbuddy.ai"):
         host = "https://" + (domain or "www.codebuddy.cn")
         for failure in (404, 401, "network"):
             for operation, paths in (
-                    (credits.daily_checkin, list(credits.CHECKIN_PATHS)),
                     (credits.fetch_credits, [credits.RESOURCE_PATH] * (1 if failure == 401 else 3)),
                     (credits.fetch_request_usage, [credits.USAGE_PATH])):
                 client = MagicMock()
@@ -134,31 +132,13 @@ def test_financial_failures_stay_on_profile():
                     client.post.side_effect = httpx.ConnectError("mock connection failure")
                 with patch("app.credits.httpx.Client") as factory, patch("app.credits.time.sleep"):
                     factory.return_value.__enter__.return_value = client
-                    if operation is credits.daily_checkin:
-                        result = operation("opaque", domain=domain)
-                        assert result["ok"] is False
-                        if failure == 401:
-                            assert result["code"] == 401
-                    else:
-                        expected_error = (AuthExpiredError if failure == 401 else
-                                          httpx.HTTPError if failure == "network" and operation is credits.fetch_request_usage
-                                          else RuntimeError)
-                        with TestCase().assertRaises(expected_error):
-                            operation("opaque", domain=domain)
+                    expected_error = (AuthExpiredError if failure == 401 else
+                                      httpx.HTTPError if failure == "network" and operation is credits.fetch_request_usage
+                                      else RuntimeError)
+                    with TestCase().assertRaises(expected_error):
+                        operation("opaque", domain=domain)
                 assert [call.args[0] for call in client.post.call_args_list] == [host + path for path in paths]
     print("test_financial_failures_stay_on_profile passed")
-
-
-def test_classify_checkin():
-    assert classify_checkin_result(True, 0, "ok")["ok"] is True
-    r = classify_checkin_result(True, 10001, "今日已签到，请勿重复")
-    assert r["ok"] is True and r["already"] is True
-    r = classify_checkin_result(True, 10001, "活动未开启")  # 10001 但文案是未开启 → 不算已签
-    assert r["ok"] is False and r["inactive"] is True
-    assert classify_checkin_result(False, 0, "x")["ok"] is False      # HTTP 非 2xx 不算成功
-    assert classify_checkin_result(True, 1, "fail")["ok"] is False
-    assert classify_checkin_result(True, None, "")["ok"] is False
-    print("✅ test_classify_checkin")
 
 
 def test_extract_segments():
@@ -220,11 +200,6 @@ def test_ledger(tmp_path=None):
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "ledger.json"
         ledger = CreditLedger(path)
-        day = time.strftime("%Y-%m-%d")
-        assert not ledger.checkin_done("c1", day)
-        ledger.mark_checkin("c1", day, True, 0, "ok")
-        assert ledger.checkin_done("c1", day)
-        assert not ledger.checkin_done("c1", "1999-01-01")  # 跨日重新签
 
         now = time.time()
         ledger.update_credits("c1", {"credits": 300.0, "count": 1, "segments": [
@@ -235,7 +210,6 @@ def test_ledger(tmp_path=None):
 
         # 持久化往返
         ledger2 = CreditLedger(path)
-        assert ledger2.checkin_done("c1", day)
         assert ledger2.soonest_expiry_of("c1") == now + 7200
         snap = ledger2.snapshot()
         assert snap["c1"]["credits"]["credits"] == 300.0
@@ -252,7 +226,6 @@ def test_ledger_remove_and_entry():
         result = {"credits": 10, "intl": False, "segments": [
             {"remaining": 10, "total": 10, "expires_at": time.time() + 3600}]}
         ledger.update_credits("same-path", result)
-        ledger.mark_checkin("same-path", "2026-01-01", True, 0, "ok")
         ledger.note_error("same-path", "old-account-error")
         ledger.update_credits("other", {"credits": 20, "intl": True})
         other = ledger.entry("other")
@@ -260,9 +233,7 @@ def test_ledger_remove_and_entry():
         entry = ledger.entry("same-path")
         assert entry["credits"]["segments"][0]["remaining"] == 10
         entry["credits"]["segments"][0]["remaining"] = 888
-        entry["checkin"]["ok"] = False
         assert ledger.entry("same-path")["credits"]["segments"][0]["remaining"] == 10
-        assert ledger.checkin_done("same-path", "2026-01-01")
         ledger.remove("same-path")
         ledger.remove("missing")  # 幂等且不创建幽灵条目
         assert ledger.entry("same-path") == {}
@@ -273,8 +244,7 @@ def test_ledger_remove_and_entry():
         replacement = reloaded.entry("same-path")
         assert replacement["credits"]["intl"] is True
         assert replacement["credits"]["credits"] == 3
-        assert replacement["checkin"] == {} and replacement["error"] is None
-        assert not reloaded.checkin_done("same-path", "2026-01-01")
+        assert replacement["error"] is None
     print("test_ledger_remove_and_entry passed")
 
 
@@ -301,39 +271,6 @@ def test_ledger_threaded_entries():
         assert set(restored) == {"domestic", "international"}
         assert all(e["credits"]["credits"] == 10 for e in restored.values())
     print("test_ledger_threaded_entries passed")
-
-
-def test_daily_checkin_http(monkey_response=None):
-    """mock httpx：首 host 404 换 path 后 code=0 成功。"""
-    calls = []
-
-    class FakeResp:
-        def __init__(self, status, payload):
-            self.status_code = status
-            self._payload = payload
-        def json(self):
-            return self._payload
-
-    class FakeClient:
-        def __enter__(self):
-            return self
-        def __exit__(self, *a):
-            return False
-        def post(self, url, headers=None, json=None, timeout=None):
-            calls.append(url)
-            if "/v2/" in url:
-                return FakeResp(200, {"code": 0, "msg": "签到成功"})
-            return FakeResp(404, {})
-
-    orig = credits.httpx.Client
-    credits.httpx.Client = FakeClient
-    try:
-        r = credits.daily_checkin(_jwt("https://www.codebuddy.cn/x"))
-    finally:
-        credits.httpx.Client = orig
-    assert r["ok"] is True, r
-    assert calls == ["https://www.codebuddy.cn" + path for path in credits.CHECKIN_PATHS]  # 只换 path
-    print("✅ test_daily_checkin_http")
 
 
 def test_fetch_credits_http():
@@ -714,14 +651,12 @@ if __name__ == "__main__":
     test_financial_hints_rejected_before_network()
     test_financial_profile_hosts_and_web_headers()
     test_financial_failures_stay_on_profile()
-    test_classify_checkin()
     test_extract_segments()
     test_merge_and_sort_segments()
     test_soonest_expiry()
     test_ledger()
     test_ledger_remove_and_entry()
     test_ledger_threaded_entries()
-    test_daily_checkin_http()
     test_fetch_credits_http()
     test_pick_expiry_priority()
     test_fetch_model_catalog()

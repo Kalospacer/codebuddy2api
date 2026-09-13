@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
-"""credits.py — 每日签到 + 积分查询 + 快过期优先调度支持。
+"""credits.py — 积分查询 + 快过期优先调度支持。
 
 HTTP 流程（官方 Web 端接口，Bearer 鉴权）：
-  签到  POST {host}/billing/meter/daily-checkin（兜底 /v2/...）
   积分  POST {host}/v2/billing/meter/get-user-resource
 财务域名按 site_routing 的凭据身份解析选择固定品牌 host，不跨产品或地域兜底。
 """
@@ -33,17 +32,13 @@ BILLING_PROFILE_HOSTS = {
     "intl-cli": "https://www.codebuddy.ai",
     "intl-work": "https://www.workbuddy.ai",
 }
-CHECKIN_PATHS = ("/billing/meter/daily-checkin", "/v2/billing/meter/daily-checkin")
 RESOURCE_PATH = "/v2/billing/meter/get-user-resource"
 CONFIG_PATH = "/v3/config"  # cbc CLI CloudProductProvider 同源：云端模型表
 RESOURCE_PRODUCT_CODE = "p_tcaca"
 
-_INACTIVE_RE = re.compile(r"未开启|未开始|未开放|已过期|无.*活动|活动.*(?:结束|关闭|暂停)", re.I)
-_ALREADY_RE = re.compile(r"已签到|已领取|已经.*(?:签到|领取)|重复签到|already", re.I)
-
 
 class AuthExpiredError(Exception):
-    """签到/积分接口 401：token 失效（重试无意义，由上层记录）。"""
+    """积分接口 401：token 失效（重试无意义，由上层记录）。"""
 
 
 # ---------------------------------------------------------------------------
@@ -94,55 +89,6 @@ def _post_json(client: httpx.Client, url: str, headers: dict, body: dict) -> tup
     except Exception:
         payload = {}
     return r.status_code, payload
-
-
-# ---------------------------------------------------------------------------
-# 每日签到
-# ---------------------------------------------------------------------------
-
-def classify_checkin_result(http_ok: bool, code, message: str) -> dict:
-    """只接受明确成功：code=0；或 code=10001 且文案表明今日已签（幂等）。"""
-    try:
-        ncode = int(code) if code is not None and str(code).strip() != "" else None
-    except (TypeError, ValueError):
-        ncode = None
-    text = str(message or "")
-    inactive = bool(_INACTIVE_RE.search(text))
-    already = ncode == 10001 and not inactive and bool(_ALREADY_RE.search(text))
-    ok = not inactive and ((ncode == 0 and http_ok) or already)
-    return {"ok": ok, "already": already, "inactive": inactive, "code": ncode, "message": text}
-
-
-def daily_checkin(access_token: str, uid: str = "", domain: str = "") -> dict:
-    """仅在同 profile host 内切换签到 path；返回 classify 结果 + status/url。"""
-    endpoints = [h + p for h in hosts_for_token(access_token, domain) for p in CHECKIN_PATHS]
-    last_err = "未知错误"
-    first_401: dict | None = None
-    with httpx.Client() as client:
-        for url in endpoints:
-            host = url.split("/v2/billing")[0].split("/billing")[0]  # 先剥 /v2 再剥 /billing 取 origin
-            try:
-                status, payload = _post_json(client, url, _web_headers(host, access_token, uid, domain), {})
-            except AuthExpiredError:
-                first_401 = first_401 or {"ok": False, "already": False, "code": 401,
-                                          "message": "登录身份过期", "status": 401, "url": url}
-                last_err = "登录身份过期"
-                continue
-            except httpx.HTTPError as e:
-                last_err = str(e)
-                continue
-            message = payload.get("msg") or payload.get("message") or ("ok" if 200 <= status < 300 else f"HTTP {status}")
-            result = classify_checkin_result(200 <= status < 300, payload.get("code"), message)
-            result.update(status=status, url=url)
-            if result["ok"]:
-                return result
-            if 400 <= status < 500 and status != 404:
-                return result  # 客户端错误（除 404 换 path）：不再兜底
-            last_err = str(message)
-    if first_401 is not None:
-        return first_401
-    return {"ok": False, "already": False, "inactive": False, "code": -1,
-            "message": last_err, "url": endpoints[0] if endpoints else None}
 
 
 # ---------------------------------------------------------------------------
@@ -542,11 +488,11 @@ def fetch_request_usage(access_token: str, days: int = USAGE_MAX_DAYS,
 
 
 # ---------------------------------------------------------------------------
-# CreditLedger：按凭证缓存签到/积分状态，JSON 原子持久化
+# CreditLedger：按凭证缓存积分状态，JSON 原子持久化
 # ---------------------------------------------------------------------------
 
 class CreditLedger:
-    """{cred_id: {checkin, credits, error}} 持久化缓存；soonest_expiry 供凭证池排序。"""
+    """{cred_id: {identity, credits, error}} 持久化缓存；soonest_expiry 供凭证池排序。"""
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -573,7 +519,7 @@ class CreditLedger:
             pass
 
     def _entry(self, cred_id: str) -> dict:
-        return self._data["creds"].setdefault(cred_id, {"checkin": {}, "credits": {}, "error": None})
+        return self._data["creds"].setdefault(cred_id, {"credits": {}, "error": None})
 
     def entry(self, cred_id: str) -> dict:
         """单凭证快照；未知凭证返回空字典且不创建条目。"""
@@ -586,29 +532,14 @@ class CreditLedger:
             entry = self._data["creds"].get(cred_id) or {}
             if entry.get("identity") == identity:
                 return False
-            self._data["creds"][cred_id] = {"identity": identity, "checkin": {}, "credits": {}, "error": None}
+            self._data["creds"][cred_id] = {"identity": identity, "credits": {}, "error": None}
             self._save()
             return True
 
     def remove(self, cred_id: str):
-        """凭证身份/站点替换时删除旧积分、签到与错误状态，幂等持久化。"""
+        """凭证身份/站点替换时删除旧积分与错误状态，幂等持久化。"""
         with self._lock:
             self._data["creds"].pop(cred_id, None)
-            self._save()
-
-    # ---- 签到 ----
-
-    def checkin_done(self, cred_id: str, day: str) -> bool:
-        with self._lock:
-            c = self._entry(cred_id).get("checkin") or {}
-            return c.get("date") == day and c.get("ok") is True
-
-    def mark_checkin(self, cred_id: str, day: str, ok: bool, code, message: str):
-        with self._lock:
-            self._entry(cred_id)["checkin"] = {
-                "date": day, "ok": bool(ok), "code": code,
-                "message": str(message or "")[:200], "at": time.time(),
-            }
             self._save()
 
     # ---- 积分 ----

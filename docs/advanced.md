@@ -56,7 +56,7 @@ Trial-credit claims are off by default and only apply to upstream-eligible `intl
 | `DELETE /admin/credentials/{name}` | Delete the credential file by filename; returns 409 while referenced by model bindings |
 | `PATCH /admin/credentials/{id}` | Enable/disable by account identity ID, without deleting files |
 | `POST /admin/oauth/start` · `GET /admin/oauth/poll` | Start and poll browser login |
-| `GET /admin/credits` · `POST /admin/checkin` | Inspect credits; trigger check-in and credit synchronization |
+| `GET /admin/credits` | Inspect per-credential credit balances and segment expiry |
 
 Pages use `/dashboard/*`, management APIs use `/admin/*`, and clients retain `/v1/*`. `/cn` and `/intl` API prefixes are not registered. Automatic model routing requires no client URL changes.
 

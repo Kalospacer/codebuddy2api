@@ -27,7 +27,6 @@ class TrialIntegrationTests(unittest.TestCase):
         self.order = []
         self.claim = self.enterContext(patch.object(trial_rewards, "claim_trial", side_effect=self.claimed))
         self.balance = self.enterContext(patch.object(credits, "fetch_credits", side_effect=self.credited))
-        self.checkin = self.enterContext(patch.object(credits, "daily_checkin"))
 
     def claimed(self, headers):
         self.order.append("trial")
@@ -52,7 +51,7 @@ class TrialIntegrationTests(unittest.TestCase):
 
     def sync(self):
         failed = set()
-        result = converter._sync_credits(self.pool, self.ledger, self.pool.entries()[0], checkin=False, failed=failed)
+        result = converter._sync_credits(self.pool, self.ledger, self.pool.entries()[0], failed=failed)
         self.assertFalse(failed)
         self.assertIsNotNone(result)
         self.assertEqual(self.ledger.entry(str(self.path))["credits"]["credits"], 123)
@@ -77,7 +76,6 @@ class TrialIntegrationTests(unittest.TestCase):
         self.sync()
         self.sync()
         self.assertEqual(self.order, ["trial", "credits", "credits"])
-        self.checkin.assert_not_called()
 
     def test_relogin_and_new_ledger_object_do_not_claim_twice(self):
         self.configure()

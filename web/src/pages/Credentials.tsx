@@ -282,9 +282,6 @@ export function Credentials() {
               <Icon name="refresh" />
               刷新
             </button>
-            <button disabled={busy} onClick={() => run(() => api.post("/checkin"))}>
-              签到 / 同步余额
-            </button>
           </div>
           <button disabled={!liveSelected.length} onClick={() => setDrawer("export")}>
             导出已选 ({liveSelected.length})

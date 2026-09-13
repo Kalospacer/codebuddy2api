@@ -79,7 +79,7 @@ from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_f
 from app.client_profiles import CLI_VERSION, CLI_USER_AGENT, credential_headers, catalog_cache_key, account_key
 try:
     from app import credits as credits_mod
-except ImportError:  # 模块缺失时签到/积分/快过期优先调度不可用
+except ImportError:  # 模块缺失时积分/快过期优先调度不可用
     credits_mod = None
 
 # ---------------------------------------------------------------------------
@@ -615,7 +615,7 @@ class CredentialPool:
                 self._ledger.remove(entry["id"])
 
     def entries(self) -> list[dict]:
-        """池内凭证条目快照（供签到/积分调度遍历）。"""
+        """池内凭证条目快照（供积分调度遍历）。"""
         with self._lock:
             return [dict(e) for e in self._entries]
 
@@ -942,8 +942,8 @@ def _refresher_loop(pool: CredentialPool):
         except Exception as e:
             _log(f"[cred] 刷新线程异常: {e}")
 
-CHECKIN_FIRST_DELAY = 30     # 启动后首次签到延迟秒数
-HOUSEKEEP_INTERVAL = 3600    # 签到兜底 + 积分刷新周期秒数
+HOUSEKEEP_FIRST_DELAY = 30   # 启动后首次全量维护延迟秒数
+HOUSEKEEP_INTERVAL = 3600    # 全量维护（积分/模型表/用量）周期秒数
 
 
 def _bearer_token(headers: dict) -> str:
@@ -977,7 +977,7 @@ def _sync_trial(headers):
         _log(f"[trial] 领取失败（不影响余额同步）: {_network_error_text(error)}")
 
 
-def _sync_credits(pool, ledger, entry, *, checkin, failed):
+def _sync_credits(pool, ledger, entry, *, failed):
     if not model_policy.credential_enabled(CONFIG, entry):
         return None
     cm, cid = entry["cm"], entry["id"]
@@ -990,17 +990,6 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed):
                 generation = cm._generation
         site = site_for_headers(headers)
         token, uid, domain = _bearer_token(headers), headers.get("X-User-Id", ""), headers.get("X-Domain", "")
-        day = time.strftime("%Y-%m-%d")
-        if checkin and not ledger.checkin_done(cid, day):
-            try:
-                result = credits_mod.daily_checkin(token, uid=uid, domain=domain)
-                if not pool.apply_if_current(cm, generation, lambda: ledger.mark_checkin(
-                        cid, day, result["ok"], result.get("code"), result.get("message", ""))):
-                    failed.add(cid)
-                    return None
-                _log(f"[checkin] {Path(cid).name}: ok={result['ok']} already={result.get('already')} code={result.get('code')}")
-            except Exception as error:
-                _sync_error(pool, ledger, entry, generation, "checkin", error)
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
         _sync_trial(headers)
@@ -1131,7 +1120,7 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
             for entry in pool.entries():
                 if entry["id"] not in ids:
                     continue
-                result = _sync_credits(pool, ledger, entry, checkin=not pending_only, failed=failed)
+                result = _sync_credits(pool, ledger, entry, failed=failed)
                 if result is not None:
                     refs[entry["id"]] = result
             _sync_model_catalogs(pool, ledger, refs, failed)
@@ -1146,7 +1135,7 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
 
 def _housekeeper_loop(pool: CredentialPool, ledger) -> None:
     """新凭据事件即时唤醒；失败退避重试，整轮维护仍按小时进行。"""
-    next_full = time.monotonic() + CHECKIN_FIRST_DELAY
+    next_full = time.monotonic() + HOUSEKEEP_FIRST_DELAY
     while True:
         pool._sync_event.wait(pool.sync_wait(next_full - time.monotonic()))
         full_due = time.monotonic() >= next_full
@@ -1220,7 +1209,7 @@ LOG_BACKUPS = 2                    # 轮转保留份数（log.1、log.2，最老
 def _log(msg: str):
     """写入脱敏有界日志，在同一把锁内检查大小与轮转。"""
     audit = CONFIG.get("audit_store")
-    component = re.match(r"\[(cred|credits|models|usage|trial|checkin|housekeeper)\]", msg)
+    component = re.match(r"\[(cred|credits|models|usage|trial|housekeeper)\]", msg)
     if audit is not None and component:
         # Persist event codes, not free-form lines which may contain upstream data.
         code = "cooldown" if "熔断" in msg or "冷却" in msg else "failure" if "失败" in msg or "异常" in msg else "updated"
@@ -1523,22 +1512,10 @@ def admin_oauth_poll(login_id: str = "",
 @app.get("/admin/credits")
 def admin_credits(authorization: Optional[str] = Header(default=None),
                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """各凭证积分余额/分段过期时间/今日签到状态（CreditLedger 缓存快照）。"""
+    """各凭证积分余额/分段过期时间（CreditLedger 缓存快照）。"""
     _check_admin_auth(authorization, x_api_key)
     ledger = CONFIG.get("ledger")
     return {"credits": ledger.snapshot() if ledger else {}}
-
-
-@app.post("/admin/checkin")
-def admin_checkin(authorization: Optional[str] = Header(default=None),
-                  x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """手动触发一轮签到 + 积分刷新（签到按日幂等，已签则只刷积分）。"""
-    _check_admin_auth(authorization, x_api_key)
-    pool, ledger = CONFIG.get("cred_pool"), CONFIG.get("ledger")
-    if pool is None or ledger is None:
-        raise HTTPException(status_code=503, detail={"error": {"message": "签到调度未启用", "type": "invalid_request_error"}})
-    _housekeep_once(pool, ledger)
-    return {"credits": ledger.snapshot()}
 
 
 # ---------------------------------------------------------------------------
@@ -2769,9 +2746,8 @@ def main():
     sys.stderr.write("   GET/POST/DELETE /admin/credentials  (凭证池管理)\n")
     sys.stderr.write("   添加账号：python3 converter.py login（自动等待扫码并保存）\n")
     if credits_mod is not None:
-        sys.stderr.write("   GET  /admin/credits           (积分/签到状态)\n")
-        sys.stderr.write("   POST /admin/checkin           (手动触发签到+积分刷新)\n")
-        sys.stderr.write("   每日签到 + 快过期积分优先调度已启用\n")
+        sys.stderr.write("   GET  /admin/credits           (积分余额)\n")
+        sys.stderr.write("   快过期积分优先调度已启用\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
     sys.stderr.write(f"   图片限制  : {CONFIG['max_images']} 张/请求，策略 {CONFIG['image_policy']}\n")
