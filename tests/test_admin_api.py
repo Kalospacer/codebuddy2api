@@ -277,6 +277,10 @@ class AdminApiTests(unittest.TestCase):
             response = self.client.get("/admin/oauth/poll?login_id=task", headers=csrf)
             self.assertEqual(response.status_code, 200, response.text)
             self.assertEqual(response.json()["imported"], "first.info")
+        # Real browsers omit Origin on same-origin GET fetches (and older engines never
+        # send Sec-Fetch-*); the mandatory CSRF token alone must admit the poll.
+        self.assertEqual(self.client.get("/admin/oauth/poll?login_id=task",
+                                         headers={"X-CSRF-Token": csrf["X-CSRF-Token"]}).status_code, 200)
         self.gateway._save_oauth_credential.assert_called_once()
         self.gateway._OAUTH.poll.assert_called_once()
         self.gateway._OAUTH.start.return_value = {"login_id": "evil", "verification_uri": "https://www.codebuddy.cn.evil.invalid/login"}

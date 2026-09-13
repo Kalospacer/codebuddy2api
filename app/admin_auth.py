@@ -142,7 +142,11 @@ class AdminMiddleware:
             return await error_response(401, "管理认证无效或会话已过期")(scope, receive, no_cache)
         if cookie and not public_session and (method not in ("GET", "HEAD", "OPTIONS") or path == "/admin/oauth/poll"):
             supplied = request.headers.get("x-csrf-token", "")
-            if not same_origin(request) or not hmac.compare_digest(supplied.encode(), session["csrf_token"].encode()):
+            origin = request.headers.get("origin")
+            # Cross-site origins are always rejected. An absent Origin is normal for
+            # same-origin requests (and older engines never send SecFetch-*), so the
+            # mandatory CSRF token below remains the primary defense in that case.
+            if (origin and not same_origin(request)) or not hmac.compare_digest(supplied.encode(), session["csrf_token"].encode()):
                 return await error_response(403, "Origin 或 CSRF 校验失败")(scope, receive, no_cache)
         scope.setdefault("state", {}).update(admin_identity=identity or sid, admin_cookie=cookie,
                                               admin_session=session)
