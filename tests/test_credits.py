@@ -1,8 +1,5 @@
 #!/usr/bin/env python3
-"""test_credits.py — 验证 credits.py 的域名选择/积分分段/ledger 与快过期优先调度。
-
-直接运行：python3 tests/test_credits.py
-"""
+"""Test billing hosts, credit segments, persistence and expiry-aware scheduling."""
 
 import base64
 import json
@@ -15,7 +12,7 @@ from unittest.mock import MagicMock, patch
 
 import httpx
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from app import credits
 from app.credits import (
@@ -41,7 +38,7 @@ def test_issuer_origin():
 def test_hosts_for_token():
     assert hosts_for_token(_jwt("https://www.codebuddy.cn/auth/realms/copilot")) == ["https://www.codebuddy.cn"]
     assert hosts_for_token(_jwt("https://www.workbuddy.ai/auth/realms/copilot")) == ["https://www.workbuddy.ai"]
-    # 无显式提示时与 site_routing 一致，仅默认国内 CLI，绝不再遍历另一产品。
+    # Absent identity hints default only to domestic CLI, never another product.
     assert hosts_for_token("bad") == ["https://www.codebuddy.cn"]
     for brand in ("codebuddy", "workbuddy"):
         for suffix in ("cn", "ai"):
@@ -60,7 +57,7 @@ def test_hosts_for_token():
 
 
 def test_financial_hints_rejected_before_network():
-    """显式未知/不安全提示与跨地域、跨产品冲突均在建立 Client 前拒绝。"""
+    """Reject unsafe or conflicting identity hints before opening a client."""
     invalid = [
         ("opaque", "unknown.example"),
         ("opaque", "http://www.codebuddy.cn"),
@@ -80,13 +77,13 @@ def test_financial_hints_rejected_before_network():
                 with TestCase().assertRaises(ValueError):
                     operation(token, domain=domain)
         factory.assert_not_called()
-    # 对外纯解析函数保留宽松解析兼容性，不把它当作受信任路由。
+    # Permissive parsing alone must not authorize routing.
     assert token_issuer_origin(_jwt("https://unknown.example/x")) == "https://unknown.example"
     print("test_financial_hints_rejected_before_network passed")
 
 
 def test_financial_profile_hosts_and_web_headers():
-    """三类财务请求传递 domain，使用各自品牌 Web 协议而非目录 CLI 身份头。"""
+    """Keep product-specific billing headers isolated."""
     for domain in ("www.codebuddy.cn", "copilot.tencent.com", "www.workbuddy.cn",
                    "www.codebuddy.ai", "www.workbuddy.ai"):
         host = "https://" + ("www.codebuddy.cn" if domain == "copilot.tencent.com" else domain)
@@ -106,9 +103,9 @@ def test_financial_profile_hosts_and_web_headers():
             assert headers["x-client-platform"] == "web"
             assert headers["origin"] == host
             assert headers["referer"] == host + "/profile/plans-usage"
+            assert headers["user-agent"] == credits.BROWSER_UA
             assert headers["authorization"] == "Bearer opaque"
             assert headers["x-user-id"] == "test-user" and headers["x-domain"] == domain
-            assert headers["user-agent"] == credits.BROWSER_UA
             assert headers["content-type"] == "application/json"
             assert "x-ide-type" not in headers
             assert kwargs["timeout"] == credits.REQUEST_TIMEOUT
@@ -118,7 +115,7 @@ def test_financial_profile_hosts_and_web_headers():
 
 
 def test_financial_failures_stay_on_profile():
-    """保留原 POST 尝试次数，失败也不转发 token 到其他产品。"""
+    """Preserve request counts without cross-product token forwarding."""
     for domain in ("", "www.codebuddy.cn", "www.workbuddy.cn", "www.codebuddy.ai", "www.workbuddy.ai"):
         host = "https://" + (domain or "www.codebuddy.cn")
         for failure in (404, 401, "network"):
@@ -141,22 +138,24 @@ def test_financial_failures_stay_on_profile():
     print("test_financial_failures_stay_on_profile passed")
 
 
+
+
 def test_extract_segments():
     accounts = [
-        {  # 有切片明细：展开，过期字段优先 DeductionEndTime
+        {  # Expand slices and prefer their deduction expiry.
             "PackageName": "月度包", "PackageCode": "p1",
             "SlicePeriodUsageDetails": [
                 {"SlicePeriodCapacityRemainPrecise": "300", "SlicePeriodCapacitySizePrecise": "500",
                  "DeductionEndTime": 1700000100},
-                {"SlicePeriodCapacityRemainPrecise": "0"},  # 余量 0 被过滤
+                {"SlicePeriodCapacityRemainPrecise": "0"},  # Filter zero balances.
             ],
         },
-        {  # 无明细：周期字段
+        {  # Use package-period fields when slices are absent.
             "PackageName": "赠送包", "PackageCode": "p2",
             "CycleCapacityRemainPrecise": "200.5", "CycleCapacitySizePrecise": "500",
             "ExpiredTime": "2027-01-01 00:00:00",
         },
-        {"PackageName": "空包", "CapacityRemain": 0},  # 余量 0 过滤
+        {"PackageName": "空包", "CapacityRemain": 0},  # Filter zero balances.
     ]
     segs = extract_segments(accounts)
     assert len(segs) == 2, segs
@@ -169,15 +168,15 @@ def test_extract_segments():
 def test_merge_and_sort_segments():
     segs = merge_segments([
         {"remaining": 100, "total": 100, "expires_at": 3000, "source": "包A", "package_code": "a"},
-        {"remaining": 50, "total": 50, "expires_at": 3000, "source": "包A", "package_code": "a"},   # 同包同期 → 合并
+        {"remaining": 50, "total": 50, "expires_at": 3000, "source": "包A", "package_code": "a"},   # Merge matching package periods.
         {"remaining": 200, "total": 200, "expires_at": 1000, "source": "包B", "package_code": "b"},
-        {"remaining": 999, "total": 999, "expires_at": None, "source": "永久", "package_code": ""},  # 无过期排最后
+        {"remaining": 999, "total": 999, "expires_at": None, "source": "永久", "package_code": ""},  # Sort unknown expiry last.
         {"remaining": 0, "total": 0, "expires_at": 500, "source": "空", "package_code": "c"},
     ])
     assert len(segs) == 3
-    assert segs[0]["package_code"] == "b"                       # 最早过期排最前
-    assert segs[1]["remaining"] == 150 and segs[1]["total"] == 150  # 合并结果
-    assert segs[2]["expires_at"] is None                        # 无过期时间排最后
+    assert segs[0]["package_code"] == "b"                       # Earliest expiry first
+    assert segs[1]["remaining"] == 150 and segs[1]["total"] == 150  # Merged balance
+    assert segs[2]["expires_at"] is None                        # Unknown expiry last
     print("✅ test_merge_and_sort_segments")
 
 
@@ -185,13 +184,13 @@ def test_soonest_expiry():
     now = time.time()
     segs = [
         {"remaining": 10, "expires_at": now + 86400},
-        {"remaining": 10, "expires_at": now + 3600},   # 最早未过期
-        {"remaining": 10, "expires_at": now - 100},    # 已过期，不算
+        {"remaining": 10, "expires_at": now + 3600},   # Earliest active expiry
+        {"remaining": 10, "expires_at": now - 100},    # Exclude expired credits.
         {"remaining": 10, "expires_at": None},
     ]
     assert soonest_expiry(segs, now=now) == now + 3600
-    assert soonest_expiry([{"remaining": 10, "expires_at": now - 1}], now=now) is None  # 全过期
-    assert soonest_expiry([{"remaining": 10, "expires_at": None}], now=now) is None     # 无过期时间
+    assert soonest_expiry([{"remaining": 10, "expires_at": now - 1}], now=now) is None  # All expired
+    assert soonest_expiry([{"remaining": 10, "expires_at": None}], now=now) is None     # No known expiry
     assert soonest_expiry([], now=now) is None
     print("✅ test_soonest_expiry")
 
@@ -200,15 +199,16 @@ def test_ledger(tmp_path=None):
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "ledger.json"
         ledger = CreditLedger(path)
+        day = time.strftime("%Y-%m-%d")
 
         now = time.time()
         ledger.update_credits("c1", {"credits": 300.0, "count": 1, "segments": [
             {"remaining": 300, "total": 300, "expires_at": now + 7200, "source": "包", "package_code": "x"}],
             "soonest_expiry": now + 7200})
         assert ledger.soonest_expiry_of("c1") == now + 7200
-        assert ledger.soonest_expiry_of("c2") is None  # 无数据
+        assert ledger.soonest_expiry_of("c2") is None  # No balance data
 
-        # 持久化往返
+        # Persistence round trip
         ledger2 = CreditLedger(path)
         assert ledger2.soonest_expiry_of("c1") == now + 7200
         snap = ledger2.snapshot()
@@ -217,12 +217,12 @@ def test_ledger(tmp_path=None):
 
 
 def test_ledger_remove_and_entry():
-    """同路径换账号/站点时彻底清旧状态；快照不泄露内部引用。"""
+    """Clear stale state on identity changes and return independent snapshots."""
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "ledger.json"
         ledger = CreditLedger(path)
         assert ledger.entry("missing") == {}
-        assert ledger.snapshot() == {}  # 只读 entry 不创建条目
+        assert ledger.snapshot() == {}  # Reads do not create entries.
         result = {"credits": 10, "intl": False, "segments": [
             {"remaining": 10, "total": 10, "expires_at": time.time() + 3600}]}
         ledger.update_credits("same-path", result)
@@ -235,7 +235,7 @@ def test_ledger_remove_and_entry():
         entry["credits"]["segments"][0]["remaining"] = 888
         assert ledger.entry("same-path")["credits"]["segments"][0]["remaining"] == 10
         ledger.remove("same-path")
-        ledger.remove("missing")  # 幂等且不创建幽灵条目
+        ledger.remove("missing")  # Idempotent removal without creating entries.
         assert ledger.entry("same-path") == {}
         assert ledger.soonest_expiry_of("same-path") is None
         reloaded = CreditLedger(path)
@@ -249,7 +249,7 @@ def test_ledger_remove_and_entry():
 
 
 def test_ledger_threaded_entries():
-    """不同凭证并发更新/删除与深拷贝读取仍可持久化。"""
+    """Persist concurrent credential updates, removals and snapshot reads safely."""
     from concurrent.futures import ThreadPoolExecutor
     with tempfile.TemporaryDirectory() as td:
         path = Path(td) / "ledger.json"
@@ -273,8 +273,10 @@ def test_ledger_threaded_entries():
     print("test_ledger_threaded_entries passed")
 
 
+
+
 def test_fetch_credits_http():
-    """mock httpx：get-user-resource 返回切片明细，验证汇总与最早过期。"""
+    """Aggregate mocked credit slices and their earliest expiry."""
     now = time.time()
 
     class FakeResp:
@@ -312,10 +314,10 @@ def test_fetch_credits_http():
 
 
 def test_pick_expiry_priority():
-    """凭证池 pick：快过期积分的凭证优先；同级轮询；无数据排最后。"""
+    """Prefer expiring credits, rotate equal candidates and place unknown balances last."""
     import converter
     with tempfile.TemporaryDirectory() as td:
-        # 三个假凭证文件
+        # Synthetic credential files
         paths = []
         for i, uid in enumerate(["u1", "u2", "u3"]):
             p = Path(td) / f"cred{i}.info"
@@ -327,7 +329,7 @@ def test_pick_expiry_priority():
         ledger = CreditLedger(Path(td) / "ledger.json")
         pool.set_ledger(ledger)
 
-        # 无数据时：全部同级，轮询
+        # Unknown balances share round-robin priority.
         seen = {pool.pick(None).path.name for _ in range(3)}
         assert len(seen) == 3, seen
 
@@ -340,11 +342,11 @@ def test_pick_expiry_priority():
             {"remaining": 10, "total": 10, "expires_at": now + 86400, "source": "s", "package_code": "b"}],
             "soonest_expiry": now + 86400})
 
-        # cred2 最早过期 → 恒优先
+        # Prefer cred2's earlier expiry.
         for _ in range(3):
             assert pool.pick(None).path.name == "cred2.info"
 
-        # cred2 数据清空后 → cred0 优先（cred1 无数据排最后）
+        # After clearing cred2, prefer cred0 over unknown balances.
         ledger.update_credits(ids[2], {"credits": 0, "count": 0, "segments": [], "soonest_expiry": None})
         for _ in range(2):
             assert pool.pick(None).path.name == "cred0.info"
@@ -352,7 +354,7 @@ def test_pick_expiry_priority():
 
 
 def test_fetch_model_catalog():
-    """mock httpx：/v3/config 返回模型表；校验 cli 平台头与解析。"""
+    """Validate CLI catalog headers and model parsing with mocked config responses."""
     seen_headers = {}
 
     class FakeResp:
@@ -380,13 +382,13 @@ def test_fetch_model_catalog():
     finally:
         credits.httpx.Client = orig
     assert [m["id"] for m in models] == ["glm-9.9", "img-1"]
-    assert seen_headers.get("x-client-platform") == "cli"  # 必须 cli,否则 400
+    assert seen_headers.get("x-client-platform") == "cli"  # Required by the catalog endpoint.
     assert httpx.Headers(seen_headers)["user-agent"] == "CLI/9.9"
     print("✅ test_fetch_model_catalog")
 
 
 def test_current_models_merge():
-    """显式国内内部视图：已知目录不补静态模型，明确空表不回退。"""
+    """Preserve explicit domestic catalogs without static expansion or empty-list fallback."""
     import converter
     with patch.dict(converter.CONFIG, {"cred_pool": None, "cred": None, "model_catalogs": {},
                                        "account_catalogs": None, "model_cache": None, "ledger": None,
@@ -395,29 +397,29 @@ def test_current_models_merge():
             {"id": "hunyuan-image", "supportsToolCall": False},
         ]}):
         out = converter.current_models(region="cn")
-        assert out == ["glm-9.9", "auto"]  # 图像模型不进表，调度别名保留
+        assert out == ["glm-9.9", "auto"]  # Exclude image models and retain the scheduling alias.
         assert not [m for m in out if m.endswith("-free")]
         assert "deepseek-v4.1-flash" in converter.DEFAULT_MODELS
-        assert "glm-5.3" not in out  # 已知目录禁止借用默认表扩大产品能力
+        assert "glm-5.3" not in out  # Do not expand known product capabilities with defaults.
         converter.CONFIG["models_remote"] = []
         assert converter.current_models(region="cn") == []
         converter.CONFIG["models_remote"] = None
-        # 无账号的旧式内部展示兜底不代表生产账号获得该目录的路由权限。
+        # Legacy display fallback does not authorize production account routing.
         assert converter.current_models(region="cn") == converter.DEFAULT_MODELS
     print("✅ test_current_models_merge")
 
 
 def test_credits_to_usd():
-    """单价→美元换算：0.014 元/Credit @ 汇率 7.15。"""
+    """Convert credit prices to USD using the configured exchange rate."""
     assert abs(credits.credits_to_usd(1000) - 1000 * 0.014 / 7.15) < 1e-9
     assert credits.credits_to_usd(0) == 0.0
-    assert abs(credits.credits_to_usd(50000, 0.014, 7.0) - 100.0) < 1e-9  # 汇率可覆盖
+    assert abs(credits.credits_to_usd(50000, 0.014, 7.0) - 100.0) < 1e-9  # Exchange-rate override
     assert credits.CREDIT_PRICE_CNY == 0.014 and credits.USAGE_MAX_DAYS == 30
     print("✅ test_credits_to_usd")
 
 
 def test_aggregate_credits():
-    """ledger 汇总：按国内/国际分组累加、额度差已用、最早过期；空条目容错。"""
+    """Aggregate regional balances, quota usage and expiry while tolerating empty entries."""
     snap = {"a": {"credits": {"intl": False, "segments": [
         {"remaining": 100, "total": 200, "expires_at": 500},
         {"remaining": 50, "total": 50, "expires_at": 900}]}},
@@ -427,8 +429,8 @@ def test_aggregate_credits():
                {"remaining": 300, "total": 400, "expires_at": 700}]}},
         "d": {"credits": {"segments": [{"remaining": 30, "total": 10, "expires_at": None}]}}}
     agg = credits.aggregate_credits(snap)
-    assert agg["remaining"] == 480, agg          # 国内 180 + 国际 300
-    assert agg["used_by_quota"] == 200, agg      # 国内 100 + 国际 100；负差不计
+    assert agg["remaining"] == 480, agg          # Domestic 180 plus international 300
+    assert agg["used_by_quota"] == 200, agg      # Sum regional usage without negative differences.
     assert agg["soonest_expiry"] == 500, agg
     g = agg["groups"]
     assert g["domestic"]["remaining"] == 180 and g["domestic"]["used_by_quota"] == 100, g
@@ -439,8 +441,239 @@ def test_aggregate_credits():
     print("✅ test_aggregate_credits")
 
 
+def _fake_client(pages, seen=None):
+    """Return predefined HTTP responses by page number."""
+    class FakeResp:
+        status_code = 200
+        def __init__(self, payload):
+            self._p = payload
+        def json(self):
+            return self._p
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def post(self, url, headers=None, json=None, timeout=None):
+            if seen is not None:
+                seen.append(json.get("pageNum", json.get("PageNumber")))
+            return FakeResp(pages[min((json.get("pageNum") or json.get("PageNumber")) - 1, len(pages) - 1)])
+    return FakeClient
+
+
+def _with_client(fake, fn):
+    orig = credits.httpx.Client
+    credits.httpx.Client = fake
+    try:
+        return fn()
+    finally:
+        credits.httpx.Client = orig
+
+
+def test_fetch_request_usage_rejects_invalid_success_payloads():
+    """Reject HTTP 200 responses with business errors or missing usage structure."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    for pages in ([{"code": 1059, "msg": "rate limited", "data": {"total": 0, "data": []}}],
+                  [{"code": 0, "data": {}}],                      # Missing nested data and total
+                  [{"data": {"data": [], "total": 0}}],           # Valid empty structure without code
+                  ):
+        try:
+            result = _with_client(_fake_client(pages),
+                                  lambda: credits.fetch_request_usage(token))
+        except RuntimeError:
+            assert pages[0].get("code") not in (0, None) or "data" not in pages[0].get("data", {}) \
+                or "data" not in pages[0]["data"]
+        else:
+            assert pages[0].get("code") is None and result["requests"] == 0  # Preserve valid empty results.
+    print("✅ test_fetch_request_usage_rejects_invalid_success_payloads")
+
+
+def test_fetch_credits_distinguishes_empty_from_missing_structure():
+    """Distinguish confirmed zero balances from missing response structure."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    empty = _with_client(_fake_client([{"code": 0, "data": {"Response": {"Data": {"Accounts": []}}}}]),
+                         lambda: credits.fetch_credits(token))
+    assert empty["credits"] == 0.0 and empty["count"] == 0
+    for bad in ({"code": 0, "data": {}}, {"code": 0, "data": {"Response": {"Data": {}}}}):
+        try:
+            _with_client(_fake_client([bad]), lambda: credits.fetch_credits(token))
+            raise AssertionError("missing Accounts structure must raise")
+        except RuntimeError as error:
+            assert "Accounts" in str(error)
+    print("✅ test_fetch_credits_distinguishes_empty_from_missing_structure")
+
+
+def test_fetch_credits_paginates_until_short_page():
+    """Aggregate credit pages, stop on short pages and mark capped results partial."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    account = lambda i: {"PackageName": f"p{i}", "PackageCode": f"c{i}",
+                         "SlicePeriodUsageDetails": [{"SlicePeriodCapacityRemainPrecise": "1",
+                                                      "DeductionEndTime": None}]}
+    full_page = {"code": 0, "data": {"Response": {"Data": {"Accounts": [account(i) for i in range(100)]}}}}
+    short_page = {"code": 0, "data": {"Response": {"Data": {"Accounts": [account(1000)]}}}}
+    seen = []
+    result = _with_client(_fake_client([full_page, short_page], seen), lambda: credits.fetch_credits(token))
+    assert seen == [1, 2] and result["count"] == 101 and result["credits"] == 101.0
+    assert result["partial"] is False
+
+    seen = []
+    result = _with_client(_fake_client([full_page] * credits.CREDITS_MAX_PAGES, seen),
+                          lambda: credits.fetch_credits(token))
+    assert len(seen) == credits.CREDITS_MAX_PAGES
+    assert result["partial"] is True
+
+    # Retry transient empty later pages before treating them as pagination completion.
+    calls = {"n": 0}
+    sequence = [full_page, {"code": 0, "data": {"Response": {"Data": {"Accounts": []}}}}, short_page]
+
+    class FlakyClient:
+        def __enter__(self):
+            return self
+        def __exit__(self, *a):
+            return False
+        def post(self, url, headers=None, json=None, timeout=None):
+            calls["n"] += 1
+            payload = sequence[min(calls["n"] - 1, len(sequence) - 1)]
+
+            class Resp:
+                status_code = 200
+                def json(self):
+                    return payload
+            return Resp()
+
+    result = _with_client(FlakyClient, lambda: credits.fetch_credits(token))
+    assert result["count"] == 101 and result["partial"] is False, result
+    print("✅ test_fetch_credits_paginates_until_short_page")
+
+
+def test_fetch_request_usage_marks_partial_at_page_cap():
+    """Mark usage partial when the page cap is below the advertised total."""
+    token = _jwt("https://www.codebuddy.cn/x")
+    big_total = credits.USAGE_MAX_PAGES * credits.USAGE_PAGE_SIZE + 1
+    row = {"requestTime": "2026-09-01 10:00:00", "model": "m", "credit": 0.01}
+    page = {"code": 0, "data": {"total": big_total, "data": [row]}}
+    result = _with_client(_fake_client([page]), lambda: credits.fetch_request_usage(token))
+    assert result["partial"] is True and result["requests"] == credits.USAGE_MAX_PAGES
+    print("✅ test_fetch_request_usage_marks_partial_at_page_cap")
+
+
+def test_sync_usage_keeps_per_account_snapshots_on_failure():
+    """Retain a failed account's prior usage snapshot with explicit stale and partial flags."""
+    import converter
+    with tempfile.TemporaryDirectory() as td:
+        paths = []
+        for uid in ("u1", "u2"):
+            p = Path(td) / f"{uid}.info"
+            p.write_text(json.dumps({
+                "auth": {"accessToken": f"token-{uid}", "refreshToken": "r",
+                         "domain": "https://www.codebuddy.cn",
+                         "expiresAt": int(time.time() * 1000) + 86400000,
+                         "lastRefreshTime": time.time() * 1000},
+                "account": {"uid": uid, "enterpriseId": "e"}}), encoding="utf-8")
+            paths.append(p)
+        pool = converter.CredentialPool(paths)
+        snapshots = {
+            "token-u1": {"by_day": {"2026-09-01": {"m": 10.0}}, "total_credits": 10.0, "requests": 1, "partial": False},
+            "token-u2": {"by_day": {"2026-09-02": {"m": 20.0}}, "total_credits": 20.0, "requests": 2, "partial": False},
+        }
+        failing = set()
+
+        def fake_fetch(token, uid="", domain=""):
+            if token in failing:
+                raise RuntimeError("synthetic sync failure")
+            return snapshots[token]
+
+        saved = (converter.CONFIG.get("usage_daily"), converter.CONFIG.get("usage_daily_accounts"),
+                 converter.CONFIG.get("control_store"))
+        orig_fetch = credits.fetch_request_usage
+        credits.fetch_request_usage = fake_fetch
+        converter.CONFIG.update(usage_daily=None, usage_daily_accounts=None, control_store=None)
+        try:
+            from fastapi.testclient import TestClient
+
+            def check_billing_stale(names):
+                with patch.dict(converter.CONFIG, {"api_key": "", "ledger": None}), \
+                        TestClient(converter.app) as client:
+                    sub = client.get("/v1/dashboard/billing/subscription")
+                    usage = client.get("/v1/dashboard/billing/usage")
+                assert sub.status_code == usage.status_code == 200
+                assert sub.json()["codebuddy_partial"] is bool(names)
+                assert sub.json().get("codebuddy_stale_accounts", []) == names
+                assert usage.json().get("partial", False) is bool(names)
+                assert usage.json().get("stale_accounts", []) == names
+
+            failing.update(snapshots)
+            for previous in (None, {"total_credits": 999, "fetched_at": 123, "partial": False}):
+                converter.CONFIG["usage_daily"] = previous
+                converter._sync_usage(pool)
+                view = converter.CONFIG["usage_daily"]
+                assert view["by_day"] == view["groups"] == {}
+                assert view["total_credits"] == view["requests"] == view["fetched_at"] == 0
+                assert view["partial"] is True and view["stale_accounts"] == ["u1.info", "u2.info"]
+                check_billing_stale(["u1.info", "u2.info"])
+                assert converter._billing_totals()["used_source"] == "quota_delta"
+            failing.clear()
+
+            # Expose first-sync failures even when no historical snapshot exists.
+            failing.add("token-u2")
+            converter._sync_usage(pool)
+            view = converter.CONFIG["usage_daily"]
+            assert view["total_credits"] == 10.0 and view["requests"] == 1
+            assert view["partial"] is True and view["stale_accounts"] == ["u2.info"]
+
+            failing.clear()
+            converter._sync_usage(pool)
+            view = converter.CONFIG["usage_daily"]
+            assert view["total_credits"] == 30.0 and view["requests"] == 3
+            assert view["partial"] is False and "stale_accounts" not in view
+
+            failing.update(snapshots)
+            last_good = dict(view)
+            converter._sync_usage(pool)
+            view = converter.CONFIG["usage_daily"]
+            for key in ("by_day", "groups", "total_credits", "requests", "fetched_at"):
+                assert view[key] == last_good[key]
+            check_billing_stale(["u1.info", "u2.info"])
+            failing.clear()
+
+            failing.add("token-u2")
+            converter._sync_usage(pool)
+            view = converter.CONFIG["usage_daily"]
+            assert view["total_credits"] == 30.0 and view["requests"] == 3  # Retain u2's snapshot.
+            assert view["partial"] is True and view["stale_accounts"] == ["u2.info"]
+
+            failing.clear()
+            snapshots["token-u2"] = {"by_day": {"2026-09-02": {"m": 25.0}},
+                                     "total_credits": 25.0, "requests": 4, "partial": False}
+            converter._sync_usage(pool)
+            view = converter.CONFIG["usage_daily"]
+            assert view["total_credits"] == 35.0 and view["partial"] is False  # Clear staleness after recovery.
+
+            paths[1].unlink()
+            pool.prune()
+            converter._sync_usage(pool)
+            view = converter.CONFIG["usage_daily"]
+            assert view["total_credits"] == 10.0  # Exclude deleted credentials.
+
+            with patch.object(converter.model_policy, "credential_enabled", return_value=False):
+                converter._sync_usage(pool)
+            assert converter.CONFIG["usage_daily"]["total_credits"] == 0
+            check_billing_stale([])
+            paths[0].unlink()
+            pool.prune()
+            converter._sync_usage(pool)
+            assert converter.CONFIG["usage_daily"]["groups"] == {}
+            check_billing_stale([])
+        finally:
+            credits.fetch_request_usage = orig_fetch
+            converter.CONFIG["usage_daily"], converter.CONFIG["usage_daily_accounts"], \
+                converter.CONFIG["control_store"] = saved
+    print("✅ test_sync_usage_keeps_per_account_snapshots_on_failure")
+
+
 def test_fetch_request_usage_paging():
-    """mock 分页明细：跨页聚合 credit，按 日期×模型 归并；请求天数夹到 30 天。"""
+    """Aggregate usage pages by day and model within the supported 30-day window."""
     pages = [
         {"code": 0, "data": {"total": 3, "data": [
             {"requestTime": "2026-09-01 10:00:00", "model": "glm-5.3", "credit": 0.5},
@@ -473,18 +706,18 @@ def test_fetch_request_usage_paging():
         u = credits.fetch_request_usage(_jwt("https://www.codebuddy.cn/x"), days=365)
     finally:
         credits.httpx.Client = orig
-    assert seen["pages"] == [1, 2], seen       # 按 total 停止分页
-    assert u["requests"] == 3 and abs(u["total_credits"] - 0.75) < 1e-9
+    assert seen["pages"] == [1, 2], seen       # Stop at the advertised total.
+    assert u["requests"] == 3 and abs(u["total_credits"] - 0.75) < 1e-9 and u["partial"] is False
     assert u["by_day"]["2026-09-01"]["glm-5.3"] == 0.75
-    assert "hy4-preview" in u["by_day"]["2026-09-02"]  # 免费模型 0 credit 也计入请求数
+    assert "hy4-preview" in u["by_day"]["2026-09-02"]  # Count zero-credit requests.
     import time as _t
     span = (_t.mktime(_t.strptime(seen["days"][0][:19], "%Y-%m-%d %H:%M:%S")))
-    assert abs((_t.time() - span) - 30 * 86400) < 3600  # days=365 被夹回 30（官方 >31 天返回空）
+    assert abs((_t.time() - span) - 30 * 86400) < 3600  # Clamp to the supported window.
     print("✅ test_fetch_request_usage_paging")
 
 
 def test_billing_balance_identity():
-    """核心不变式：hard_limit_usd − total_usage/100 == 剩余余额（One-API 算法自洽）。"""
+    """Preserve the subscription limit minus usage equals balance identity."""
     import converter
     with tempfile.TemporaryDirectory() as td:
         led = credits.CreditLedger(Path(td) / "ledger.json")
@@ -494,7 +727,7 @@ def test_billing_balance_identity():
         saved_led, saved_usage = converter.CONFIG.get("ledger"), converter.CONFIG.get("usage_daily")
         try:
             converter.CONFIG["ledger"] = led
-            # 明细可用：已用取官方明细（真实消耗 200 credits）
+            # Prefer official usage details over quota differences.
             day_map = {"2026-09-01": {"glm-5.3": 200.0}}
             converter.CONFIG["usage_daily"] = {"by_day": day_map,
                 "groups": {"domestic": {"by_day": day_map, "total_credits": 200.0,
@@ -503,23 +736,28 @@ def test_billing_balance_identity():
             t = converter._billing_totals()
             assert t["remaining"] == 1000.0 and t["used"] == 200.0 and t["quota"] == 1200.0
             assert t["used_source"] == "official_usage_detail"
-            # 端点级恒等式：客户端按 hard_limit_usd − total_usage/100 算出的正是真实剩余
+            # Subscription limit minus usage must equal the remaining balance.
             sub = converter.billing_subscription(None, None)
             usage = converter.billing_usage(None, None, None, None)
+            assert sub["codebuddy_partial"] is False  # Explicitly report complete data.
             assert abs(sub["hard_limit_usd"] - usage["total_usage"] / 100 - t["remaining_usd"]) < 0.01
             assert sub["codebuddy_credits_remaining"] == 1000.0
             assert sub["plan"]["title"].startswith("CodeBuddy Credits")
             assert usage["object"] == "list"
             assert usage["daily_costs"][0]["line_items"][0]["name"] == "glm-5.3"
-            # 明细缺失：回退额度差（1600-1000=600）且恒等式仍成立
+            # Quota-difference fallback must preserve the balance identity.
             converter.CONFIG["usage_daily"] = None
             t2 = converter._billing_totals()
             assert t2["used"] == 600.0 and t2["used_source"] == "quota_delta"
             assert abs(t2["quota_usd"] - t2["used_usd"] - t2["remaining_usd"]) < 0.01
-            assert converter.billing_usage(None, None, None, None)["daily_costs"] == []  # 无明细则不出 daily_costs
-            # 区间过滤只统计窗口内明细
+            assert converter.billing_usage(None, None, None, None)["daily_costs"] == []  # No fabricated daily details
+            # Include only usage within the requested interval.
             converter.CONFIG["usage_daily"] = {"by_day": {"2026-09-01": {"glm-5.3": 200.0},
                                                           "2026-09-05": {"glm-5.3": 50.0}},
+                                               "groups": {"domestic": {"by_day": {
+                                                   "2026-09-01": {"glm-5.3": 200.0},
+                                                   "2026-09-05": {"glm-5.3": 50.0}},
+                                                   "total_credits": 250.0, "requests": 3}},
                                                "total_credits": 250.0, "requests": 3,
                                                "fetched_at": time.time()}
             filtered = converter.billing_usage("2026-09-04", "2026-09-30", None, None)
@@ -531,8 +769,44 @@ def test_billing_balance_identity():
     print("✅ test_billing_balance_identity")
 
 
+def test_billing_usage_prices_each_day_by_site():
+    """Apply each region's credit rate to its own daily usage."""
+    import converter
+    with tempfile.TemporaryDirectory() as td:
+        led = credits.CreditLedger(Path(td) / "ledger.json")
+        led.update_credits("cn", {"credits": 100.0, "segments": [
+            {"remaining": 100.0, "total": 200.0, "expires_at": None}], "intl": False})
+        led.update_credits("ai", {"credits": 100.0, "segments": [
+            {"remaining": 100.0, "total": 200.0, "expires_at": None}], "intl": True})
+        saved = (converter.CONFIG.get("ledger"), converter.CONFIG.get("usage_daily"))
+        try:
+            converter.CONFIG["ledger"] = led
+            # Each region's 100-credit usage falls on a different day.
+            converter.CONFIG["usage_daily"] = {
+                "by_day": {"2026-09-01": {"m": 100.0}, "2026-09-02": {"m": 100.0}},
+                "groups": {"domestic": {"by_day": {"2026-09-01": {"m": 100.0}},
+                                        "total_credits": 100.0, "requests": 1},
+                           "international": {"by_day": {"2026-09-02": {"m": 100.0}},
+                                             "total_credits": 100.0, "requests": 1}},
+                "total_credits": 200.0, "requests": 2, "fetched_at": time.time()}
+            usage = converter.billing_usage(None, None, None, None)
+            days = {d["timestamp"]: d["line_items"] for d in usage["daily_costs"]}
+            import time as _t
+            d1 = _t.mktime(_t.strptime("2026-09-01", "%Y-%m-%d"))
+            d2 = _t.mktime(_t.strptime("2026-09-02", "%Y-%m-%d"))
+            cn_cents = 100 * 0.014 / 7.15 * 100   # Approximately 19.58 cents
+            assert abs(days[d1][0]["cost"] - cn_cents) < 0.01, days[d1]
+            assert abs(days[d2][0]["cost"] - 300.0) < 0.01, days[d2]  # 100 credits at USD 0.03
+            # Daily amounts sum to total monetary usage.
+            assert abs(sum(i["cost"] for d in usage["daily_costs"] for i in d["line_items"])
+                       - usage["total_usage"]) < 0.02
+        finally:
+            converter.CONFIG["ledger"], converter.CONFIG["usage_daily"] = saved
+    print("✅ test_billing_usage_prices_each_day_by_site")
+
+
 def test_billing_intl_split():
-    """国内/国际分组折算：单价各按站点，合计与恒等式仍成立。"""
+    """Preserve regional pricing and additive balance identities."""
     import converter
     with tempfile.TemporaryDirectory() as td:
         led = credits.CreditLedger(Path(td) / "ledger.json")
@@ -543,17 +817,17 @@ def test_billing_intl_split():
         saved = (converter.CONFIG.get("ledger"), converter.CONFIG.get("usage_daily"))
         try:
             converter.CONFIG["ledger"] = led
-            converter.CONFIG["usage_daily"] = None   # 无明细，走额度差口径
+            converter.CONFIG["usage_daily"] = None   # Use quota-difference fallback.
             t = converter._billing_totals()
             assert t["groups"]["domestic"]["credits_remaining"] == 1000.0
             assert t["groups"]["international"]["credits_remaining"] == 500.0
-            cn_usd = 1000 * 0.014 / 7.15          # 国内：CNY 单价 / 汇率
+            cn_usd = 1000 * 0.014 / 7.15          # Convert domestic CNY pricing to USD.
             assert abs(t["groups"]["domestic"]["balance_usd"] - cn_usd) < 0.01, t["groups"]
             assert abs(t["groups"]["international"]["balance_usd"] - 15.0) < 0.01  # 500×$0.03
             assert abs(t["remaining_usd"] - (cn_usd + 15.0)) < 0.01
-            # 跨组线性可加，余额恒等式不被破坏
+            # Regional amounts remain additive without breaking the balance identity.
             assert abs(t["quota_usd"] - t["used_usd"] - t["remaining_usd"]) < 0.01, t
-            # 人民币合计：国内按元计，国际按美元×汇率
+            # Convert international USD amounts before combining CNY totals.
             assert abs(t["remaining_cny"] - (1000 * 0.014 + 500 * 0.03 * 7.15)) < 0.01, t
             sub = converter.billing_subscription(None, None)
             assert sub["codebuddy_sites"]["international"]["credits_remaining"] == 500.0
@@ -564,7 +838,7 @@ def test_billing_intl_split():
 
 
 def test_current_models_intl_condition():
-    """默认视图合并国际来源；余额不参与发布，能力过滤与显式地域过滤仍相互隔离。"""
+    """Merge eligible international models while preserving explicit regional isolation."""
     import converter
     with tempfile.TemporaryDirectory() as td, patch.dict(converter.CONFIG, {
             "cred_pool": None, "cred": None, "model_catalogs": {}, "ledger": None,
@@ -573,12 +847,12 @@ def test_current_models_intl_condition():
             "models_intl": [{"id": "gpt-5.5", "supportsToolCall": True},
                             {"id": "img-1", "supportsToolCall": False}]}):
         assert converter.current_models("cn") == ["glm-5.3", "auto"]
-        assert converter.current_models("intl") == ["gpt-5.5"]  # 余额不参与发布，能力过滤生效
+        assert converter.current_models("intl") == ["gpt-5.5"]  # Balance does not gate catalogs.
         assert set(converter.current_models()) == {"glm-5.3", "gpt-5.5", "auto"}
         led = credits.CreditLedger(Path(td) / "l.json")
         led.update_credits("ai", {"credits": 0.0, "segments": [], "intl": True})
         converter.CONFIG["ledger"] = led
-        assert converter.current_models("intl") == ["gpt-5.5"]  # 国际额度为 0 仍发布
+        assert converter.current_models("intl") == ["gpt-5.5"]  # Zero balance does not gate catalogs.
         assert set(converter.current_models()) == {"glm-5.3", "gpt-5.5", "auto"}
         led.update_credits("ai", {"credits": 120.0, "segments": [
             {"remaining": 120.0, "total": 120.0, "expires_at": None}], "intl": True})
@@ -586,13 +860,13 @@ def test_current_models_intl_condition():
         assert converter.current_models("cn") == ["glm-5.3", "auto"]
         assert set(converter.current_models()) == {"glm-5.3", "gpt-5.5", "auto"}
         converter.CONFIG["models_intl"] = []
-        assert converter.current_models("intl") == []  # 有额度也不绕过明确空表
+        assert converter.current_models("intl") == []  # Positive balance cannot override an empty catalog.
         assert set(converter.current_models()) == {"glm-5.3", "auto"}
     print("✅ test_current_models_intl_condition")
 
 
 def test_guard_model():
-    """表外模型本地拦截为 404；表内/别名/关闭开关时放行。"""
+    """Reject unknown models unless an explicit guard bypass authorizes them."""
     import converter
     from fastapi import HTTPException
     saved = (converter.CONFIG.get("model_guard"), converter.CONFIG.get("models_remote"))
@@ -600,10 +874,10 @@ def test_guard_model():
         converter.CONFIG["model_guard"] = True
         converter.CONFIG["models_remote"] = [{"id": "glm-5.3", "supportsToolCall": True}]
         converter.invalidate_model_table()
-        converter.guard_model("glm-5.3")   # 表内
-        converter.guard_model("auto")      # 已知非空国内 CLI 目录的旧调度别名
+        converter.guard_model("glm-5.3")   # Known model
+        converter.guard_model("auto")      # Legacy alias in a known nonempty domestic CLI catalog
         with TestCase().assertRaises(HTTPException) as raised:
-            converter.guard_model("")  # 显式空模型不是默认模型别名
+            converter.guard_model("")  # Empty IDs are not default-model aliases.
         assert raised.exception.status_code == 400
         assert raised.exception.detail["error"]["param"] == "model"
         try:
@@ -615,14 +889,14 @@ def test_guard_model():
         else:
             raise AssertionError("表外模型必须被本地拦截")
         converter.CONFIG["model_guard"] = False
-        converter.guard_model("gpt-9.9")   # 关闭开关后放行
+        converter.guard_model("gpt-9.9")   # Explicitly disabled model guard
     finally:
         converter.CONFIG["model_guard"], converter.CONFIG["models_remote"] = saved
     print("✅ test_guard_model")
 
 
 def test_model_catalog_cache():
-    """模型表缓存：TTL 命中免拉云端、持久化可重载、站点组判定正确。"""
+    """Test catalog TTL, persisted reload and regional cache grouping."""
     with tempfile.TemporaryDirectory() as td:
         p = Path(td) / "catalog.json"
         c1 = credits.ModelCatalogCache(p, ttl=3600)
@@ -630,13 +904,13 @@ def test_model_catalog_cache():
         assert c1.age("domestic") is None
         c1.put("domestic", [{"id": "glm-5.3", "supportsToolCall": True}])
         assert c1.fresh("domestic") and len(c1.models("domestic")) == 1
-        assert not c1.fresh("international")        # 未拉过的组不暴露
-        c2 = credits.ModelCatalogCache(p, ttl=3600)  # 重新加载：持久化生效
+        assert not c1.fresh("international")        # Unsynchronized cache group
+        c2 = credits.ModelCatalogCache(p, ttl=3600)  # Reload persisted data.
         assert c2.fresh("domestic") and c2.models("domestic")[0]["id"] == "glm-5.3"
         assert c2.age("domestic") >= 0
         c3 = credits.ModelCatalogCache(p, ttl=60)
         c3._data["groups"]["domestic"]["fetched_at"] = time.time() - 120
-        assert not c3.fresh("domestic")             # TTL 过期后需重拉
+        assert not c3.fresh("domestic")             # Expired cache requires refresh.
         g = credits.ModelCatalogCache.group_for_token
         assert g(_jwt("https://www.codebuddy.cn/x")) == "domestic"
         assert g(_jwt("https://www.workbuddy.ai/x")) == "international"
@@ -663,8 +937,14 @@ if __name__ == "__main__":
     test_current_models_merge()
     test_credits_to_usd()
     test_aggregate_credits()
+    test_fetch_request_usage_rejects_invalid_success_payloads()
+    test_fetch_credits_distinguishes_empty_from_missing_structure()
+    test_sync_usage_keeps_per_account_snapshots_on_failure()
+    test_fetch_credits_paginates_until_short_page()
+    test_fetch_request_usage_marks_partial_at_page_cap()
     test_fetch_request_usage_paging()
     test_billing_balance_identity()
+    test_billing_usage_prices_each_day_by_site()
     test_billing_intl_split()
     test_current_models_intl_condition()
     test_guard_model()

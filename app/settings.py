@@ -3,10 +3,39 @@ from __future__ import annotations
 
 import math
 import os
+import re
+from urllib.parse import urlsplit
+
+
+def normalize_allowed_origins(value):
+    """Normalize a comma/space separated origin list; bare hosts default to HTTPS."""
+    entries = [entry for entry in re.split(r"[\s,]+", value.strip()) if entry]
+    if len(entries) > 32:
+        raise ValueError("admin_allowed_origins: 来源数量超出上限")
+    normalized = []
+    for entry in entries:
+        candidate = entry if "://" in entry else f"https://{entry}"
+        try:
+            parts = urlsplit(candidate)
+            port = parts.port
+        except ValueError:
+            raise ValueError(f"admin_allowed_origins: 来源无效 {entry!r}") from None
+        if (parts.scheme not in ("http", "https") or not parts.hostname
+                or parts.username is not None or parts.password is not None
+                or parts.path not in ("", "/") or parts.query or parts.fragment
+                or (port is not None and not 1 <= port <= 65535)):
+            raise ValueError(f"admin_allowed_origins: 来源无效 {entry!r}")
+        host = f"[{parts.hostname}]" if ":" in parts.hostname else parts.hostname
+        default_port = 443 if parts.scheme == "https" else 80
+        origin = f"{parts.scheme}://{host}" + (f":{port}" if port is not None and port != default_port else "")
+        if origin not in normalized:
+            normalized.append(origin)
+    return ",".join(normalized)
+
 
 
 def _item(default, type_, label, *, mode="hot", env=None, minimum=None, maximum=None,
-          choices=None, sensitive=False):
+          choices=None, sensitive=False, allow_empty=False, max_length=255, validator=None):
     value = {"default": default, "type": type_, "label": label, "mode": mode,
              "env": env, "sensitive": sensitive}
     if minimum is not None:
@@ -15,41 +44,62 @@ def _item(default, type_, label, *, mode="hot", env=None, minimum=None, maximum=
         value["max"] = maximum
     if choices is not None:
         value["choices"] = choices
+    if allow_empty:
+        value["allow_empty"] = True
+    if max_length != 255:
+        value["max_length"] = max_length
+    if validator is not None:
+        value["validator"] = validator
     return value
 
 
 SCHEMA = {
-    "host": _item("127.0.0.1", "string", "监听地址", mode="restart"),
-    "port": _item(8787, "integer", "监听端口", mode="restart", minimum=1, maximum=65535),
+    "host": _item("127.0.0.1", "string", "监听地址", mode="restart", env="CODEBUDDY2API_BIND"),
+    "port": _item(8787, "integer", "监听端口", mode="restart", env="CODEBUDDY2API_PORT", minimum=1, maximum=65535),
     "api_key": _item(None, "secret", "管理与推理密钥", mode="startup", env="CODEBUDDY2API_KEY", sensitive=True),
     "auth_file": _item(None, "paths", "显式凭证文件", mode="startup", sensitive=True),
     "auth_dir": _item(None, "path", "凭证目录", mode="startup", env="CODEBUDDY_AUTH_DIR", sensitive=True),
     "import_dir": _item(None, "path", "导入目录", mode="startup", env="CODEBUDDY_IMPORT_DIR", sensitive=True),
     "log_path": _item(None, "path", "兼容文本日志", mode="startup", env="CODEBUDDY2API_LOG", sensitive=True),
+    "admin_allowed_origins": _item("", "string", "管理页额外信任来源", env="CODEBUDDY2API_ADMIN_ORIGINS",
+                                   allow_empty=True, max_length=2000, validator=normalize_allowed_origins),
     "desensitize": _item(False, "boolean", "提示词脱敏"),
     "no_compact": _item(False, "boolean", "保留提示词全文"),
+    "keep_tool_metadata": _item(False, "boolean", "保留工具描述", env="CODEBUDDY2API_KEEP_TOOL_METADATA"),
     "skip_check": _item(False, "boolean", "跳过启动预检", mode="restart"),
     "credit_price_cny": _item(0.014, "number", "国内积分单价", minimum=0),
     "usd_rate": _item(7.15, "number", "美元人民币折算率", minimum=0.000001),
     "credit_price_usd": _item(0.03, "number", "国际积分单价", minimum=0),
     "model_catalog_ttl": _item(21600, "integer", "模型目录缓存秒数", minimum=0, maximum=31536000),
     "model_guard": _item(True, "boolean", "表外模型拦截"),
+    "model_capability_guard": _item(True, "boolean", "模型能力预检", env="CODEBUDDY2API_MODEL_CAPABILITY_GUARD"),
     "max_images": _item(16, "integer", "单请求图片上限", env="CODEBUDDY2API_MAX_IMAGES", minimum=0, maximum=10000),
     "image_policy": _item("truncate", "string", "超额图片策略", env="CODEBUDDY2API_IMAGE_POLICY", choices=["truncate", "error"]),
     "max_request_bytes": _item(32 * 1024 * 1024, "integer", "请求字节上限", env="CODEBUDDY2API_MAX_REQUEST_BYTES", minimum=1, maximum=1024**3),
     "log_body_limit": _item(65536, "integer", "文本正文预览字节", env="CODEBUDDY2API_LOG_BODY_LIMIT", minimum=0, maximum=1024**2),
-    "auto_trial": _item(False, "boolean", "自动领取体验积分", env="CODEBUDDY2API_AUTO_TRIAL"),
+    "failover_max": _item(0, "integer", "换凭证重放次数", env="CODEBUDDY2API_FAILOVER_MAX",
+                          minimum=0, maximum=10),
+    "retry_write_timeout": _item(False, "boolean", "写超时参与重放",
+                                 env="CODEBUDDY2API_RETRY_WRITE_TIMEOUT"),
+    "upstream_keepalive": _item(False, "boolean", "上游连接复用", mode="restart",
+                                env="CODEBUDDY2API_UPSTREAM_KEEPALIVE"),
+    "max_inflight_per_account": _item(0, "integer", "单账号在途上限（0 不限制）",
+                                      env="CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT", minimum=0, maximum=10000),
+    "request_context_mode": _item("legacy", "string", "请求上下文模式",
+                                  env="CODEBUDDY2API_REQUEST_CONTEXT_MODE", choices=["legacy", "scoped"]),
     "audit_max_bytes": _item(256 * 1024 * 1024, "integer", "审计明细预算", minimum=1024**2, maximum=1024**4),
     "audit_retention_days": _item(30, "integer", "审计明细保留天数", minimum=1, maximum=36500),
     "audit_diagnostic_bytes": _item(8192, "integer", "失败诊断最大字节", minimum=0, maximum=8192),
 }
 
 
-def validate_settings(values):
+def validate_settings(values, *, legacy=False):
     if not isinstance(values, dict):
         raise ValueError("values 必须是对象")
     clean = {}
     for key, value in values.items():
+        if legacy and key == "auto_trial" and type(value) is bool:
+            continue  # Retired persisted switch: accept old databases without enabling claims.
         spec = SCHEMA.get(key)
         if spec is None or spec["sensitive"]:
             raise ValueError("未知或启动来源锁定的配置项")
@@ -57,13 +107,18 @@ def validate_settings(values):
         valid = ((kind == "boolean" and type(value) is bool)
                  or (kind == "integer" and type(value) is int)
                  or (kind == "number" and type(value) in (int, float) and math.isfinite(value))
-                 or (kind == "string" and isinstance(value, str) and 0 < len(value) <= 255 and not any(ord(c) < 32 for c in value)))
+                 or (kind == "string" and isinstance(value, str)
+                     and (spec.get("allow_empty") or 0 < len(value))
+                     and len(value) <= spec.get("max_length", 255)
+                     and not any(ord(c) < 32 for c in value)))
         if not valid:
             raise ValueError(f"{key}: 类型或值无效")
         if "min" in spec and value < spec["min"] or "max" in spec and value > spec["max"]:
             raise ValueError(f"{key}: 超出允许范围")
         if "choices" in spec and value not in spec["choices"]:
             raise ValueError(f"{key}: 不支持的选项")
+        if spec.get("validator"):
+            value = spec["validator"](value)
         clean[key] = value
     return clean
 

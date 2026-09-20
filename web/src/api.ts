@@ -78,8 +78,10 @@ export function errorMessage(error: unknown): string {
         body.detail &&
         typeof body.detail === "object" &&
         "models" in body.detail
-      )
-        return `凭证仍被模型规则引用，请先解除绑定：${text(body.detail.models)}`;
+      ) {
+        const models = body.detail.models;
+        return `凭证仍被模型规则引用，请先解除绑定：${Array.isArray(models) ? models.map(text).join("、") : text(models)}`;
+      }
       return "保存冲突：配置已被其他操作更新。请关闭编辑并刷新后重新修改。";
     }
     if (error.response?.status === 401) return "会话已失效，请重新登录。";
@@ -166,6 +168,9 @@ export function useResource<T>(path: string, normalize: (value: unknown) => T) {
 export type ModelRule = {
   id: string;
   public_id: string;
+  upstream_id?: string;
+  custom?: boolean;
+  available?: boolean;
   enabled: boolean;
   keep_original: boolean;
   region: string;
@@ -173,8 +178,15 @@ export type ModelRule = {
   credential_ids: string[];
   credits?: unknown;
   credits_by_profile?: unknown;
+  capabilities?: unknown;
+  limits?: unknown;
+  metadata_by_profile?: unknown;
 };
-export function modelResponse(value: unknown): { revision: number; models: ModelRule[] } {
+export function modelResponse(value: unknown): {
+  revision: number;
+  models: ModelRule[];
+  model_capability_guard?: boolean;
+} {
   const data = object(value);
   if (typeof data.revision !== "number") throw new Error("模型响应缺少 revision");
   const models = list(data.models).map((m) => {
@@ -182,6 +194,8 @@ export function modelResponse(value: unknown): { revision: number; models: Model
       typeof m.id !== "string" ||
       typeof m.enabled !== "boolean" ||
       typeof m.keep_original !== "boolean" ||
+      (m.upstream_id !== undefined && typeof m.upstream_id !== "string") ||
+      (m.custom !== undefined && typeof m.custom !== "boolean") ||
       !Array.isArray(m.credential_ids) ||
       !m.credential_ids.every((id) => typeof id === "string")
     )
@@ -190,6 +204,9 @@ export function modelResponse(value: unknown): { revision: number; models: Model
       ...m,
       id: m.id,
       public_id: typeof m.public_id === "string" ? m.public_id : m.id,
+      upstream_id: typeof m.upstream_id === "string" ? m.upstream_id : m.id,
+      custom: m.custom === true,
+      available: typeof m.available === "boolean" ? m.available : undefined,
       enabled: m.enabled,
       keep_original: m.keep_original,
       region: typeof m.region === "string" ? m.region : "",
@@ -197,7 +214,12 @@ export function modelResponse(value: unknown): { revision: number; models: Model
       credential_ids: m.credential_ids as string[],
     };
   });
-  return { revision: data.revision, models };
+  return {
+    revision: data.revision,
+    models,
+    model_capability_guard:
+      typeof data.model_capability_guard === "boolean" ? data.model_capability_guard : undefined,
+  };
 }
 export type Credential = RecordValue & { id: string; name: string | null };
 export function credentialResponse(value: unknown): Credential[] {
@@ -205,6 +227,11 @@ export function credentialResponse(value: unknown): Credential[] {
     const id = c.account_key ?? c.id;
     if (typeof id !== "string" || !id) throw new Error("凭证缺少公开 account_key");
     const name = c.name ?? c.filename;
+    for (const field of ["auto_travel", "travel_supported", "trial_supported"])
+      if (c[field] !== undefined && typeof c[field] !== "boolean")
+        throw new Error("自动任务状态必须为布尔值");
+    for (const field of ["travel", "trial"])
+      if (c[field] !== undefined && c[field] !== null) object(c[field], "自动任务结果");
     return { ...c, id, name: typeof name === "string" && !/[\\/]/.test(name) ? name : null };
   });
 }

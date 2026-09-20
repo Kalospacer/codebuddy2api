@@ -8,7 +8,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 import converter
@@ -49,9 +49,48 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
                                   known_models=[item["id"] for item in self.management.admin_model_inventory()])
         return rule
 
+    def test_model_metadata_respects_alias_and_draft_scope_without_exposing_identity(self):
+        tables = {profile: [{**fixtures.model('shared-model', 'x0.00'), 'supportsImages': profile == 'cn-cli',
+                            'descriptionZh': 'safe-' + profile, 'accessToken': 'metadata-secret-canary',
+                            'uid': 'private-account'}] for profile in fixtures.PROFILES}
+        self.account_catalogs(tables)
+        self.policy(public_id='public-capabilities', profile='intl-work')
+        published = next(m for m in self.client.get('/v1/models').json()['data'] if m['id'] == 'public-capabilities')
+        self.assertEqual(set(published['metadata_by_profile']), {'intl-work'})
+        self.assertEqual(published['capabilities']['images'], 'unsupported')
+        self.assertNotIn('metadata-secret-canary', json.dumps(published))
+        self.assertNotIn('private-account', json.dumps(published))
+        response = self.client.post('/admin/models/shared-model/preview', json={
+            'public_id': 'public-capabilities', 'upstream_id': 'shared-model', 'enabled': True,
+            'keep_original': False, 'region': None, 'profile': 'cn-cli', 'credential_ids': []})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(set(response.json()['metadata_by_profile']), {'cn-cli'})
+        self.assertEqual(response.json()['capabilities']['images'], 'supported')
+        self.policy(public_id='public-capabilities', profile='intl-work', enabled=False)
+        rows = self.client.get('/admin/models').json()['models']
+        managed = next(row for row in rows if row['id'] == 'shared-model')
+        self.assertFalse(managed['enabled'])
+        self.assertEqual(set(managed['metadata_by_profile']), {'intl-work'})
+        self.assertNotIn('metadata-secret-canary', json.dumps(managed))
+
+    def test_managed_capability_guard_hot_toggle_does_not_remove_metadata(self):
+        self.configure(profiles=('intl-work',))
+        self.account_catalogs({'intl-work': [{**fixtures.model('shared-model', 'x0.00'), 'supportsImages': False}]})
+        body = self.payload(text=[{'type': 'image_url', 'image_url': {'url': 'https://example.invalid/a.png'}}])
+        response = self.client.post('/v1/chat/completions', json=body)
+        self.assertEqual(response.status_code, 400, response.text)
+        response = self.client.patch('/admin/settings', json={'revision': self.control.snapshot()['revision'],
+                                                            'values': {'model_capability_guard': False}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.post_ok('chat/completions', body, {'intl-work'})
+        data = self.client.get('/admin/models').json()
+        self.assertFalse(data['model_capability_guard'])
+        self.assertEqual(data['models'][0]['capabilities']['images'], 'unsupported')
+
+
     def test_managed_alias_all_protocols_strict_binding_and_response_names(self):
         identity = self.entries["intl-work"]["account_key"]
-        self.policy(public_id="garden-fast", region="intl", profile="intl-work", credential_ids=[identity])
+        self.policy(public_id="garden-fast", credential_ids=[identity])
         published = self.client.get("/v1/models").json()["data"]
         self.assertIn("garden-fast", [model["id"] for model in published])
         self.assertNotIn("shared-model", [model["id"] for model in published])
@@ -65,6 +104,109 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
                     self.post_rejected(endpoint, self.payload(endpoint, "shared-model"), (404,))
         self.management.admin_set_credential_enabled(identity, False)
         self.post_rejected("chat/completions", self.payload(selected_model="garden-fast"), (503,))
+
+    def test_custom_models_keep_upstream_and_binding_independent(self):
+        created = []
+        for label, profile in (("studio-cn", "cn-work"), ("studio-intl", "intl-work")):
+            response = self.client.post("/admin/models", json={
+                "revision": self.control.snapshot()["revision"], "public_id": label,
+                "upstream_id": "shared-model", "credential_ids": [self.entries[profile]["account_key"]]})
+            self.assertEqual(response.status_code, 201, response.text)
+            rule = response.json()["model"]
+            self.assertTrue(rule["custom"])
+            self.assertNotEqual(rule["id"], label)
+            created.append(rule)
+            for endpoint in fixtures.GENERATIONS:
+                for stream in (False, True):
+                    _, wire = self.post_ok(endpoint, self.payload(endpoint, label, stream=stream), {profile})
+                    self.assertEqual(wire["model"], "shared-model")
+        published = {row["id"] for row in self.client.get("/v1/models").json()["data"]}
+        self.assertTrue({"studio-cn", "studio-intl", "shared-model"} <= published)
+        self.assertTrue(all(row["id"] not in published for row in created))
+        self.post_rejected("chat/completions", self.payload(selected_model=created[0]["id"]), (404,))
+        bindings = {row["id"]: row["bindings"] for row in self.management.admin_credential_inventory()}
+        self.assertEqual(bindings[self.entries["cn-work"]["account_key"]], ["studio-cn"])
+        self.policy(enabled=False)  # Catalog toggles do not alter independent custom routes.
+        published = {row["id"] for row in self.client.get("/v1/models").json()["data"]}
+        self.assertNotIn("shared-model", published)
+        self.assertTrue({"studio-cn", "studio-intl"} <= published)
+        self.management.admin_set_credential_enabled(self.entries["cn-work"]["account_key"], False)
+        self.post_rejected("chat/completions", self.payload(selected_model="studio-cn"), (503,))
+        self.post_ok("chat/completions", self.payload(selected_model="studio-intl"), {"intl-work"})
+
+    def test_custom_model_crud_preview_unknown_and_collisions(self):
+        body = {"revision": 0, "public_id": "my-model", "upstream_id": "shared-model", "region": "cn"}
+        preview = self.client.post("/admin/models/preview", json=body)
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertTrue(preview.json()["candidates"])
+        self.assertEqual(self.control.snapshot()["revision"], 0)
+        created = self.client.post("/admin/models", json=body)
+        self.assertEqual(created.status_code, 201, created.text)
+        identifier = created.json()["model"]["id"]
+        self.assertEqual(self.client.post("/admin/models", json={**body, "revision": 1}).status_code, 400)
+        conflict = self.client.put("/admin/models/" + identifier, json={**body, "upstream_id": "missing"})
+        self.assertEqual(conflict.status_code, 409)
+        updated = self.client.put("/admin/models/" + identifier, json={**body, "revision": 1, "upstream_id": "cn-cli-only"})
+        self.assertEqual(updated.status_code, 200, updated.text)
+        _, wire = self.post_ok("chat/completions", self.payload(selected_model="my-model"), {"cn-cli"})
+        self.assertEqual(wire["model"], "cn-cli-only")
+        preview = self.client.post("/admin/models/preview", json={"public_id": "unready-model", "upstream_id": "missing"})
+        self.assertEqual(preview.status_code, 200, preview.text)
+        self.assertEqual(preview.json()["candidates"], [])
+        missing = self.client.post("/admin/models", json={"revision": 2, "public_id": "unready-model", "upstream_id": "missing"})
+        self.assertEqual(missing.status_code, 201, missing.text)
+        self.post_rejected("chat/completions", self.payload(selected_model="unready-model"), (404,))
+        self.assertNotIn("unready-model", [row["id"] for row in self.client.get("/v1/models").json()["data"]])
+        deleted = self.client.request("DELETE", "/admin/models/" + identifier, json={"revision": 3})
+        self.assertEqual(deleted.status_code, 200, deleted.text)
+        self.assertEqual(len(self.pool.entries()), 4)
+        self.post_rejected("chat/completions", self.payload(selected_model="my-model"), (404,))
+
+    def test_custom_auto_keeps_account_scope_through_backend_model_rewrite(self):
+        tables = fixtures.catalogs()
+        tables["intl-work"].append(fixtures.model("default-model", "x1"))
+        self.account_catalogs(tables)
+        identity = self.entries["intl-work"]["account_key"]
+        response = self.client.post("/admin/models", json={"revision": 0, "public_id": "my-auto",
+            "upstream_id": "auto", "credential_ids": [identity]})
+        self.assertEqual(response.status_code, 201, response.text)
+        self.assertIn("my-auto", {row["id"] for row in self.client.get("/v1/models").json()["data"]})
+        for endpoint in fixtures.GENERATIONS:
+            with self.subTest(endpoint=endpoint):
+                request, wire = self.post_ok(endpoint, self.payload(endpoint, "my-auto", stream=False), {"intl-work"})
+                self.assertEqual(wire["model"], "default-model")
+                self.assertEqual(request.headers["X-Domain"], "www.workbuddy.ai")
+                self.assertEqual(request.headers["X-User-Id"], "intl-work")
+
+    def test_custom_scope_conflicts_and_policy_changes_fail_closed(self):
+        from app import model_policy
+        identity = self.entries["intl-work"]["account_key"]
+        for scope in ({"region": "intl"}, {"profile": "intl-work"}):
+            response = self.client.post("/admin/models", json={
+                "revision": 0, "public_id": "invalid-scope", "upstream_id": "shared-model",
+                "credential_ids": [identity], **scope})
+            self.assertEqual(response.status_code, 400)
+        created = self.client.post("/admin/models", json={
+            "revision": 0, "public_id": "frozen-policy", "upstream_id": "shared-model"}).json()["model"]
+        missing_context = model_policy._request_policy.set(None)
+        try:
+            with self.assertRaises(HTTPException) as error:
+                model_policy.resolve(converter.CONFIG, "frozen-policy")
+            self.assertEqual(error.exception.status_code, 503)
+        finally:
+            model_policy._request_policy.reset(missing_context)
+        token = model_policy._request_policy.set({})
+        try:
+            self.assertEqual(model_policy.resolve(converter.CONFIG, "frozen-policy"), "shared-model")
+            self.control.update_model(created["id"], {**{k: v for k, v in created.items() if k != "id"},
+                                      "upstream_id": "cn-cli-only"}, 1)
+            with self.assertRaises(HTTPException) as changed:
+                model_policy.check_resolved(converter.CONFIG, "shared-model")
+            self.assertEqual(changed.exception.detail["error"]["code"], "model_policy_changed")
+            self.assertFalse(model_policy.route_allowed(converter.CONFIG, self.entries["cn-cli"], "shared-model"))
+        finally:
+            model_policy._request_policy.reset(token)
+
 
     def test_managed_disabled_cannot_bypass_guard_or_alias(self):
         self.policy(public_id="garden-fast", enabled=False, keep_original=True)

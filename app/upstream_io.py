@@ -1,7 +1,11 @@
-"""有界连接重试；请求已发送或响应已开始后不重放 POST。"""
+"""Bound upstream retries and prohibit replay after a response has opened."""
 
 import asyncio
 from contextlib import asynccontextmanager
+from datetime import timezone
+from email.utils import parsedate_to_datetime
+import math
+import time
 
 import json
 import httpx
@@ -10,7 +14,7 @@ from app.content_filter import ContentFilterDetector
 
 
 class UpstreamResponseError(Exception):
-    """保留上游 HTTP 状态与错误体，由端点映射为对应协议。"""
+    """Preserve upstream HTTP status and error bytes for protocol-specific mapping."""
 
     def __init__(self, status, raw):
         self.status = status
@@ -18,11 +22,45 @@ class UpstreamResponseError(Exception):
         super().__init__(f"upstream HTTP {status}")
 
 
-class ChatSSEAccumulator:
-    """聚合 Chat SSE，拒绝错误事件、空输出和无结束标记的残流。"""
+class UpstreamHTTPError(UpstreamResponseError):
+    """Distinguish actual upstream HTTP errors from failures synthesized while collecting a response."""
 
-    def __init__(self, *, collect=True):
+    def __init__(self, status, raw, *, retry_after=None):
+        super().__init__(status, raw)
+        self.retry_after = retry_after
+        self.headers = {"Retry-After": str(retry_after)} if retry_after is not None else {}
+
+
+MAX_RETRY_AFTER = 86400
+
+
+def parse_retry_after(value, *, now=None) -> int | None:
+    """Normalize bounded Retry-After seconds or HTTP dates; ignore invalid or expired values."""
+    if not isinstance(value, str) or len(value) > 128 or not value.isascii() or not value.isprintable():
+        return None
+    value = value.strip()
+    if not value:
+        return None
+    try:
+        if value.isdecimal():
+            delay = int(value)
+        else:
+            deadline = parsedate_to_datetime(value)
+            if deadline.tzinfo is None:
+                deadline = deadline.replace(tzinfo=timezone.utc)  # Obsolete HTTP asctime uses GMT.
+            delay = deadline.timestamp() - (time.time() if now is None else now)
+        return math.ceil(delay) if 0 <= delay <= MAX_RETRY_AFTER else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+class ChatSSEAccumulator:
+    """Collect Chat SSE and reject error events, empty output and incomplete streams."""
+
+    def __init__(self, *, collect=True, max_collect_bytes: int = 0):
         self.collect = collect
+        self.max_collect_bytes = max(0, int(max_collect_bytes or 0))
+        self.collected_bytes = 0
         self.content = []
         self.reasoning = []
         self.refusal = []
@@ -92,12 +130,11 @@ class ChatSSEAccumulator:
                     self.saw_output = True
             if "tool_calls" in delta and not isinstance(delta["tool_calls"], list):
                 raise ValueError("tool_calls")
-            if self.collect and delta.get("content"):
-                self.content.append(delta["content"])
-            if self.collect and delta.get("reasoning_content"):
-                self.reasoning.append(delta["reasoning_content"])
-            if self.collect and delta.get("refusal"):
-                self.refusal.append(delta["refusal"])
+            if self.collect:
+                for key in ("content", "reasoning_content", "refusal"):
+                    if delta.get(key):
+                        getattr(self, key if key != "reasoning_content" else "reasoning").append(delta[key])
+                        self._charge(len(delta[key].encode("utf-8")))
             for tool in delta.get("tool_calls") or []:
                 if not isinstance(tool, dict):
                     raise ValueError("tool")
@@ -118,8 +155,20 @@ class ChatSSEAccumulator:
                     self.saw_output = True
                 slot["name"] = function.get("name") or slot["name"]
                 if self.collect:
-                    slot["arguments"] += function.get("arguments") or ""
+                    piece = function.get("arguments") or ""
+                    slot["arguments"] += piece
+                    self._charge(len(piece.encode("utf-8")))
             self.filter_detector.feed(delta, choice.get("finish_reason"))
+
+    def _charge(self, size: int):
+        """Fail when collected bytes exceed the configured memory budget."""
+        if not self.collect or not self.max_collect_bytes:
+            return
+        self.collected_bytes += size
+        if self.collected_bytes > self.max_collect_bytes:
+            raise UpstreamResponseError(502, json.dumps({"error": {
+                "message": f"upstream response exceeds the {self.max_collect_bytes}-byte collection budget",
+                "type": "upstream_error", "code": "response_too_large"}}).encode())
 
     def result(self):
         if not self.saw_choice or not (self.done or self.finish_reason):
@@ -141,19 +190,55 @@ class ChatSSEAccumulator:
                 "usage": self.usage, "model": self.model}
 
 
+ERROR_BODY_LIMIT = 4 * 1024 * 1024  # Bound error-body memory usage.
+
+
+async def read_bounded_error(response, limit: int = ERROR_BODY_LIMIT) -> bytes:
+    """Read and truncate upstream error bytes within a fixed budget."""
+    if limit <= 0:
+        return b""
+    buf = bytearray()
+    async for chunk in response.aiter_bytes():
+        buf.extend(chunk[:limit - len(buf)])
+        if len(buf) >= limit:
+            break
+    return bytes(buf)
+
+
+# Connection failures occur before any request body is sent.
+BODY_NOT_ACCEPTED = (httpx.ConnectError, httpx.ConnectTimeout)
+# Write-timeout replay is opt-in because partial requests may already have been processed.
+WRITE_TIMEOUT = (httpx.WriteTimeout,)
+
+
 @asynccontextmanager
-async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=None):
-    """只重试一次建连失败，其他错误交给调用方按协议返回。"""
+async def _attempt_client(url, timeout, clients):
+    client = clients.get(url) if clients is not None else None
+    if client is not None:
+        yield client
+    else:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            yield client
+
+
+@asynccontextmanager
+async def open_backend_stream(url, headers, body, *, read_timeout=300, on_retry=None,
+                              retry_write_timeout=False, clients=None, headers_for_attempt=None):
+    """Retry connection failures once on a fresh client; write timeouts require explicit opt-in.
+    Never replay after the upstream response opens.
+    """
+    retryable = BODY_NOT_ACCEPTED + (WRITE_TIMEOUT if retry_write_timeout else ())
     timeout = httpx.Timeout(read_timeout, connect=15, write=60, pool=15)
     for attempt in range(2):
         opened = False
         try:
-            async with httpx.AsyncClient(timeout=timeout) as client:
-                async with client.stream("POST", url, headers=headers, json=body) as response:
+            async with _attempt_client(url, timeout, clients if attempt == 0 else None) as client:
+                attempt_headers = headers_for_attempt() if headers_for_attempt is not None else headers
+                async with client.stream("POST", url, headers=attempt_headers, json=body, timeout=timeout) as response:
                     opened = True
                     yield response
                     return
-        except (httpx.ConnectError, httpx.ConnectTimeout) as error:
+        except retryable as error:
             if opened or attempt == 1:
                 raise
             if on_retry is not None:

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""登录命令的扫码轮询、凭据保存和退出行为；运行 python3 tests/test_login.py。"""
+"""Test browser login polling, credential persistence and command exit behavior."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import contextlib
 import io
@@ -41,7 +41,7 @@ class LoginTests(unittest.TestCase):
             path = request.url.path
             if path.endswith("/auth/state"):
                 self.assertEqual(request.method, "POST")
-                self.assertEqual(request.url.params["platform"], "workbuddy")
+                self.assertEqual(request.url.params["platform"], "CLI" if domain == "www.codebuddy.ai" else "workbuddy")
                 return httpx.Response(200, json={"code": 0, "data": {
                     "state": "test-state", "authUrl": f"https://{domain}/login?state=test-state"}})
             self.assertEqual(request.method, "GET")
@@ -82,9 +82,29 @@ class LoginTests(unittest.TestCase):
         self.assertEqual(auth_oauth.validate_cred_data(credential), ("u1", None))
         if os.name != "nt":
             self.assertEqual(stat.S_IMODE(saved.stat().st_mode), 0o600)
-        self.assertIsNone(pool.pick(None, region="cn"))  # 内部过滤不能把国际账号当作国内账号。
+        self.assertIsNone(pool.pick(None, region="cn"))  # Never treat international credentials as domestic.
         self.assertEqual(pool.pick(None).summary()["uid"], "u1")
         self.assertIn("账号已保存", self.stdout.getvalue())
+        self.assert_no_tokens_printed()
+
+    def test_international_commands_keep_same_uid_products_separate(self):
+        pool = converter.CredentialPool(scan=True)
+        for site, domain in (("intl", "www.workbuddy.ai"), ("intl-codebuddy", "www.codebuddy.ai")):
+            with self.subTest(site=site), patch.object(converter, "_OAUTH", self.manager(domain)), \
+                    patch("sys.argv", ["converter.py", "login", "--site", site, "--no-browser"]), \
+                    patch("converter.uvicorn.run") as server, patch("converter.threading.Thread") as thread:
+                self.polls = 0
+                self.assertEqual(converter.main(), 0)
+                server.assert_not_called()
+                thread.assert_not_called()
+        files = list(self.directory.glob("*.info"))
+        self.assertEqual(len(files), 2)
+        credentials = [json.loads(path.read_text()) for path in files]
+        self.assertEqual({item["auth"]["domain"] for item in credentials}, {"www.workbuddy.ai", "www.codebuddy.ai"})
+        self.assertTrue(all(auth_oauth.validate_cred_data(item) == ("u1", None) for item in credentials))
+        pool.reload(files, reset=False)
+        self.assertEqual({entry["profile"] for entry in pool._entries}, {"intl-work", "intl-cli"})
+        self.browser.assert_not_called()
         self.assert_no_tokens_printed()
 
     def test_relogin_updates_existing_name_and_preserves_other_accounts(self):

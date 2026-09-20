@@ -1,12 +1,9 @@
 #!/usr/bin/env python3
-"""拒绝文本与空终止回归；仅内存 SSE、MockTransport，不读凭据或写日志。
-
-运行：python3 tests/test_refusal.py
-"""
+"""Test refusals and empty stream termination using in-memory SSE and MockTransport."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from copy import deepcopy
 import json
@@ -69,7 +66,9 @@ class AdapterRefusalTests(unittest.TestCase):
                         self.assertEqual(events(raw)[-1]["type"], "message_stop")
                     else:
                         final = events(raw)[-1]
-                        self.assertEqual(final["type"], "response.completed")
+                        # Preserve refusal text while reporting an incomplete response.
+                        expected_type = "response.completed" if finish == "stop" else "response.incomplete"
+                        self.assertEqual(final["type"], expected_type)
                         self.assertEqual(adapted_text(final["response"], False), REFUSAL)
                         self.assertEqual(final["response"]["output"][0]["content"], [
                             {"type": "output_text", "text": REFUSAL, "annotations": []}])
@@ -217,7 +216,11 @@ class EndpointRefusalTests(unittest.TestCase):
                                 self.assertIn("data: [DONE]", response.text)
                             else:
                                 self.assertEqual(delta_text(parsed, route == ROUTES[2]), REFUSAL)
-                                expected = "message_stop" if route == ROUTES[2] else "response.completed"
+                                if route == ROUTES[2]:
+                                    expected = "message_stop"
+                                else:
+                                    expected = ("response.completed" if finish == "stop"
+                                                else "response.incomplete")
                                 self.assertEqual(parsed[-1]["type"], expected)
 
     def test_empty_stop_done_errors_on_all_six_paths_without_normal_completion_or_replay(self):
@@ -227,18 +230,12 @@ class EndpointRefusalTests(unittest.TestCase):
                 for tools in (False, True):
                     with self.subTest(route=route, stream=stream, tools=tools):
                         response = self.request(route, stream, tools)
-                        if not stream:
-                            self.assertEqual(response.status_code, 502, response.text)
-                            self.assertIn("error", response.json().get("detail", response.json()))
-                            continue
-                        parsed = events(response.text)
-                        self.assertTrue(any("error" in event for event in parsed), response.text)
+                        # Detect empty termination before committing headers and return HTTP 502.
+                        self.assertEqual(response.status_code, 502, response.text)
+                        self.assertIn("error", response.json().get("detail", response.json()))
                         self.assertNotIn("data: [DONE]", response.text)
-                        self.assertFalse(any(choice.get("finish_reason") for event in parsed
-                                             for choice in event.get("choices", [])), response.text)
-                        self.assertFalse(any(event.get("type") in (
-                            "response.completed", "response.output_item.done", "response.output_text.done",
-                            "message_stop", "message_delta") for event in parsed), response.text)
+                        self.assertNotIn("response.completed", response.text)
+                        self.assertNotIn("message_stop", response.text)
 
 
 if __name__ == "__main__":

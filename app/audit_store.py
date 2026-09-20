@@ -1,13 +1,5 @@
-"""Bounded, metadata-only SQLite audit storage (no import-time I/O).
-
-Methods are synchronous: ASGI callers must offload them. Lock and SQLite busy
-waits are capped at 250ms; SQL has a cooperative 1s progress deadline (not a hard
-wall-clock guarantee for filesystem I/O). Failures are observable, not retried.
-Ingest deduplication and aggregates intentionally outlive all detail eviction.
-Detail accounting is transactional; indexed cleanup commits bounded batches.
-Large budget/retention reductions converge on subsequent writes or detail reads
-(including storage()), reported as pending_cleanup until complete. This is a
-logical detail budget, not a bound on aggregate, dedup, or physical file size.
+"""Store metadata-only SQLite audits with bounded waits; detail eviction preserves aggregates.
+ASGI callers must offload synchronous methods; capacity limits cover logical detail storage only.
 """
 from __future__ import annotations
 
@@ -23,7 +15,7 @@ import time
 import uuid
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 _CLEANUP_BATCH = 128
 _CLEANUP_SECONDS = 0.05
 METRICS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
@@ -55,11 +47,13 @@ def safe_attempt(value: Any) -> dict:
         return {}
     result = {}
     for key in ("stage", "code", "error_code", "model", "upstream_model", "profile",
-                "credential", "usage_source", "outcome"):
+                "credential", "usage_source", "outcome", "consent_source", "agreement_revision", "conversation_id", "request_id",
+                "attempt_id", "upstream_request_id", "session_source"):
         clean = safe_label(value.get(key))
         if clean is not None:
             result[key] = clean
-    for key in ("status_code", "duration_ms", "attempt", "retry_after"):
+    for key in ("status_code", "duration_ms", "attempt", "retry_after", "max_attempts", "total_tokens",
+                "attempt_index", "dropped", "merged_runs", "merged_messages"):
         clean = number(value.get(key))
         if clean is not None:
             result[key] = clean
@@ -125,11 +119,11 @@ class AuditStore:
             self._db.execute("BEGIN IMMEDIATE")
             version = self._db.execute("PRAGMA user_version").fetchone()[0]
             tables = self._db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
-            if version not in (0, SCHEMA_VERSION) or (version == 0 and tables):
+            if version not in (0, 1, SCHEMA_VERSION) or (version == 0 and tables):
                 raise ValueError("unsupported audit schema")
             self._db.execute("CREATE TABLE IF NOT EXISTS state (id INTEGER PRIMARY KEY CHECK(id=1), epoch INTEGER NOT NULL, detail_generation INTEGER NOT NULL, cleared_at REAL NOT NULL)")
             self._db.execute("INSERT OR IGNORE INTO state VALUES(1,0,0,0)")
-            self._db.execute("CREATE TABLE IF NOT EXISTS ingest (id TEXT PRIMARY KEY, kind TEXT NOT NULL)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS ingest (id TEXT PRIMARY KEY, kind TEXT NOT NULL, created_at REAL NOT NULL)")
             self._db.execute("CREATE TABLE IF NOT EXISTS requests (id TEXT PRIMARY KEY, started_at REAL NOT NULL, model TEXT, profile TEXT, credential TEXT, outcome TEXT, status_code INTEGER, payload TEXT NOT NULL, logical_bytes INTEGER NOT NULL)")
             self._db.execute("CREATE INDEX IF NOT EXISTS requests_time ON requests(started_at,id)")
             self._db.execute("CREATE TABLE IF NOT EXISTS attempts (request_id TEXT NOT NULL, ordinal INTEGER NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(request_id,ordinal))")
@@ -138,12 +132,23 @@ class AuditStore:
             self._init_accounting()
             for table in ("stats_hourly", "stats_daily", "stats_totals"):
                 self._db.execute(f"CREATE TABLE IF NOT EXISTS {table} (bucket INTEGER NOT NULL, dimension TEXT NOT NULL, dimension_key TEXT NOT NULL, payload TEXT NOT NULL, PRIMARY KEY(bucket,dimension,dimension_key))")
+            self._migrate_ingest_time()
             self._db.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
             self._epoch = self._db.execute("SELECT epoch FROM state").fetchone()[0]
             self._db.execute("COMMIT")
         except Exception:
             self._db.close()
             raise
+
+    def _migrate_ingest_time(self):
+        # Backfill dedup timestamps so retention can expire them alongside request details.
+        columns = [row[1] for row in self._db.execute("PRAGMA table_info(ingest)").fetchall()]
+        if "created_at" not in columns:
+            self._db.execute("ALTER TABLE ingest ADD COLUMN created_at REAL")
+            self._db.execute("""UPDATE ingest SET created_at=COALESCE(
+                (SELECT started_at FROM requests WHERE requests.id=ingest.id),
+                (SELECT started_at FROM events WHERE events.id=ingest.id), ?)""", (time.time(),))
+        self._db.execute("CREATE INDEX IF NOT EXISTS ingest_time ON ingest(created_at)")
 
     def _init_accounting(self):
         # Additive v1 migration: scan legacy details only once, under the same
@@ -298,7 +303,7 @@ class AuditStore:
             state = self._db.execute("SELECT * FROM state").fetchone()
             if data["epoch"] != state["epoch"]:
                 return {"ok": True, "recorded": False, "reason": "stale_epoch"}
-            if not self._db.execute("INSERT OR IGNORE INTO ingest VALUES(?, 'request')", (data["id"],)).rowcount:
+            if not self._db.execute("INSERT OR IGNORE INTO ingest VALUES(?, 'request', ?)", (data["id"], data["started_at"])).rowcount:
                 return {"ok": True, "recorded": False, "reason": "duplicate"}
             self._aggregate(data)
             generation = record.get("detail_generation")
@@ -338,12 +343,20 @@ class AuditStore:
             if time.monotonic() >= deadline:
                 break
             self._db.execute(f"DELETE FROM {table} WHERE id=?", (record_id,))
+        # Expire dedup records with request details to bound retention growth.
+        for row in self._db.execute("SELECT id FROM ingest WHERE created_at<? ORDER BY created_at LIMIT ?",
+                                    (cutoff, _CLEANUP_BATCH)):
+            if time.monotonic() >= deadline:
+                break
+            self._db.execute("DELETE FROM ingest WHERE id=?", (row[0],))
 
     def _cleanup_pending(self, budget=None, retention_days=None):
         budget = self.max_bytes if budget is None else budget
         cutoff = time.time() - (self.retention_days if retention_days is None else retention_days) * 86400
         accounting = self._db.execute("SELECT logical_bytes,cleanup_target FROM detail_accounting WHERE id=1").fetchone()
-        return (accounting[0] > budget or accounting[1] is not None or any(
+        ingest_expired = self._db.execute(
+            "SELECT 1 FROM ingest WHERE created_at<? LIMIT 1", (cutoff,)).fetchone()
+        return (accounting[0] > budget or accounting[1] is not None or ingest_expired or any(
             self._db.execute(f"SELECT 1 FROM {table} WHERE started_at<? LIMIT 1", (cutoff,)).fetchone()
             for table in ("requests", "events")))
 
@@ -382,7 +395,7 @@ class AuditStore:
             if source.get("epoch", state["epoch"]) != state["epoch"]:
                 return {"ok": True, "recorded": False, "reason": "stale_epoch"}
             event_id = safe_label(source.get("event_id", source.get("id"))) or uuid.uuid4().hex
-            if not self._db.execute("INSERT OR IGNORE INTO ingest VALUES(?,?)", (event_id, kind)).rowcount:
+            if not self._db.execute("INSERT OR IGNORE INTO ingest VALUES(?,?,?)", (event_id, kind, started_at)).rowcount:
                 return {"ok": True, "recorded": False, "reason": "duplicate"}
             if (started_at <= state["cleared_at"] or
                     source.get("detail_generation", state["detail_generation"]) != state["detail_generation"]):
@@ -454,12 +467,16 @@ class AuditStore:
             return json.loads(row[0]) if row else None
         return self._run(fetch, write=True)
 
-    def dashboard(self, days=30):
+    def dashboard(self, days=30, granularity="auto"):
         days = int(days)
-        if not 1 <= days <= 36500:
-            raise ValueError("invalid days")
+        if not 1 <= days <= 36500 or granularity not in ("auto", "hour", "day"):
+            raise ValueError("invalid dashboard range or granularity")
+        grain = ("hour" if days == 1 else "day") if granularity == "auto" else granularity
+        if grain == "hour" and days > 90:
+            raise ValueError("hourly range exceeds 90 days")
         now = time.time()
         start = int(now // 86400) * 86400 - (days - 1) * 86400
+        period = {"days": days, "start": start, "end": now, "timezone": "UTC", "granularity": grain}
         def fetch():
             summary = self._empty_stats()
             series, models, profiles = [], {}, {}
@@ -468,17 +485,28 @@ class AuditStore:
                 stats = json.loads(row["payload"])
                 if row["dimension"] == "global":
                     self._merge(summary, stats)
-                    series.append({"bucket": row["bucket"], "date": time.strftime("%Y-%m-%d", time.gmtime(row["bucket"])), **stats})
+                    if grain == "day":
+                        series.append({"bucket": row["bucket"], **stats})
                 elif row["dimension"] in ("model", "profile"):
                     target = models if row["dimension"] == "model" else profiles
                     self._merge(target.setdefault(row["dimension_key"], self._empty_stats()), stats)
+            if grain == "hour":
+                rows = self._db.execute("SELECT bucket,payload FROM stats_hourly WHERE dimension='global' AND bucket>=? AND bucket<=? ORDER BY bucket", (start, now)).fetchall()
+                series = [{"bucket": row["bucket"], **json.loads(row["payload"])} for row in rows]
+            partial = grain == "hour" and sum(row["requests"] for row in series) != summary["requests"]
+            step = 3600 if grain == "hour" else 86400
+            if days <= 90 and not partial:
+                recorded = {row["bucket"]: row for row in series}
+                series = [recorded.get(bucket, {"bucket": bucket, **self._empty_stats()})
+                          for bucket in range(start, int(now // step) * step + 1, step)]
+            for row in series:
+                row["date"] = time.strftime("%Y-%m-%d %H:00" if grain == "hour" else "%Y-%m-%d", time.gmtime(row["bucket"]))
             summary["success_rate"] = summary["success"] / summary["requests"] if summary["requests"] else None
             return {"summary": summary, "series": series,
                     "models": [{"model": key, **value} for key, value in models.items()],
                     "profiles": [{"profile": key, **value} for key, value in profiles.items()],
-                    "generated_at": now, "range": {"days": days, "start": start, "end": now, "timezone": "UTC"}}
-        return self._run(fetch, {"summary": self._empty_stats(), "series": [], "models": [], "profiles": [], "generated_at": now, "range": {"days": days, "start": start, "end": now}, "degraded": True})
-
+                    "generated_at": now, "range": {**period, "partial": partial}}
+        return self._run(fetch, {"summary": self._empty_stats(), "series": [], "models": [], "profiles": [], "generated_at": now, "range": period, "degraded": True})
     def storage(self):
         def fetch():
             self._prune()

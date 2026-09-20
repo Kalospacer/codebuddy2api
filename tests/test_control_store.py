@@ -66,6 +66,22 @@ class ControlStoreTests(unittest.TestCase):
                 self.store.update_model(source, rule, 1)
         self.assertEqual(self.store.snapshot()["revision"], 1)
 
+    def test_legacy_combined_scopes_load_without_widening_and_require_explicit_edit(self):
+        from app import model_policy
+        legacy = {"public_id": "legacy", "enabled": True, "keep_original": False,
+                  "region": "cn", "profile": None, "credential_ids": ["cn-account", "intl-account"]}
+        self.store._update(0, lambda state: state["models"].update({"real": legacy}))
+        reopened = ControlStore(self.path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.snapshot()["models"]["real"], legacy)
+        config = {"control_store": reopened}
+        self.assertTrue(model_policy.route_allowed(config, {"profile": "cn-cli", "account_key": "cn-account"}, "real"))
+        self.assertFalse(model_policy.route_allowed(config, {"profile": "intl-cli", "account_key": "intl-account"}, "real"))
+        with self.assertRaises(ValueError):
+            reopened.update_model("real", legacy, 1)
+        self.assertEqual(reopened.snapshot()["revision"], 1)
+
+
     def test_credential_metadata_and_no_secret_settings(self):
         self.store.set_credential("account-fingerprint", False)
         self.assertEqual(self.store.snapshot()["credentials"], {"account-fingerprint": {"enabled": False}})
@@ -108,6 +124,35 @@ class ControlStoreTests(unittest.TestCase):
         for invalid in ({"usd_rate": float("nan")}, {"port": 65536}, {"audit_diagnostic_bytes": 8193}):
             with self.assertRaises(ValueError):
                 validate_settings(invalid)
+
+    def test_tool_metadata_persistence_precedence_and_locking(self):
+        key = "keep_tool_metadata"
+        env_key = "CODEBUDDY2API_KEEP_TOOL_METADATA"
+        defaults = {"control_store": self.store}
+        apply_persisted_settings(defaults, environ={})
+        self.assertIs(defaults[key], False)
+        initial = next(item for item in resolve_settings(defaults) if item["key"] == key)
+        self.assertFalse(initial["locked"])
+        self.assertEqual(initial["mode"], "hot")
+        self.store.update_settings({key: True}, 0)
+        reopened = ControlStore(self.path)
+        self.addCleanup(reopened.close)
+        for env, explicit, expected, source in (
+            ({}, (), True, "management"),
+            ({env_key: "false"}, (), False, "environment"),
+            ({env_key: "true"}, (key,), False, "cli"),
+        ):
+            with self.subTest(env=env, explicit=explicit):
+                config = {"control_store": reopened, key: False}
+                apply_persisted_settings(config, explicit=explicit, environ=env)
+                self.assertIs(config[key], expected)
+                item = next(item for item in resolve_settings(config) if item["key"] == key)
+                self.assertEqual(item["source"], source)
+                self.assertEqual(item["locked"], source != "management")
+                self.assertIs(item["stored"], True)
+        for invalid in ("true", 1, None):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                validate_settings({key: invalid})
 
 
 if __name__ == "__main__":

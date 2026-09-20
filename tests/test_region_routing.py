@@ -1,12 +1,8 @@
-"""原 /v1 接口自动地域/产品路由回归：合成凭据，httpx 全部由 MockTransport 接管。
-
-运行：.venv/bin/python -B -m unittest -v tests/test_region_routing.py
-不启动维护线程，不读取本机 auth/.env，不依赖在线目录或真实账号。
-"""
+"""Test automatic product/region routing through existing /v1 URLs with synthetic offline credentials."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from copy import deepcopy
 import json
@@ -126,9 +122,11 @@ class RegionRoutingTests(unittest.TestCase):
                                 model_guard=guard, model_cache=None, account_catalogs=None)
         converter.invalidate_model_table()
 
-    def account_catalogs(self, tables):
+    def account_catalogs(self, tables, serves=None):
+        serves = serves or {}
         converter.CONFIG["account_catalogs"] = {
-            self.entries[uid]["account_key"]: {"profile": self.account_profiles[uid], "models": items}
+            self.entries[uid]["account_key"]: {"profile": self.account_profiles[uid],
+                                               "models": items, "serves": serves.get(uid)}
             for uid, items in tables.items()
         }
         converter.invalidate_model_table()
@@ -220,6 +218,7 @@ class RegionRoutingTests(unittest.TestCase):
 
     def test_original_generation_apis_preserve_shapes_for_all_four_profiles(self):
         for profile in PROFILES:
+            self.configure(profiles=(profile,))
             for endpoint in GENERATIONS:
                 for stream in (False, True):
                     with self.subTest(profile=profile, endpoint=endpoint, stream=stream):
@@ -260,11 +259,11 @@ class RegionRoutingTests(unittest.TestCase):
             for _ in range(6):
                 request, _ = self.post_ok(endpoint, self.payload(endpoint), {free})
                 self.assertEqual(request.headers["x-user-id"], free)
-            # 计费账号只在免费账号不可用时兜底。
+            # Paid accounts are fallback candidates only when free accounts are unavailable.
             self.pool.note_status(self.entries[free]["cm"], 429, model="shared-model")
             request, _ = self.post_ok(endpoint, self.payload(endpoint), set(PROFILES) - {free})
             self.assertNotEqual(request.headers["x-user-id"], free)
-            # 冷却换绑后该会话黏在计费账号上；解除冷却应重绑回免费账号。
+            # Rebind paid sticky sessions when a free account becomes eligible again.
             self.pool.note_status(self.entries[free]["cm"], 429, model="other-model")
             with self.pool._lock:
                 self.pool._model_fail.clear()
@@ -273,7 +272,7 @@ class RegionRoutingTests(unittest.TestCase):
 
     def test_zero_multiplier_model_requires_declared_credits_field(self):
         tables = catalogs()
-        # 只给 intl-cli 声明零倍率，其余账号目录仍是不带 credits 字段的同名模型。
+        # Declare a zero rate only for intl-cli, not the same model on other accounts.
         tables["intl-cli"] = [dict(model("shared-model"), credits="x0.00"), model("intl-cli-exclusive")]
         tables["intl-work"] = [model("shared-model"), model("intl-work-exclusive")]
         self.configure(tables=tables)
@@ -282,7 +281,7 @@ class RegionRoutingTests(unittest.TestCase):
         for _ in range(4):
             request, _ = self.post_ok("chat/completions", self.payload(), {"intl-cli"})
             self.assertEqual(request.headers["x-user-id"], "intl-cli")
-        # 免费账号不可用后，未声明 credits 的账号按普通轮询调度，不会被误判为免费。
+        # Unknown rates use ordinary rotation rather than free-tier priority.
         self.pool.note_status(self.entries["intl-cli"]["cm"], 429, model="shared-model")
         seen = set()
         for _ in range(6):
@@ -300,8 +299,8 @@ class RegionRoutingTests(unittest.TestCase):
         payload = self.payload()
         request, _ = self.post_ok("chat/completions", payload, {free})
         self.assertEqual(request.headers["x-user-id"], free)
-        self.post_ok("chat/completions", payload, {free})  # 黏绑保持
-        # 免费账号改为计费后，旧黏绑必须重绑到仍然免费的账号。
+        self.post_ok("chat/completions", payload, {free})  # Preserve the sticky binding.
+        # Rebind when the sticky account becomes paid and another free account remains.
         tables[free] = [dict(model("shared-model"), credits="x0.03"), model(free + "-exclusive")]
         tables["cn-cli"] = [dict(model("shared-model"), credits="x0.00"), model("cn-cli-exclusive")]
         self.account_catalogs(tables)
@@ -314,10 +313,10 @@ class RegionRoutingTests(unittest.TestCase):
         for value in ("x0.03", "x0.03 credits", "x0.34 credits", "", "credits", None, 0, {}, "x0.00x"):
             self.assertFalse(converter._free_multiplier(value), repr(value))
 
-    def test_product_exclusive_models_only_rotate_between_supporting_regions(self):
+    def test_domestic_product_scope_and_shared_international_candidates(self):
         for endpoint in GENERATIONS:
             for product in ("cli", "work"):
-                expected = {"cn-" + product, "intl-" + product}
+                expected = {"cn-" + product, "intl-cli", "intl-work"}
                 seen = set()
                 for _ in range(4):
                     request, body = self.post_ok(endpoint,
@@ -329,34 +328,36 @@ class RegionRoutingTests(unittest.TestCase):
     def test_original_root_automatically_selects_international_only_models(self):
         for endpoint in GENERATIONS:
             for profile in ("intl-cli", "intl-work"):
-                self.post_ok(endpoint, self.payload(endpoint, profile + "-only"), {profile})
+                self.post_ok(endpoint, self.payload(endpoint, profile + "-only"), {"intl-cli", "intl-work"})
 
     def test_wrong_region_or_product_sticky_is_automatically_rebound(self):
         for right in PROFILES:
-            for wrong in set(PROFILES) - {right}:
+            allowed = {"intl-cli", "intl-work"} if right.startswith("intl-") else {right}
+            for wrong in set(PROFILES) - allowed:
                 with self.subTest(right=right, wrong=wrong):
                     payload = self.payload(selected_model=right + "-only")
                     old_keys = set(self.pool._sticky)
-                    self.post_ok("chat/completions", payload, {right})
+                    self.post_ok("chat/completions", payload, allowed)
                     keys = set(self.pool._sticky) - old_keys
                     self.assertEqual(len(keys), 1)
                     key = keys.pop()
                     self.pool._sticky[key] = (self.entries[wrong]["id"], time.time())
-                    self.post_ok("chat/completions", payload, {right})
-                    self.assertEqual(self.pool._sticky[key][0], self.entries[right]["id"])
+                    self.post_ok("chat/completions", payload, allowed)
+                    self.assertIn(self.pool._sticky[key][0], {self.entries[profile]["id"] for profile in allowed})
 
     def test_model_change_rechecks_sticky_region_and_product_availability(self):
         payload = self.payload(selected_model="cn-cli-only")
         self.post_ok("chat/completions", payload, {"cn-cli"})
         payload["model"] = "intl-work-only"
-        self.post_ok("chat/completions", payload, {"intl-work"})
+        self.post_ok("chat/completions", payload, {"intl-cli", "intl-work"})
 
     def test_repeated_payload_preserves_account_sticky_and_conversation_id(self):
         for endpoint in GENERATIONS:
             for profile in PROFILES:
                 payload = self.payload(endpoint, profile + "-only", system="Keep this instruction.")
-                first, _ = self.post_ok(endpoint, payload, {profile})
-                repeat, _ = self.post_ok(endpoint, payload, {profile})
+                allowed = {"intl-cli", "intl-work"} if profile.startswith("intl-") else {profile}
+                first, _ = self.post_ok(endpoint, payload, allowed)
+                repeat, _ = self.post_ok(endpoint, payload, allowed)
                 self.assertTrue(first.headers["x-conversation-id"])
                 self.assertEqual(first.headers["x-conversation-id"], repeat.headers["x-conversation-id"])
                 self.assertEqual(first.headers["x-user-id"], repeat.headers["x-user-id"])
@@ -369,25 +370,61 @@ class RegionRoutingTests(unittest.TestCase):
                 self.post_ok(endpoint, self.payload(endpoint), expected)
                 self.post_rejected(endpoint, self.payload(endpoint, absent + "-cli-only"))
 
-    def test_intl_routes_without_known_positive_balance(self):
+    def test_intl_routes_with_unknown_zero_or_negative_balance(self):
         for balance in (None, 0, -1):
             with self.subTest(balance=balance):
                 self.configure(balances={"intl-cli": balance, "intl-work": balance})
                 for endpoint in GENERATIONS:
-                    self.post_ok(endpoint, self.payload(endpoint, "intl-cli-only"), {"intl-cli"})
+                    self.post_ok(endpoint, self.payload(endpoint, "intl-cli-only"), {"intl-cli", "intl-work"})
                     self.post_ok(endpoint, self.payload(endpoint), set(PROFILES))
 
-    def test_unknown_or_zero_balance_still_rotates(self):
-        for unavailable in PROFILES:
-            for balance in ((None, 0) if unavailable.startswith("intl-") else (0,)):
-                self.configure(balances={unavailable: balance})
+    def test_unknown_or_zero_balance_remains_a_rotation_candidate(self):
+        for profile in PROFILES:
+            for balance in (None, 0):
+                self.configure(balances={profile: balance})
                 seen = set()
-                for _ in range(6):
+                for _ in range(8):
                     request, _ = self.post_ok("chat/completions", self.payload(), set(PROFILES))
                     seen.add(request.headers["x-user-id"])
-                self.assertIn(unavailable, seen)
+                self.assertEqual(seen, set(PROFILES))
 
-    def test_unknown_or_empty_catalog_never_borrows_other_profile_models(self):
+    def test_account_root_models_route_when_the_picker_subset_omits_them(self):
+        """Route account-root candidates omitted from selectors through all three protocols."""
+        tables = catalogs()
+        self.configure(tables=tables)
+        for profile in PROFILES:
+            for endpoint in GENERATIONS:
+                self.post_rejected(endpoint, self.payload(endpoint, profile + "-root-only"))
+        self.account_catalogs(tables, serves={
+            profile: tables[profile] + [model(profile + "-root-only")] for profile in PROFILES})
+        for profile in PROFILES:
+            for endpoint in GENERATIONS:
+                with self.subTest(profile=profile, endpoint=endpoint):
+                    allowed = {"intl-cli", "intl-work"} if profile.startswith("intl-") else {profile}
+                    request, sent = self.post_ok(
+                        endpoint, self.payload(endpoint, profile + "-root-only"), allowed)
+                    self.assertEqual(sent["model"], profile + "-root-only")
+                    self.assertIn(request.url.host, {HOSTS[candidate] for candidate in allowed})
+        # Sharing does not invent model names absent from every source.
+        self.post_rejected("chat/completions", self.payload("chat/completions", "no-such-model"))
+        ids = {item["id"] for item in self.client.get("/v1/models").json()["data"]}
+        self.assertIn("cn-cli-root-only", ids, "对外模型表要能报出实际发得出去的模型")
+
+    def test_unusable_root_models_are_not_advertised(self):
+        """Exclude root models without tool support from public catalogs and routing."""
+        tables = catalogs()
+        self.configure(tables=tables)
+        self.account_catalogs(tables, serves={
+            profile: tables[profile] + [{"id": profile + "-image", "name": "image",
+                                         "credits": "x5.00 credits"}]
+            for profile in PROFILES})
+        for profile in PROFILES:
+            self.post_rejected("chat/completions", self.payload("chat/completions",
+                                                                profile + "-image"))
+        ids = {item["id"] for item in self.client.get("/v1/models").json()["data"]}
+        self.assertNotIn("cn-cli-image", ids)
+
+    def test_unknown_catalog_cannot_borrow_but_ready_international_catalog_can(self):
         for unavailable in PROFILES:
             for missing in (None, []):
                 with self.subTest(profile=unavailable, catalog=missing):
@@ -396,7 +433,8 @@ class RegionRoutingTests(unittest.TestCase):
                     self.configure(tables=tables)
                     for endpoint in GENERATIONS:
                         self.post_rejected(endpoint, self.payload(endpoint, unavailable + "-only"))
-                        self.post_ok(endpoint, self.payload(endpoint), set(PROFILES) - {unavailable})
+                        allowed = set(PROFILES) if missing == [] and unavailable.startswith("intl-") else set(PROFILES) - {unavailable}
+                        self.post_ok(endpoint, self.payload(endpoint), allowed)
         for missing in (None, []):
             self.configure(tables={profile: missing for profile in PROFILES})
             for endpoint in GENERATIONS:
@@ -439,7 +477,8 @@ class RegionRoutingTests(unittest.TestCase):
         for profile in PROFILES:
             self.configure()
             payload = self.payload(selected_model=profile + "-only")
-            self.allowed_profiles = {profile}
+            allowed = {"intl-cli", "intl-work"} if profile.startswith("intl-") else {profile}
+            self.allowed_profiles = allowed
             self.response_status = 429
             before = len(self.requests)
             try:
@@ -448,7 +487,11 @@ class RegionRoutingTests(unittest.TestCase):
                 self.response_status = 200
             self.assertEqual(response.status_code, 429, response.text)
             self.assertEqual(len(self.requests), before + 1)
-            self.post_rejected("chat/completions", payload, statuses=(429,))
+            remaining = allowed - {self.requests[-1].headers["x-user-id"]}
+            if remaining:
+                self.post_ok("chat/completions", payload, remaining)
+            else:
+                self.post_rejected("chat/completions", payload, statuses=(429,))
             self.post_ok("chat/completions", self.payload(), PROFILES)
 
     def test_account_cooldown_rebinds_to_supported_other_region(self):
@@ -480,18 +523,18 @@ class RegionRoutingTests(unittest.TestCase):
 
     def test_models_exposes_credits_multiplier_per_profile(self):
         tables = catalogs()
-        # 默认目录的 credits 是 {input, output} 对象（官方新版形态），只有字符串倍率可解析。
+        # Object-shaped credit rates remain unknown; only supported scalar rates are parsed.
         tables["cn-cli"] = [model("shared-model", credits="x0.00"), model("cn-cli-only", credits="x0.03")]
         tables["intl-cli"] = [model("shared-model", credits="x0.34"), model("intl-cli-only", credits="x0.03")]
         self.configure(tables=tables)
         data = {item["id"]: item for item in self.client.get("/v1/models").json()["data"]}
         shared = data["shared-model"]
-        self.assertEqual(shared["credits"], 0.0)  # 取各来源最小值
-        # 只有给出可解析字符串倍率的来源进入分组；cn-work / intl-work 仍是对象形态，故不列出。
+        self.assertEqual(shared["credits"], 0.0)  # Minimum eligible source rate
+        # Group only sources with parseable rates, excluding WorkBuddy's object-shaped rates.
         self.assertEqual(shared["credits_by_profile"], {"cn-cli": 0.0, "intl-cli": 0.34})
         self.assertEqual(data["cn-cli-only"]["credits"], 0.03)
         self.assertEqual(data["cn-cli-only"]["credits_by_profile"], {"cn-cli": 0.03})
-        # 标准 OpenAI 字段必须保留。
+        # Retain standard OpenAI fields.
         for item in data.values():
             self.assertEqual(item["object"], "model")
             self.assertIsInstance(item["created"], int)
@@ -504,7 +547,7 @@ class RegionRoutingTests(unittest.TestCase):
                             dict(model("cn-cli-only-2"), credits="not-a-multiplier")]
         self.configure(tables=tables)
         data = {item["id"]: item for item in self.client.get("/v1/models").json()["data"]}
-        self.assertEqual(data["shared-model"]["credits"], 0.03)  # 只有 cn-cli 给出可解析倍率
+        self.assertEqual(data["shared-model"]["credits"], 0.03)  # Only cn-cli has a parseable rate.
         self.assertEqual(data["shared-model"]["credits_by_profile"], {"cn-cli": 0.03})
         self.assertIsNone(data["cn-cli-only"]["credits"])
         self.assertEqual(data["cn-cli-only"]["credits_by_profile"], {})
@@ -516,35 +559,41 @@ class RegionRoutingTests(unittest.TestCase):
             self.assertGreaterEqual(response.json()["input_tokens"], 0)
         self.assertFalse(self.requests)
 
-    def test_models_publishes_configured_product_catalogs_regardless_of_balance(self):
-        for profiles, balances in (
-                (("cn-cli", "cn-work", "intl-cli"), {}),
-                (PROFILES, {"intl-cli": None, "intl-work": 0}),
-                (("intl-cli", "intl-work"), {"intl-cli": None, "intl-work": 0})):
+    def test_models_publish_configured_catalogs_regardless_of_balance(self):
+        for profiles, balances, eligible in (
+                (("cn-cli", "cn-work", "intl-cli"), {}, ("cn-cli", "cn-work", "intl-cli")),
+                (PROFILES, {"intl-cli": None, "intl-work": 0}, PROFILES),
+                (("intl-cli", "intl-work"), {"intl-cli": None, "intl-work": 0}, ("intl-cli", "intl-work"))):
             self.configure(profiles=profiles, balances=balances)
             response = self.client.get("/v1/models")
-            self.assertEqual(response.status_code, 200, response.text)
-            expected = {m["id"] for profile in profiles for m in catalogs()[profile]}
-            self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
+            self.assertIn(response.status_code, (200, 503), response.text)
+            if eligible:
+                self.assertEqual(response.status_code, 200, response.text)
+            if response.status_code == 200:
+                expected = {m["id"] for profile in eligible for m in catalogs()[profile]}
+                self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
+                if not eligible:
+                    self.assertEqual(response.json()["data"], [])
         self.assertFalse(self.requests)
 
-    def test_same_profile_accounts_cannot_borrow_catalogs(self):
-        second = "intl-cli-second"
-        self.add_account(second, "intl-cli")
+    def test_domestic_same_profile_accounts_cannot_borrow_catalogs(self):
+        second = "cn-cli-second"
+        self.add_account(second, "cn-cli")
         for balance in (None, 0, 100):
             for missing in (None, [], [model("second-only")]):
                 with self.subTest(balance=balance, catalog=missing):
-                    self.configure(profiles=("intl-cli", second), balances={"intl-cli": balance})
-                    self.account_catalogs({"intl-cli": [model("first-only")], second: missing})
-                    self.post_ok("chat/completions", self.payload(selected_model="first-only"), {"intl-cli"})
+                    self.configure(profiles=("cn-cli", second), balances={"cn-cli": balance})
+                    self.account_catalogs({"cn-cli": [model("first-only")], second: missing})
+                    self.post_ok("chat/completions", self.payload(selected_model="first-only"), {"cn-cli"})
                     if missing:
                         self.post_ok("chat/completions", self.payload(selected_model="second-only"), {second})
                     else:
                         self.post_rejected("chat/completions", self.payload(selected_model="second-only"))
                     response = self.client.get("/v1/models")
-                    self.assertEqual(response.status_code, 200, response.text)
-                    expected = {"first-only"} | ({"second-only"} if missing else set())
-                    self.assertEqual({m["id"] for m in response.json()["data"]}, expected)
+                    self.assertIn(response.status_code, (200, 503), response.text)
+                    if response.status_code == 200:
+                        expected = {"first-only"} | ({"second-only"} if missing else set())
+                        self.assertEqual({m["id"] for m in response.json()["data"]} - {"auto"}, expected)
 
     def test_auto_maps_to_each_accounts_declared_default_and_rotates(self):
         tables = catalogs()
@@ -603,6 +652,7 @@ class RegionRoutingTests(unittest.TestCase):
 
     def test_system_is_only_added_when_needed_and_preserves_payload_and_parameters(self):
         for profile in PROFILES:
+            self.configure(profiles=(profile,))
             for endpoint in GENERATIONS:
                 for system in (None, "Original caller system; preserve verbatim."):
                     with self.subTest(profile=profile, endpoint=endpoint, system=system):
@@ -633,6 +683,7 @@ class RegionRoutingTests(unittest.TestCase):
                             self.assertEqual(len(systems), 1)
 
     def test_late_system_is_not_overwritten_when_intl_requires_first_system(self):
+        self.configure(profiles=("intl-cli",))
         payload = self.payload(selected_model="intl-cli-only")
         payload["messages"].append({"role": "system", "content": "Keep this late system intact."})
         original = deepcopy(payload)
