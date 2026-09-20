@@ -1,13 +1,4 @@
-"""
-responses_adapter.py — OpenAI Responses API ↔ Chat Completions API 适配层。
-
-Codex CLI 使用 Responses API（POST /v1/responses），而 CodeBuddy 后端只支持
-Chat Completions 协议。本模块做双向转换：
-  请求：Responses input/instructions/tools → Chat messages/tools
-  响应：Chat SSE delta → Responses 语义事件流（response.created / output_text.delta / …）
-
-事件类型参考：https://developers.openai.com/api/docs/guides/streaming-responses
-"""
+"""Translate requests and SSE responses between OpenAI Responses and Chat Completions."""
 
 from __future__ import annotations
 
@@ -17,25 +8,42 @@ import time
 from typing import Any
 
 # ---------------------------------------------------------------------------
-# ID 生成
+# ID generation
 # ---------------------------------------------------------------------------
 
 def _rand_id(prefix: str = "resp_") -> str:
     return prefix + os.urandom(12).hex()
 
 # ---------------------------------------------------------------------------
-# 请求转换：Responses → Chat
+# Responses to Chat requests
 # ---------------------------------------------------------------------------
 
-def responses_request_to_chat(body: dict) -> dict:
-    """将 Responses API 请求体转换为 Chat Completions 请求体。
+def _text_format_to_response_format(fmt) -> dict | None:
+    """Map Responses text.format to equivalent Chat formats, rejecting unsupported variants."""
+    if fmt is None:
+        return None
+    if not isinstance(fmt, dict):
+        raise ValueError("text.format must be an object")
+    kind = fmt.get("type")
+    if kind in (None, "text"):
+        return None
+    if kind == "json_object":
+        return {"type": "json_object"}
+    if kind == "json_schema":
+        schema = fmt.get("schema")
+        if not isinstance(schema, dict):
+            raise ValueError("text.format json_schema requires a schema object")
+        js: dict[str, Any] = {"name": fmt.get("name") or "response", "schema": schema}
+        if "strict" in fmt:
+            js["strict"] = bool(fmt["strict"])
+        if isinstance(fmt.get("description"), str):
+            js["description"] = fmt["description"]
+        return {"type": "json_schema", "json_schema": js}
+    raise ValueError(f"unsupported text.format type: {kind}")
 
-    关键映射：
-      input → messages
-      instructions → system message（置顶）
-      max_output_tokens → max_tokens
-      tools 格式微调（Responses 用 name，Chat 用 function.name）
-    """
+
+def responses_request_to_chat(body: dict) -> dict:
+    """Convert Responses input, instructions and tools to a Chat request."""
     messages: list[dict] = []
 
     # instructions → system message
@@ -50,27 +58,38 @@ def responses_request_to_chat(body: dict) -> dict:
     elif isinstance(inp, list):
         messages.extend(_convert_input_items(inp))
 
-    # 构造 Chat body
+    # Build the Chat request body.
     chat: dict[str, Any] = {"messages": messages, "stream": True}
 
     # model
     if "model" in body:
         chat["model"] = body["model"]
 
-    # tools — Responses 和 Chat 的 function tool 格式略有不同
+    # Normalize function tool definitions.
     tools = body.get("tools")
     if tools:
         chat["tools"] = _convert_tools_for_chat(tools)
     if "tool_choice" in body:
         chat["tool_choice"] = body["tool_choice"]
 
-    # 透传常见参数
+    # Forward supported parameters.
     for key in ("temperature", "top_p", "stop", "seed",
                 "presence_penalty", "frequency_penalty",
-                "response_format", "reasoning_effort"):
+                "response_format", "reasoning_effort", "parallel_tool_calls", "prompt_cache_key"):
         if key in body:
             chat[key] = body[key]
 
+    # Explicit top-level values override equivalent nested fields.
+    reasoning = body.get("reasoning")
+    if isinstance(reasoning, dict) and "reasoning_effort" not in chat:
+        effort = reasoning.get("effort")
+        if isinstance(effort, str) and effort.strip():
+            chat["reasoning_effort"] = effort
+    text = body.get("text")
+    if isinstance(text, dict) and "response_format" not in chat:
+        mapped = _text_format_to_response_format(text.get("format"))
+        if mapped is not None:
+            chat["response_format"] = mapped
     # max_output_tokens → max_tokens
     if "max_output_tokens" in body:
         chat["max_tokens"] = body["max_output_tokens"]
@@ -81,16 +100,9 @@ def responses_request_to_chat(body: dict) -> dict:
 
 
 def _convert_input_items(items: list) -> list[dict]:
-    """将 Responses API 的 input 数组转换为 Chat messages。
-
-    input 里可能包含：
-      - {"role": "user/developer", "content": ...}   → 直接映射
-      - {"type": "message", ...}                      → 助手消息
-      - {"type": "function_call", ...}                → 需合并到前面的助手消息
-      - {"type": "function_call_output", ...}         → tool 角色
-    """
+    """Convert input items and merge adjacent assistant messages with tool calls."""
     messages: list[dict] = []
-    # 临时缓存：合并相邻的 assistant message 和 function_call
+    # Buffer adjacent assistant text and function calls.
     pending_assistant_content: str | list[dict] | None = None
     pending_tool_calls: list[dict] = []
 
@@ -112,7 +124,7 @@ def _convert_input_items(items: list) -> list[dict]:
         item_type = item.get("type")
         role = item.get("role", "")
 
-        # 简单消息 {"role": "user", "content": "..."}
+        # Untyped role messages
         if item_type is None and role in ("user", "system", "developer"):
             _flush_assistant()
             mapped_role = "system" if role == "developer" else role
@@ -120,7 +132,7 @@ def _convert_input_items(items: list) -> list[dict]:
             messages.append({"role": mapped_role, "content": content})
             continue
 
-        # typed message（Responses 里常见）
+        # Typed message items
         if item_type == "message" and role in ("user", "system", "developer"):
             _flush_assistant()
             mapped_role = "system" if role == "developer" else role
@@ -128,7 +140,7 @@ def _convert_input_items(items: list) -> list[dict]:
             messages.append({"role": mapped_role, "content": content})
             continue
 
-        # assistant 消息（来自前一轮输出）
+        # Assistant output from history
         if item_type == "message" and role == "assistant":
             _flush_assistant()
             content_parts = item.get("content", [])
@@ -136,14 +148,14 @@ def _convert_input_items(items: list) -> list[dict]:
             pending_assistant_content = text
             continue
 
-        # 简单 role=assistant（无 type 标记）
+        # Untyped assistant messages
         if item_type is None and role == "assistant":
             _flush_assistant()
             content = _extract_content(item.get("content", ""))
             pending_assistant_content = content
             continue
 
-        # function_call — 合并到前面的 assistant 消息
+        # Merge calls into the preceding assistant message.
         if item_type == "function_call":
             if pending_assistant_content is None:
                 pending_assistant_content = ""
@@ -157,7 +169,7 @@ def _convert_input_items(items: list) -> list[dict]:
             })
             continue
 
-        # function_call_output → tool 消息
+        # Map function results to tool messages.
         if item_type == "function_call_output":
             _flush_assistant()
             messages.append({
@@ -168,7 +180,7 @@ def _convert_input_items(items: list) -> list[dict]:
             })
             continue
 
-        # 其他未知类型 — 尝试当作普通消息
+        # Retain compatible message content from unknown item types.
         if role:
             _flush_assistant()
             content = _extract_content(item.get("content", ""))
@@ -179,7 +191,7 @@ def _convert_input_items(items: list) -> list[dict]:
 
 
 def _extract_content(content) -> str | list[dict]:
-    """转换协议内容块；含图片时保留多模态数组，不字符串化图片。"""
+    """Convert protocol blocks without stringifying image content."""
     if isinstance(content, str):
         return content
     if isinstance(content, list):
@@ -213,7 +225,7 @@ def _extract_content(content) -> str | list[dict]:
 
 
 def _extract_output_text(content_parts: list) -> str | list[dict]:
-    """保留历史消息图片；没有图片时沿用 output_text 提取行为。"""
+    """Preserve historical images and extract output_text for text-only messages."""
     if any(isinstance(part, dict) and part.get("type") in ("input_image", "image_url")
            for part in content_parts):
         return _extract_content(content_parts)
@@ -225,22 +237,18 @@ def _extract_output_text(content_parts: list) -> str | list[dict]:
 
 
 def _convert_tools_for_chat(tools: list) -> list:
-    """将 Responses 格式的 tools 转为 Chat 格式。
-
-    Responses:  {"type": "function", "name": "shell", "description": ..., "parameters": ...}
-    Chat:       {"type": "function", "function": {"name": "shell", "description": ..., "parameters": ...}}
-    """
+    """Convert Responses tool definitions to Chat function objects."""
     result = []
     for t in tools:
         if not isinstance(t, dict):
             continue
         if t.get("type") != "function":
             continue
-        # 已经是 Chat 格式（有 "function" key）
+        # Already in Chat format.
         if "function" in t:
             result.append(t)
             continue
-        # Responses 扁平格式 → Chat 嵌套格式
+        # Nest the flat Responses function fields.
         fn: dict[str, Any] = {"name": t.get("name", "")}
         if "description" in t:
             fn["description"] = t["description"]
@@ -253,49 +261,38 @@ def _convert_tools_for_chat(tools: list) -> list:
 
 
 # ---------------------------------------------------------------------------
-# 响应转换：Chat → Responses
+# Chat SSE to Responses events
 # ---------------------------------------------------------------------------
 
 class ResponsesStreamConverter:
-    """将 Chat SSE 流实时转换为 Responses API 语义事件流。
+    """Convert Chat SSE increments into Responses events."""
 
-    用法：
-      converter = ResponsesStreamConverter(model="glm-5.2")
-      # 对后端返回的每个 SSE 行调 feed_line()
-      # feed_line 返回要发送给客户端的 Responses 事件字符串（可能多行）
-      for line in backend_sse:
-          events = converter.feed_line(line)
-          if events:
-              yield events.encode()
-      # 流结束后调 finish() 获取收尾事件
-      yield converter.finish().encode()
-    """
-
-    def __init__(self, model: str = "unknown"):
+    def __init__(self, model: str = "unknown", parallel_tool_calls: bool = True):
         self.resp_id = _rand_id("resp_")
         self.msg_id = _rand_id("msg_")
         self.model = model
+        self._parallel_tool_calls = bool(parallel_tool_calls)
         self.created_at = int(time.time())
 
-        # 状态标记
+        # Stream state
         self._emitted_created = False
         self._emitted_msg_item = False
         self._emitted_content_part = False
 
-        # 累积内容
+        # Collected content
         self._content = ""
-        # reasoning item（上游 reasoning_content → Responses reasoning，位于 message 之前）
+        # Reasoning items precede message items.
         self._reasoning = ""
         self._reasoning_item_id = _rand_id("rs_")
         self._emitted_reasoning_item = False
         self._tool_calls: dict[int, dict] = {}  # index → {id, name, args, fc_id, output_idx, emitted}
         self._finish_reason: str | None = None
         self._usage: dict | None = None
-
-    # ---- 公开接口 ----
+        self._seq = 0  # Monotonic emitted-event sequence
+    # Public methods
 
     def feed_line(self, line: str) -> str:
-        """处理一行 SSE（如 'data: {...}'），返回转换后的 Responses 事件字符串。"""
+        """Convert one SSE line into Responses event text."""
         line = line.strip()
         if not line or not line.startswith("data:"):
             return ""
@@ -309,66 +306,81 @@ class ResponsesStreamConverter:
         return self._process_chunk(chunk)
 
     def finish(self) -> str:
-        """流结束后，发出收尾事件（done + completed）。"""
+        """Close output items and emit the terminal response status."""
+        status, reason = self._final_status()
         events: list[str] = []
 
-        # 关闭 reasoning item
+        # Close reasoning items.
         if self._emitted_reasoning_item:
             events.append(self._evt("response.reasoning_summary_text.done", {
-                "output_index": 0, "summary_index": 0, "text": self._reasoning
+                "output_index": 0, "summary_index": 0, "text": self._reasoning,
+                "item_id": self._reasoning_item_id
             }))
             events.append(self._evt("response.output_item.done", {
-                "output_index": 0, "item": self._reasoning_item("completed")
+                "output_index": 0, "item": self._reasoning_item(status)
             }))
 
-        # 关闭 text content
+        # Close text content.
         if self._emitted_content_part:
             events.append(self._evt("response.output_text.done", {
-                "output_index": self._msg_idx(), "content_index": 0, "text": self._content
+                "output_index": self._msg_idx(), "content_index": 0, "text": self._content,
+                "item_id": self.msg_id
             }))
             events.append(self._evt("response.content_part.done", {
                 "output_index": self._msg_idx(), "content_index": 0,
-                "part": {"type": "output_text", "text": self._content, "annotations": []}
+                "part": {"type": "output_text", "text": self._content, "annotations": []},
+                "item_id": self.msg_id
             }))
 
         if self._emitted_msg_item:
             events.append(self._evt("response.output_item.done", {
                 "output_index": self._msg_idx(),
-                "item": self._msg_item("completed")
+                "item": self._msg_item(status)
             }))
 
-        # 关闭 function calls
+        # Close function calls.
         for idx in sorted(self._tool_calls):
             tc = self._tool_calls[idx]
             if tc.get("emitted"):
                 oi = tc["output_idx"]
                 events.append(self._evt("response.function_call_arguments.done", {
-                    "output_index": oi, "arguments": tc["args"]
+                    "output_index": oi, "arguments": tc["args"], "item_id": tc["fc_id"]
                 }))
                 events.append(self._evt("response.output_item.done", {
-                    "output_index": oi, "item": self._fc_item(tc, "completed")
+                    "output_index": oi, "item": self._fc_item(tc, status)
                 }))
 
-        # response.completed
-        events.append(self._evt("response.completed", {
-            "response": self._response_obj("completed")
+        # Truncated or filtered responses must not report completion.
+        events.append(self._evt(f"response.{status}", {
+            "response": self._response_obj(status, incomplete_reason=reason)
         }))
         return "".join(events)
 
     def get_nonstream_response(self) -> dict:
-        """流结束后获取完整的非流式 Response 对象。"""
-        return self._response_obj("completed")
+        """Return the complete non-streaming Response object."""
+        status, reason = self._final_status()
+        return self._response_obj(status, incomplete_reason=reason)
 
-    # ---- 内部 ----
+    def _final_status(self) -> tuple[str, str | None]:
+        """Map finish reasons to response status without hiding truncation or filtering."""
+        fr = self._finish_reason
+        if fr in (None, "stop", "tool_calls"):
+            return "completed", None
+        if fr == "length":
+            return "incomplete", "max_output_tokens"
+        if fr in ("content_filter", "content-filter", "refusal"):
+            return "incomplete", "content_filter"
+        return "incomplete", None
+    # Internal helpers
 
     def _process_chunk(self, chunk: dict) -> str:
         events: list[str] = []
 
-        # 模型名
+        # Model identity
         if chunk.get("model"):
             self.model = chunk["model"]
 
-        # 首次 → 发 created + in_progress
+        # Emit created and in_progress once.
         if not self._emitted_created:
             resp = self._response_obj("in_progress")
             events.append(self._evt("response.created", {"response": resp}))
@@ -383,7 +395,7 @@ class ResponsesStreamConverter:
             delta = choice.get("delta", {})
             finish = choice.get("finish_reason")
 
-            # ---- reasoning delta（reasoning_content → reasoning item，位于 message 之前）----
+            # Emit reasoning before message content.
             reasoning = delta.get("reasoning_content")
             if reasoning:
                 if not self._emitted_reasoning_item:
@@ -395,10 +407,11 @@ class ResponsesStreamConverter:
                     self._emitted_reasoning_item = True
                 self._reasoning += reasoning
                 events.append(self._evt("response.reasoning_summary_text.delta", {
-                    "output_index": 0, "summary_index": 0, "delta": reasoning
+                    "output_index": 0, "summary_index": 0, "delta": reasoning,
+                    "item_id": self._reasoning_item_id
                 }))
 
-            # 当前适配器只发 output_text；拒绝说明也保留为合法文本，不丢弃原文。
+            # Preserve refusal content as valid output_text.
             content = (delta.get("content") or "") + (delta.get("refusal") or "")
             if content:
                 if not self._emitted_msg_item:
@@ -411,20 +424,22 @@ class ResponsesStreamConverter:
                 if not self._emitted_content_part:
                     events.append(self._evt("response.content_part.added", {
                         "output_index": self._msg_idx(), "content_index": 0,
-                        "part": {"type": "output_text", "text": "", "annotations": []}
+                        "part": {"type": "output_text", "text": "", "annotations": []},
+                        "item_id": self.msg_id
                     }))
                     self._emitted_content_part = True
 
                 self._content += content
                 events.append(self._evt("response.output_text.delta", {
-                    "output_index": self._msg_idx(), "content_index": 0, "delta": content
+                    "output_index": self._msg_idx(), "content_index": 0, "delta": content,
+                    "item_id": self.msg_id
                 }))
 
             # ---- tool_calls delta ----
             for tc in delta.get("tool_calls", []):
                 idx = tc.get("index", 0)
                 if idx not in self._tool_calls:
-                    # 计算 output_index：reasoning/msg item 在前，function_call 依次往后排
+                    # Place function calls after reasoning and message items.
                     base = (1 if self._emitted_reasoning_item else 0) + \
                            (1 if (self._emitted_msg_item or self._content) else 0)
                     oi = base + len(self._tool_calls)
@@ -444,9 +459,9 @@ class ResponsesStreamConverter:
                     slot["name"] = fn["name"]
 
                 if not slot["emitted"]:
-                    # 确保 msg item 已发出（即使 content 为空）
+                    # Ensure the message item exists even when empty.
                     if not self._emitted_msg_item and (self._content or not self._tool_calls):
-                        pass  # 不需要额外处理
+                        pass
                     events.append(self._evt("response.output_item.added", {
                         "output_index": slot["output_idx"],
                         "item": self._fc_item(slot, "in_progress")
@@ -457,7 +472,7 @@ class ResponsesStreamConverter:
                     slot["args"] += fn["arguments"]
                     events.append(self._evt("response.function_call_arguments.delta", {
                         "output_index": slot["output_idx"],
-                        "delta": fn["arguments"]
+                        "delta": fn["arguments"], "item_id": slot["fc_id"]
                     }))
 
             if finish:
@@ -466,16 +481,17 @@ class ResponsesStreamConverter:
         return "".join(events)
 
     def _evt(self, event_type: str, data: dict) -> str:
-        """格式化一个 SSE 事件。"""
-        payload = {"type": event_type, **data}
+        """Format SSE events with monotonically increasing sequence numbers."""
+        self._seq += 1
+        payload = {"type": event_type, **data, "sequence_number": self._seq}
         return f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     def _msg_idx(self) -> int:
-        """message item 的 output_index；reasoning item 存在时占据 0，message 顺延到 1。"""
+        """Place the message at index one when reasoning occupies index zero."""
         return 1 if self._emitted_reasoning_item else 0
 
     def _reasoning_item(self, status: str) -> dict:
-        """Responses reasoning item：思考全文放在 summary 第一段。"""
+        """Build a reasoning item with its text in the first summary block."""
         return {"type": "reasoning", "id": self._reasoning_item_id, "status": status,
                 "summary": [{"type": "summary_text", "text": self._reasoning}]}
 
@@ -501,7 +517,7 @@ class ResponsesStreamConverter:
             "status": status,
         }
 
-    def _response_obj(self, status: str) -> dict:
+    def _response_obj(self, status: str, incomplete_reason: str | None = None) -> dict:
         output = []
         if self._emitted_reasoning_item:
             output.append(self._reasoning_item(status))
@@ -516,21 +532,29 @@ class ResponsesStreamConverter:
         if self._usage:
             u = self._usage
             reasoning_tokens = (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0)
+            # Omit unknown cache details instead of reporting a fabricated zero.
+            cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens",
+                                                                   u.get("cache_read_input_tokens"))
             usage = {
                 "input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)),
-                "input_tokens_details": {"cached_tokens": 0},
                 "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)),
                 "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
                 "total_tokens": u.get("total_tokens", 0),
             }
+            if isinstance(cached, int) and not isinstance(cached, bool) and cached >= 0:
+                usage["input_tokens_details"] = {"cached_tokens": cached}
 
-        return {
+        obj = {
             "id": self.resp_id,
             "object": "response",
             "created_at": self.created_at,
             "status": status,
             "model": self.model,
             "output": output,
-            "parallel_tool_calls": True,
+            "parallel_tool_calls": self._parallel_tool_calls,
             "usage": usage,
         }
+        if status == "incomplete":
+            # Preserve a null incomplete reason when the upstream supplies none.
+            obj["incomplete_details"] = {"reason": incomplete_reason}
+        return obj

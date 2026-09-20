@@ -1,0 +1,166 @@
+"""Scoped manual credential maintenance without implicit reward claims."""
+import time
+from pathlib import Path
+
+from fastapi import HTTPException
+
+from . import buddy, model_policy, travel, trial_management
+from .credential_io import credential_file_lock
+
+
+def run(gateway, action, identity=None, *, consent_revision=None):
+    if action not in {"refresh", "sync", "travel", "travel-status", "trial", "reset-cooldown"} or (action in {"refresh", "travel", "travel-status", "trial", "reset-cooldown"} and identity is None):
+        raise HTTPException(404, "凭证操作不存在")
+    if consent_revision is not None and (action != "travel" or identity is None or consent_revision != buddy.AGREEMENT_REVISION):
+        raise HTTPException(400, "首领确认无效或协议版本已变化")
+    config = gateway.CONFIG
+    # Clearing a cooldown only edits local state: it needs neither the ledger nor a network round
+    # trip, and it must stay available while the periodic maintenance sweep holds its lock. It is
+    # also allowed for a disabled account, since a stale cooldown is worth clearing either way.
+    if action == "reset-cooldown":
+        result = _reset_cooldowns(gateway, identity)
+        _audit(config, result)
+        return {"ok": result["ok"], "results": [result]}
+    pool, ledger = config.get("cred_pool"), config.get("ledger")
+    if pool is None or (action not in {"refresh", "trial"} and (ledger is None or gateway.credits_mod is None)):
+        raise HTTPException(503, "凭证维护尚未就绪")
+    # Do not queue duplicate manual work behind the periodic maintenance sweep.
+    if not gateway._HOUSEKEEP_LOCK.acquire(blocking=False):
+        raise HTTPException(409, "凭证维护正在执行，请稍后刷新列表核验")
+    try:
+        pool._rescan()
+        entries = [dict(e) for e in pool.entries() if identity is None or e.get("account_key") == identity]
+        if identity is not None and not entries:
+            raise HTTPException(404, "凭证不存在或身份已变化")
+        if action in {"trial", "travel", "travel-status"}:
+            entries = entries[:1]  # One account identity represents one manual action.
+        results = []
+        for entry in entries:
+            started = time.monotonic()
+            result = {"id": entry.get("account_key"), "name": Path(entry["id"]).name, "action": action, "ok": False}
+            if not model_policy.credential_enabled(config, entry):
+                result.update(trial_management.failure("changed", skipped=True) if action == "trial"
+                              else {"skipped": True, "message": "账号已人工停用"})
+            else:
+                try:
+                    result.update(_one(gateway, pool, ledger, entry, action, consent_revision=consent_revision))
+                except Exception:
+                    # Upstream exception text may contain headers or credential file paths.
+                    result.update(ok=False, message="操作失败，保留已有数据；请检查账号状态后重试")
+            results.append(result)
+            _audit(config, result, started)
+        response = {"ok": bool(results) and all(r["ok"] for r in results), "results": results}
+        if identity is None and ledger is not None:
+            response["credits"] = ledger.snapshot()
+        return response
+    finally:
+        gateway._HOUSEKEEP_LOCK.release()
+
+
+def _audit(config, result, started=None):
+    """Record one credential action; auditing must never break the action itself."""
+    audit = config.get("audit_store")
+    if not audit:
+        return
+    try:
+        action = result.get("action")
+        details = {"credential": result["id"], "ok": result["ok"]}
+        if action == "trial":
+            details.update(outcome="success" if result["ok"] else "error", stage=result.get("state"),
+                           status_code=result.get("status"),
+                           code=str(result["code"]) if result.get("code") is not None else None,
+                           duration_ms=(time.monotonic() - started) * 1000 if started is not None else None)
+        if action == "reset-cooldown":
+            # The audit sanitizer keeps a fixed key allowlist, so report the split outcome through
+            # fields it retains rather than widening a shared schema.
+            details.update(outcome="success" if result["ok"] else "error",
+                           stage="durable" if result.get("durable") else "memory_only",
+                           code="reset_cooldown" if result.get("durable") else "reset_cooldown_write_failed")
+        trip = result if action in {"travel", "travel-status"} else None
+        if isinstance(trip, dict):
+            details.update(outcome="success" if trip.get("ok") else "warning" if trip.get("buddy_blocked") else "error",
+                           stage=trip.get("phase"), status_code=trip.get("http_status"),
+                           code=trip.get("reason") or (str(trip["code"]) if trip.get("code") is not None else None),
+                           consent_source=trip.get("consent_source"))
+        audit.event("admin", "credential." + str(action), details)
+    except Exception:
+        pass
+
+
+def _reset_cooldowns(gateway, identity):
+    """Lift every cooldown an account holds, reporting memory and durability separately."""
+    pool = gateway.CONFIG.get("cred_pool")
+    if pool is None:
+        raise HTTPException(503, "凭证维护尚未就绪")
+    pool._rescan()
+    entry = next((e for e in pool.entries() if e.get("account_key") == identity), None)
+    if entry is None:
+        raise HTTPException(404, "凭证不存在或身份已变化")
+    outcome = pool.reset_cooldowns_for(identity)
+    result = {"id": identity, "name": Path(entry["id"]).name, "action": "reset-cooldown",
+              "ok": outcome["durable"], "changed_in_memory": outcome["changed_in_memory"],
+              "durable": outcome["durable"]}
+    if outcome["durable"]:
+        result["message"] = "已清除该账号的冷却" if outcome["changed_in_memory"] else "该账号当前没有冷却"
+    else:
+        # Never let a failed write read as a completed reset: a restart would restore the row.
+        result["message"] = "内存冷却已清除，但写入失败，重启后可能恢复；请稍后重试"
+    return result
+
+
+def _one(gateway, pool, ledger, entry, action, *, automatic=False, consent_revision=None):
+    if action == "trial":
+        return trial_management.perform(gateway, pool, entry)
+    cm, cid = entry["cm"], entry["id"]
+    if not model_policy.credential_enabled(gateway.CONFIG, entry):
+        return {"ok": False, "skipped": True, "message": "账号已人工停用"}
+    if action in {"travel", "travel-status"} and not travel.supported(entry.get("profile")):
+        return travel.unavailable()
+    with cm._lock:
+        if cm.summary().get("account_key") != entry.get("account_key"):
+            return {"ok": False, "state": "changed", "message": "凭证身份已变化，请刷新列表"}
+        if action == "refresh":
+            with credential_file_lock(cm.path.parent, cm.path.name):
+                if cm.summary().get("account_key") != entry.get("account_key"):
+                    return {"ok": False, "message": "凭证身份已变化，请刷新列表"}
+                cm._refresh_locked()
+            generation = cm._generation
+        else:
+            headers = cm.get_headers()
+            generation = cm._generation
+    if action == "refresh":
+        pool.reload([cm.path], reset=False)
+        current = pool.apply_if_current(cm, generation, lambda: None)
+        return {"ok": current, "message": "凭证已刷新" if current else "凭证已变化，请刷新列表核验"}
+    if action in {"travel", "travel-status"}:
+        def can_write():
+            return ((not automatic or model_policy.credential_auto_travel(gateway.CONFIG, entry))
+                    and pool.apply_if_current(cm, generation, lambda: None))
+        result = travel.perform(gateway._bearer_token(headers), gateway.profile_for_headers(headers),
+                                read_only=action == "travel-status", can_write=can_write,
+                                buddy_context=gateway._buddy_context(entry, headers, consent_revision))
+        if not pool.apply_if_current(cm, generation, lambda: travel.remember(ledger, cid, result)):
+            return {**result, "ok": False, "stale": True, "message": "凭证已变化，旅行结果未写入，请刷新核验"}
+        if automatic:
+            buddy.daily_warning(gateway.CONFIG, entry.get("account_key"), entry.get("profile"), result)
+        return result
+    failed = set()
+    ref = gateway._sync_credits(pool, ledger, entry, automatic=False, failed=failed,
+                                expected_identity=entry.get("account_key"))
+    if ref is not None:
+        if not pool.apply_if_current(cm, ref[1], lambda: entry.update(catalog_dirty=True)):
+            failed.add(cid)
+        else:
+            gateway._sync_model_catalogs(pool, ledger, {cid: ref}, failed)
+            failed.update(gateway._sync_usage(pool, entries=[entry], expected_identity=entry.get("account_key")))
+    partial = bool((ledger.entry(cid).get("credits") or {}).get("partial")) or bool(
+        (gateway.CONFIG.get("usage_daily_accounts") or {}).get(cid, {}).get("partial"))
+    ok = ref is not None and cid not in failed and not partial
+    if ok:
+        def complete():
+            pool._sync_pending.discard(cid)
+            pool.end_sync({cid})
+            if not pool._sync_pending:
+                pool._sync_event.clear()
+        ok = pool.apply_if_current(cm, ref[1], complete)
+    return {"ok": ok, "partial": partial, "message": "余额、目录和用量已同步" if ok else "同步不完整，保留上次成功数据"}

@@ -8,7 +8,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.staticfiles import StaticFiles
 
-from . import model_policy
+from . import model_policy, travel, trial_management
 
 
 class Management:
@@ -25,6 +25,7 @@ class Management:
             return []
         pool._rescan()
         now = time.time()
+        trials = trial_management.inventory(self.CONFIG.get("trial_ledger"))
         with pool._lock:
             entries = {entry["id"]: entry for entry in pool.entries()}
             result = []
@@ -43,6 +44,13 @@ class Management:
                 state = ("disabled" if not enabled else "error" if row.get("error") else
                          "circuit_open" if until > now else "expired" if row.get("token_expired") else "ready")
                 row.update(id=identity, name=Path(path).name, enabled=enabled, health=state,
+                           auto_travel=model_policy.credential_auto_travel(self.CONFIG, entry),
+                           travel_supported=travel.supported(entry.get("profile")),
+                           travel=balance.get("travel") or {"state": "unknown", "message": "尚未查询旅行状态"},
+                           trial_supported=entry.get("profile") == "intl-work",
+                           trial=(trial_management.view(trials.get(identity), now=now) if trials is not None
+                                  else trial_management.failure("storage_error"))
+                                 if entry.get("profile") == "intl-work" else trial_management.failure("not_applicable"),
                            fail_until=until, cooldown_until=until,
                            cooldown_remaining=max(0, round(until - now)),
                            last_error_code=("http_401" if entry.get("last_error") == "backend HTTP 401" else
@@ -52,7 +60,7 @@ class Management:
                            cooldowns=cooldowns, credits=balance.get("credits") or None,
                            sync_pending=path in pool._sync_pending or path in pool._syncing or path in pool._sync_retry,
                            catalog_ready=(self.CONFIG.get("account_catalogs") or {}).get(identity, {}).get("models") is not None,
-                           bindings=[source for source, rule in model_policy.snapshot(self.CONFIG)["models"].items()
+                           bindings=[rule.get("public_id", source) for source, rule in model_policy.snapshot(self.CONFIG)["models"].items()
                                      if identity in rule.get("credential_ids", [])])
                 result.append(row)
             return result
@@ -77,6 +85,18 @@ class Management:
             self.gateway.invalidate_model_table()
         return next(row for row in self.admin_credential_inventory() if row["id"] == identity)
 
+    def admin_set_auto_travel(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if enabled and not travel.supported(entry.get("profile")):
+                raise HTTPException(400, "旅行仅适用于国内账号")
+            self.CONFIG["control_store"].set_auto_travel(identity, enabled)
+
     def admin_delete_guard(self, name):
         rows = self.admin_credential_inventory()
         row = next((row for row in rows if row["name"] == name or row["id"] == name), None)
@@ -90,7 +110,8 @@ class Management:
             pool._rescan()
         facts = {}
         for account in (self.CONFIG.get("account_catalogs") or {}).values():
-            for item in self.gateway._usable_models(account.get("models")):
+            for item in self.gateway._usable_models(
+                    self.gateway._effective_account_scope(account, "serves") or []):
                 source = item["id"]
                 row = facts.setdefault(source, {"id": source, "credits": None, "credits_by_profile": {}})
                 price = self.gateway._multiplier_value(item.get("credits"))
@@ -105,11 +126,17 @@ class Management:
         for source, row in facts.items():
             rule = model_policy.rule_for(self.CONFIG, source)
             preview = self.admin_model_preview(source, rule)
-            result.append({**row, **rule, "available_credentials": len(preview["candidates"]),
+            target = facts.get(rule["upstream_id"], row)
+            metadata = self.gateway.model_capabilities.route_metadata(
+                self.gateway, rule["upstream_id"], rule=rule, include_disabled=True)
+            prices = self.gateway.model_capabilities.declaration_prices(self.gateway, metadata)
+            result.append({**target, **metadata, **prices, **rule, "id": source,
+                           "available_credentials": len(preview["candidates"]),
                            "available": bool(preview["candidates"])})
         return sorted(result, key=lambda row: row["id"])
 
     def admin_model_preview(self, source, rule):
+        upstream = rule.get("upstream_id", source)
         pool = self.CONFIG.get("cred_pool")
         accepted, rejected = [], []
         if pool is None:
@@ -127,24 +154,26 @@ class Management:
                     reason = "不在绑定范围"
                 elif not pool._healthy(entry):
                     reason = "认证熔断"
-                elif not pool._model_healthy(entry, source):
+                elif not pool._model_healthy(entry, upstream):
                     reason = "模型额度冷却"
-                else:
+                elif not pool._model_servable(entry, upstream):
+                    reason = "后端模型暂时不可用"
+                elif not pool._eligible(entry, upstream, rule=rule):
                     account = (self.CONFIG.get("account_catalogs") or {}).get(identity, {})
-                    models = account.get("models")
-                    if self.CONFIG.get("account_catalogs") is not None:
-                        if models is None:
-                            reason = "目录尚未就绪"
-                        elif not any(item["id"] == self.gateway._upstream_model(source, profile)
-                                     for item in self.gateway._usable_models(models)) and not (
-                                         source == "auto" and profile == "cn-cli" and self.gateway._usable_models(models)):
-                            reason = "账号自身目录不支持模型"
+                    models = self.gateway._effective_account_scope(account, "serves", model_id=self.gateway._upstream_model(upstream, profile))
+                    if (self.CONFIG.get("account_catalogs") is not None or self.CONFIG.get("model_cache") is not None) and (
+                            models is None or account.get("profile") != profile):
+                        reason = "目录尚未就绪"
+                    else:
+                        reason = "账号自身目录不支持模型"
                 item = {"id": identity, "name": Path(entry["id"]).name, "profile": profile}
                 if reason:
                     rejected.append({**item, "reason": reason})
                 else:
                     accepted.append(item)
-        return {"candidates": accepted, "excluded": rejected}
+        return {"candidates": accepted, "excluded": rejected,
+                **self.gateway.model_capabilities.route_metadata(
+                    self.gateway, upstream, rule=rule, include_disabled=True)}
 
     def admin_apply_settings(self, values):
         restart = {"host", "port", "auth_file", "auth_dir", "import_dir", "skip_check", "log_db"}
@@ -153,8 +182,6 @@ class Management:
                 self.CONFIG[key] = value
         if "model_catalog_ttl" in values and self.CONFIG.get("model_cache") is not None:
             self.CONFIG["model_cache"].ttl = values["model_catalog_ttl"]
-        if "auto_trial" in values and values["auto_trial"] and self.CONFIG.get("trial_ledger") is None:
-            self.CONFIG["trial_ledger"] = self.gateway.trial_rewards.TrialLedger(self.gateway.managed_auth_dir() / "trial-ledger.json")
         self.gateway.invalidate_model_table()
 
 

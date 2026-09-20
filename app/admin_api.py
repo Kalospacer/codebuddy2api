@@ -8,6 +8,7 @@ from pathlib import Path
 import threading
 import time
 from urllib.parse import quote, urlsplit
+import uuid
 import zipfile
 
 from fastapi import HTTPException, Request
@@ -24,12 +25,14 @@ MAX_UPLOAD_BYTES = 32 * 1024 * 1024
 CLEAR_CONFIRMATION = "清空全部日志与统计"
 
 
-async def _body(request, maximum=65536):
+async def _body(request, maximum=65536, *, allow_empty=False):
     data = bytearray()
     async for chunk in request.stream():
         data.extend(chunk)
         if len(data) > maximum:
             raise ValueError("请求体超过大小限制")
+    if allow_empty and not data:
+        return {}
     try:
         value = json.loads(data)
     except (ValueError, UnicodeError, RecursionError):
@@ -46,6 +49,8 @@ def _public_credential(item):
               "credits_by_profile", "catalog", "catalog_sync", "sync", "generation", "auth_broken",
               "models", "remaining", "enterprise_id", "product", "status", "sync_pending", "sync_error",
               "fail_until", "cooldown_until", "cooldown_remaining", "last_failure_at", "catalog_ready", "bindings",
+              "auto_travel", "travel_supported", "travel",
+              "trial_supported", "trial",
               "token_expired", "token_expires_at", "last_refresh_time", "sessions", "sticky_sessions", "last_error_code"}
     result = {key: value for key, value in item.items() if key in fields}
     identity = item.get("account_key") or item.get("id")
@@ -59,15 +64,14 @@ def _public_credential(item):
 
 
 def install_admin(app, config, gateway):
-    """Install once before serving; config owns control_store, audit_store, api_key.
-
-    Gateway inventories must expose real model ``id`` and credential ``account_key``
-    (or fingerprint ``id``), plus a safe ``name``/``filename`` for file operations.
-    """
+    """Install management routes using configured stores, stable inventory IDs and safe filenames."""
     if getattr(app.state, "admin_installed", False):
         return app.state.admin_auth
     control, audit = config["control_store"], config["audit_store"]
     auth = AdminAuth(config)
+    # Resolve the key epoch now: a process that only serves inference traffic would
+    # otherwise never clear a snapshot belonging to a superseded key.
+    auth.reconcile()
     mutation_lock = threading.RLock()
     oauth_lock = threading.RLock()
     oauth_tasks = OrderedDict()
@@ -98,7 +102,11 @@ def install_admin(app, config, gateway):
             if type(value) in (int, float):
                 items.append({"key": name.lower(), "value": value, "stored": None, "source": "internal",
                               "mode": "readonly", "type": "number", "label": label, "locked": True})
-        return {"revision": control.snapshot()["revision"], "items": items, "audit": audit.storage()}
+        items.append({"key": "auto_accept_buddy", "value": config.get("auto_accept_buddy") is True,
+                      "stored": None, "source": config.get("auto_accept_buddy_source", "default"),
+                      "mode": "startup", "type": "boolean", "label": "全部国内账号首次领猫预授权", "locked": True})
+        return {"revision": control.snapshot()["revision"], "items": items, "audit": audit.storage(),
+                "session": auth.storage()}
 
     def audit_settings(values):
         mapping = {"audit_max_bytes": "max_bytes", "audit_retention_days": "retention_days",
@@ -114,8 +122,8 @@ def install_admin(app, config, gateway):
                     del oauth_tasks[task_id]
             if request.url.path == "/admin/oauth/start":
                 site = request.query_params.get("site", "cn")
-                if site not in ("cn", "intl"):
-                    return error_response(400, "OAuth 站点必须为 cn 或 intl")
+                if site not in auth_oauth.SITE_HOSTS:
+                    return error_response(400, f"OAuth 站点必须为 {'、'.join(auth_oauth.SITE_HOSTS)}")
                 if len(oauth_tasks) >= 256:
                     return error_response(429, "OAuth 任务过多，请稍后重试")
                 try:
@@ -197,7 +205,7 @@ def install_admin(app, config, gateway):
 
     @route("POST", "/admin/session")
     async def session_login(request):
-        if not same_origin(request):
+        if auth.csrf_enabled() and not same_origin(request, auth.allowed_origins()):
             return error_response(403, "登录请求 Origin 校验失败")
         data = await _body(request, 8192)
         result, status = auth.login(request, data.get("api_key"))
@@ -216,7 +224,10 @@ def install_admin(app, config, gateway):
 
     @route("DELETE", "/admin/session")
     async def session_delete(request):
-        auth.logout(request)
+        if not auth.logout(request):
+            # The session is still valid on disk; keep the cookie so the client can retry.
+            event("session.revoke_failed", {"code": "session_storage_unavailable"})
+            return error_response(503, "会话未能持久撤销，请检查管理目录权限后重试")
         response = JSONResponse({"authenticated": False})
         response.delete_cookie(COOKIE_NAME, path="/admin", httponly=True, samesite="strict", secure=request.url.scheme == "https")
         return response
@@ -250,18 +261,30 @@ def install_admin(app, config, gateway):
 
     @route("GET", "/admin/models")
     async def models_get(request):
-        snapshot = control.snapshot()
-        models = []
-        for item in await run_in_threadpool(gateway.admin_model_inventory):
-            item = {"id": item} if isinstance(item, str) else dict(item)
-            source = item["id"]
-            rule = snapshot["models"].get(source, {"public_id": source, "enabled": True, "keep_original": False,
-                                                   "region": None, "profile": None, "credential_ids": []})
-            models.append({**item, **rule})
-        return JSONResponse({"revision": snapshot["revision"], "models": models})
+        def build_models():
+            with mutation_lock:
+                inventory = gateway.admin_model_inventory()
+                snapshot = control.snapshot()  # Read policy after account identity synchronization.
+                models = []
+                for item in inventory:
+                    item = {"id": item} if isinstance(item, str) else dict(item)
+                    source = item["id"]
+                    rule = snapshot["models"].get(source, {"public_id": source, "enabled": True, "keep_original": False,
+                                                           "region": None, "profile": None, "credential_ids": []})
+                    models.append({**item, **rule})
+                return JSONResponse({"revision": snapshot["revision"], "models": models,
+                                     "model_capability_guard": config.get("model_capability_guard", True)})
+        return await run_in_threadpool(build_models)
 
-    def checked_rule(source, data):
-        rule = validate_model(source, data, control.snapshot()["models"], known_models())
+    def checked_rule(source, data, *, creating=False):
+        if "custom" in data:
+            raise ValueError("custom 是只读字段")
+        existing = control.snapshot()["models"].get(source, {})
+        if creating and (not data.get("public_id") or not data.get("upstream_id")):
+            raise ValueError("对外 ID 和上游模型 ID 均不能为空")
+        values = {"upstream_id": existing.get("upstream_id", source), **data,
+                  "custom": True if creating else existing.get("custom", False)}
+        rule = validate_model(source, values, control.snapshot()["models"], known_models())
         for identity in rule["credential_ids"]:
             item = selected(identity)
             if item is None:
@@ -271,6 +294,42 @@ def install_admin(app, config, gateway):
                             or (rule["region"] and not profile.startswith(rule["region"] + "-"))):
                 raise ValueError("绑定凭证与区域或产品规则冲突")
         return rule
+
+    @route("POST", "/admin/models")
+    async def models_create(request):
+        data = await _body(request)
+        revision = data.pop("revision", None)
+        source = "custom:" + uuid.uuid4().hex
+        def apply():
+            with mutation_lock:
+                rule = checked_rule(source, data, creating=True)
+                snapshot = control.update_model(source, rule, revision, known_models())
+            event("model.created", {"model": rule["public_id"]})
+            return JSONResponse({"revision": snapshot["revision"], "model": {"id": source, **rule}}, status_code=201)
+        return await run_in_threadpool(apply)
+
+    @route("POST", "/admin/models/preview")
+    async def models_create_preview(request):
+        data = await _body(request)
+        data.pop("revision", None)
+        source = "custom:" + uuid.uuid4().hex
+        def preview():
+            return JSONResponse(gateway.admin_model_preview(source, checked_rule(source, data, creating=True)))
+        return await run_in_threadpool(preview)
+
+    @route("DELETE", "/admin/models/{id:path}")
+    async def models_delete(request):
+        data = await _body(request)
+        if set(data) != {"revision"}:
+            raise ValueError("删除模型只接受 revision")
+        source = request.path_params["id"]
+        def remove():
+            with mutation_lock:
+                snapshot = control.delete_model(source, data["revision"])
+            event("model.deleted", {"model": source})
+            return JSONResponse({"revision": snapshot["revision"], "ok": True})
+        return await run_in_threadpool(remove)
+
 
     @route("PUT", "/admin/models/{id:path}")
     async def models_put(request):
@@ -297,17 +356,21 @@ def install_admin(app, config, gateway):
     @route("PATCH", "/admin/credentials/{id}")
     async def credentials_patch(request):
         data = await _body(request)
-        if set(data) != {"enabled"} or type(data["enabled"]) is not bool:
-            raise ValueError("enabled 必须为布尔值")
+        if set(data) not in ({"enabled"}, {"auto_travel"}) or any(type(value) is not bool for value in data.values()):
+            raise ValueError("仅接受一个布尔字段：enabled 或 auto_travel")
+        field, value = next(iter(data.items()))
         identity = request.path_params["id"]
         def apply():
             if selected(identity) is None:
                 return error_response(404, "凭证不存在")
             with mutation_lock:
                 # The gateway persists under the pool lock before publishing routing state.
-                gateway.admin_set_credential_enabled(identity, data["enabled"])
-            event("credential.enabled", {"credential": identity, "enabled": data["enabled"]})
-            return JSONResponse({"id": identity, "enabled": data["enabled"], "revision": control.snapshot()["revision"]})
+                if field == "enabled":
+                    gateway.admin_set_credential_enabled(identity, value)
+                else:
+                    gateway.admin_set_auto_travel(identity, value)
+            event("credential." + field, {"credential": identity, field: value})
+            return JSONResponse({"id": identity, field: value, "revision": control.snapshot()["revision"]})
         return await run_in_threadpool(apply)
 
     def upload(body):
@@ -336,13 +399,16 @@ def install_admin(app, config, gateway):
             directory = gateway.managed_auth_dir().resolve()
             for name, content in prepared:
                 try:
-                    data = json.loads(content)
+                    data = auth_oauth.loads_strict(content)  # Reject nonstandard JSON constants.
                     uid, invalid = auth_oauth.validate_cred_data(data)
                     if invalid or not isinstance(data.get("account") or {}, dict) or type(data["auth"].get("expiresAt", 0)) not in (int, float):
                         raise CredentialFileError("凭据格式无效")
                     if not body.get("replace", False) and (directory / name).exists():
                         results.append({"name": name, "ok": False, "error": "文件已存在，需明确允许替换"})
                         continue
+                    # Persist token aliases using official runtime field names.
+                    content = json.dumps(auth_oauth.normalize_cred_data(data),
+                                         ensure_ascii=False).encode("utf-8")
                     gateway._store_credential(directory, name, content, uid, replace_existing=body.get("replace", False))
                     results.append({"name": name, "ok": True})
                 except Exception:
@@ -439,8 +505,11 @@ def install_admin(app, config, gateway):
             raise ValueError("days 必须为 1、7、30 或 90") from None
         if days not in (1, 7, 30, 90):
             raise ValueError("days 必须为 1、7、30 或 90")
+        granularity = request.query_params.get("granularity", "auto")
+        if granularity not in ("auto", "hour", "day"):
+            raise ValueError("granularity 必须为 auto、hour 或 day")
         def build_dashboard():
-            result = audit.dashboard(days)
+            result = audit.dashboard(days, granularity=granularity)
             if result.get("degraded"):
                 return error_response(503, "统计暂时无法读取，不能确认当前数值；请检查审计存储状态")
             rows = [_public_credential(item) for item in inventory()]

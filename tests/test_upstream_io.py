@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Chat SSE 边界回归；仅使用内存数据和 MockTransport。"""
+"""Test Chat SSE boundaries with in-memory data and MockTransport."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import json
 import unittest
@@ -222,6 +222,70 @@ class AccumulatorTests(unittest.TestCase):
         self.assertEqual(result["finish_reason"], "content_filter")
 
 
+class OutputBudgetTests(unittest.TestCase):
+    """Test collection budgets and bounded error-body reads."""
+
+    def test_collect_budget_aborts_oversized_aggregation(self):
+        acc = ChatSSEAccumulator(max_collect_bytes=10)  # The second eight-byte chunk exceeds the budget.
+        acc.feed_line('data: {"choices":[{"index":0,"delta":{"content":"12345678"}}]}')
+        with self.assertRaises(UpstreamResponseError) as caught:
+            acc.feed_line('data: {"choices":[{"index":0,"delta":{"content":"12345678"}}]}')
+        self.assertEqual(caught.exception.status, 502)
+        self.assertIn(b"response_too_large", caught.exception.raw)
+        # Within-budget output remains valid.
+        acc = ChatSSEAccumulator(max_collect_bytes=1024)
+        acc.feed_line('data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":"stop"}]}')
+        acc.feed_line("data: [DONE]")
+        self.assertEqual(acc.result()["content"], "ok")
+
+    def test_error_body_read_is_bounded(self):
+        import asyncio
+
+        class BigError:
+            async def aiter_bytes(self):
+                for _ in range(8):
+                    yield b"x" * 1024 * 1024
+
+        raw = asyncio.run(upstream_io.read_bounded_error(BigError(), limit=1024))
+        self.assertEqual(len(raw), 1024)
+
+
+class BoundedErrorReadTests(unittest.IsolatedAsyncioTestCase):
+    async def test_filling_the_limit_never_pulls_another_chunk_and_closes_response(self):
+        for chunks in ((b"abcdefgh",), (b"abcd", b"efgh"), (b"abcd", b"efgh-tail")):
+            with self.subTest(chunks=chunks):
+                class CappedStream(httpx.AsyncByteStream):
+                    closed = False
+
+                    async def __aiter__(self):
+                        for chunk in chunks:
+                            yield chunk
+                        raise AssertionError("reader waited for data after reaching its budget")
+
+                    async def aclose(self):
+                        self.closed = True
+
+                stream = CappedStream()
+                transport = httpx.MockTransport(lambda request: httpx.Response(500, stream=stream))
+                async with httpx.AsyncClient(transport=transport) as client:
+                    async with client.stream("POST", "https://synthetic.invalid") as response:
+                        raw = await upstream_io.read_bounded_error(response, limit=8)
+                        self.assertEqual(raw, b"abcdefgh")
+                    self.assertTrue(stream.closed)
+
+    async def test_short_error_body_is_preserved(self):
+        response = httpx.Response(400, content=b"short")
+        self.assertEqual(await upstream_io.read_bounded_error(response, limit=8), b"short")
+
+    async def test_zero_budget_does_not_open_the_iterator(self):
+        class NoRead:
+            def aiter_bytes(self):
+                raise AssertionError("zero budget must not read upstream")
+
+        self.assertEqual(await upstream_io.read_bounded_error(NoRead(), limit=0), b"")
+
+
+
 class TransportTests(unittest.IsolatedAsyncioTestCase):
     async def test_empty_or_malformed_stream_never_replays_post(self):
         raw_cases = [b"", b"data: {}\n\ndata: [DONE]\n\n",
@@ -251,6 +315,90 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
                                 tracker.result()
                     self.assertEqual(len(requests), 1)
                     self.assertEqual(requests[0].method, "POST")
+
+    async def test_body_not_accepted_is_replayed_on_a_fresh_connection(self):
+        """Retry connection failures once before any request body is accepted."""
+        real_client = httpx.AsyncClient
+        for error_type in (httpx.ConnectError, httpx.ConnectTimeout):
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    if len(attempts) == 1:
+                        raise error_type("synthetic failure before the body was accepted")
+                    return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(await response.aread(), b"data: [DONE]\n\n")
+                self.assertEqual(len(attempts), 2, "只允许重放一次")
+                self.assertEqual([request.method for request in attempts], ["POST", "POST"])
+
+    async def test_write_timeout_is_not_replayed_without_the_opt_in(self):
+        """Do not replay incomplete writes by default because accepted bytes may be processed."""
+        real_client = httpx.AsyncClient
+        for error_type in upstream_io.WRITE_TIMEOUT:
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    raise error_type("synthetic write timeout")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    with self.assertRaises(error_type):
+                        async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
+                            await response.aread()
+                self.assertEqual(len(attempts), 1, "默认必须一次都不重放")
+
+    async def test_write_timeout_is_replayed_only_when_opted_in(self):
+        """Allow explicit write-timeout replay with acknowledged billing ambiguity."""
+        real_client = httpx.AsyncClient
+        for error_type in upstream_io.WRITE_TIMEOUT:
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    if len(attempts) == 1:
+                        raise error_type("synthetic write timeout")
+                    return httpx.Response(200, content=b"data: [DONE]\n\n")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    async with upstream_io.open_backend_stream(
+                            "https://synthetic.invalid", {}, {}, retry_write_timeout=True) as response:
+                        self.assertEqual(response.status_code, 200)
+                        self.assertEqual(await response.aread(), b"data: [DONE]\n\n")
+                self.assertEqual(len(attempts), 2, "只允许重放一次")
+                self.assertEqual([request.method for request in attempts], ["POST", "POST"])
+
+    async def test_ambiguous_transport_failures_never_replay_post(self):
+        """Propagate ambiguous post-send failures without automatic replay."""
+        real_client = httpx.AsyncClient
+        for error_type in (httpx.ReadError, httpx.ReadTimeout, httpx.WriteError,
+                           httpx.RemoteProtocolError):
+            with self.subTest(error=error_type.__name__):
+                attempts = []
+
+                def handler(request):
+                    attempts.append(request)
+                    raise error_type("synthetic failure after the body was sent")
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(upstream_io.httpx, "AsyncClient",
+                                  side_effect=lambda **kw: real_client(transport=transport, **kw)):
+                    with self.assertRaises(error_type):
+                        async with upstream_io.open_backend_stream("https://synthetic.invalid", {}, {}) as response:
+                            await response.aread()
+                self.assertEqual(len(attempts), 1, "歧义请求不得重放 POST")
 
 
 if __name__ == "__main__":

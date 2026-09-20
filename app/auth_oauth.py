@@ -1,18 +1,10 @@
 #!/usr/bin/env python3
-"""auth_oauth.py — WorkBuddy/CodeBuddy 无感登录采集（OAuth state 轮询）与凭据入库校验。
-
-无感登录采集流程（OAuth state 轮询 + 入库严格校验）：
-  1. POST {apiHost}/v2/plugin/auth/state?platform=workbuddy 申请 state + 授权链接
-  2. 用户在浏览器完成扫码授权（桌面端全程不退出、无需安装）
-  3. 轮询 GET /v2/plugin/auth/token?state=... 拿 accessToken
-  4. GET /v2/plugin/login/account?state=... 拉账号信息，拼成官方 .info 结构入库
-
-仅依赖 httpx；文件落盘与凭证池热加载由调用方（converter.py）完成。
-"""
+"""Acquire and validate WorkBuddy/CodeBuddy OAuth credentials; callers handle persistence and pool reload."""
 
 from __future__ import annotations
 
 import base64
+import copy
 import json
 import re
 import threading
@@ -24,21 +16,22 @@ import httpx
 from .site_routing import profile_for_auth
 
 PLUGIN_PREFIX = "/v2/plugin"
-OAUTH_TIMEOUT_S = 600          # 授权等待超时秒数
-RESULT_RETENTION_S = 300       # 完成状态保留，供调用方重复轮询取结果
+OAUTH_TIMEOUT_S = 600          # Authorization deadline in seconds
+RESULT_RETENTION_S = 300       # Retain completed results for repeated polling
 REQUEST_TIMEOUT_S = 15.0
 
-# 各站点无感登录 apiHost（与 auth.domain 一致；积分也打各自域名，不互用）
+# Keep OAuth hosts isolated by product and region.
 SITE_HOSTS = {
     "cn": "https://www.codebuddy.cn",
     "intl": "https://www.workbuddy.ai",
+    "intl-codebuddy": "https://www.codebuddy.ai",
 }
 
-# 入库站点白名单：auth.domain 或 access token 的 JWT issuer 命中其一才收
+# Require an allowlisted credential domain or JWT issuer.
 ALLOWED_ORIGINS = {
     "https://www.workbuddy.cn",
     "https://www.codebuddy.cn",
-    "https://copilot.tencent.com",   # 国内版新版 Keycloak issuer
+    "https://copilot.tencent.com",   # Domestic Keycloak issuer
     "https://www.workbuddy.ai",
     "https://www.codebuddy.ai",
 }
@@ -47,7 +40,7 @@ DEFAULT_UA = "codebuddy2api"
 
 
 def _normalize_origin(value) -> str:
-    """域名/URL 归一化为小写 origin（无 scheme 补 https://）；无效返回 ''。"""
+    """Normalize a domain or URL to a lowercase HTTPS origin, or return an empty string."""
     raw = str(value or "").strip()
     if not raw:
         return ""
@@ -58,7 +51,7 @@ def _normalize_origin(value) -> str:
 
 
 def _token_issuer_origin(access_token: str) -> str:
-    """解码 JWT payload 的 iss，返回 origin；失败返回 ''。"""
+    """Decode a JWT issuer origin, returning an empty string on failure."""
     try:
         part = access_token.split(".")[1]
         part += "=" * ((4 - len(part) % 4) % 4)
@@ -68,8 +61,17 @@ def _token_issuer_origin(access_token: str) -> str:
         return ""
 
 
+def _reject_constant(value):
+    raise ValueError(f"非标准 JSON 常量: {value}")
+
+
+def loads_strict(text):
+    """Parse strict JSON without nonstandard NaN or Infinity constants."""
+    return json.loads(text, parse_constant=_reject_constant)
+
+
 def validate_cred_data(data) -> tuple[str | None, str | None]:
-    """入库校验（严格模式）：返回 (uid, None) 或 (None, 原因)。"""
+    """Validate credentials and return either the account UID or a safe failure reason."""
     if not isinstance(data, dict):
         return None, "凭据不是有效的 JSON 对象"
     acct = data.get("account")
@@ -83,6 +85,14 @@ def validate_cred_data(data) -> tuple[str | None, str | None]:
     token = auth.get("accessToken") or auth.get("access_token") or auth.get("token")
     if not isinstance(token, str) or not token:
         return None, "缺少有效的 accessToken"
+    for field in ("expiresAt", "lastRefreshTime"):
+        value = auth.get(field)
+        if value is None:
+            continue
+        # Compare before float conversion to reject nonfinite values and oversized integers.
+        if isinstance(value, bool) or not isinstance(value, (int, float)) \
+                or not 0 < value < 4102444800000:  # Upper bound: 2100-01-01
+            return None, f"{field} 必须是合理范围内的有限毫秒时间戳"
     domain = _normalize_origin(auth.get("domain") or auth.get("issuer") or "")
     issuer = _token_issuer_origin(token)
     if not any(o in ALLOWED_ORIGINS for o in (domain, issuer) if o):
@@ -94,8 +104,27 @@ def validate_cred_data(data) -> tuple[str | None, str | None]:
     return uid, None
 
 
+def normalize_cred_data(data: dict) -> dict:
+    """Normalize validated token aliases to the official runtime credential fields."""
+    out = copy.deepcopy(data)
+    auth = out.get("auth")
+    if not isinstance(auth, dict):
+        return out
+    for canonical, aliases in (("accessToken", ("access_token", "token")),
+                               ("refreshToken", ("refresh_token",)),
+                               ("tokenType", ("token_type",))):
+        if not auth.get(canonical):
+            for alias in aliases:
+                if auth.get(alias):
+                    auth[canonical] = auth[alias]
+                    break
+        for alias in aliases:
+            auth.pop(alias, None)
+    return out
+
+
 def _norm_ts(v) -> int | None:
-    """时间戳归一化：秒/毫秒/数字字符串 → 毫秒；无效返回 None。"""
+    """Normalize numeric seconds or milliseconds to milliseconds; invalid values return None."""
     if isinstance(v, bool):
         return None
     if isinstance(v, (int, float)):
@@ -109,13 +138,13 @@ def _norm_ts(v) -> int | None:
         return None
     if ts <= 0:
         return None
-    if ts < 1e10:  # 秒 → 毫秒
+    if ts < 1e10:  # Convert seconds to milliseconds.
         ts *= 1000
     return round(ts)
 
 
 def build_auth_file(token_data, account_data) -> dict:
-    """把 OAuth token + 账号信息拼成官方 .info 结构（保留上游全部字段，不裁剪白名单）。"""
+    """Build the official .info structure while preserving upstream credential fields."""
     now = round(time.time() * 1000)
     raw = token_data if isinstance(token_data, dict) else {}
     domain = str(raw.get("domain") or "")
@@ -142,7 +171,7 @@ def build_auth_file(token_data, account_data) -> dict:
         "pluginEnabled": True,
     })
 
-    auth = dict(raw)  # 保留 idToken/sessionState 等官方后续可能依赖的字段
+    auth = dict(raw)  # Preserve official session fields beyond the access token.
     auth.update({
         "accessToken": str(raw.get("accessToken") or raw.get("access_token") or ""),
         "refreshToken": str(raw.get("refreshToken") or raw.get("refresh_token") or ""),
@@ -166,7 +195,7 @@ def build_auth_file(token_data, account_data) -> dict:
 
 
 def merge_existing_accounts(cred: dict, existing) -> dict:
-    """把 existing 文件的 accounts/allAccounts 并入 cred（按 uid 去重，cred 内账号优先）。"""
+    """Merge existing account lists by UID, preferring accounts in the new credential."""
     if not isinstance(existing, dict):
         return cred
     arr = existing.get("allAccounts") or existing.get("accounts")
@@ -182,7 +211,7 @@ def merge_existing_accounts(cred: dict, existing) -> dict:
 
 
 class OAuthManager:
-    """无感登录状态机：start 申请 state，poll 轮询直至授权完成。状态存内存，懒清理。"""
+    """Manage in-memory OAuth authorization sessions with lazy expiry cleanup."""
 
     def __init__(self, user_agent: str = DEFAULT_UA, timeout_s: int = OAUTH_TIMEOUT_S,
                  retention_s: int = RESULT_RETENTION_S, http_factory=None):
@@ -191,7 +220,7 @@ class OAuthManager:
         self._ua = user_agent
         self._timeout_s = timeout_s
         self._retention_s = retention_s
-        self._http_factory = http_factory    # 测试注入；缺省 httpx.Client
+        self._http_factory = http_factory    # Optional test transport factory
 
     def _client(self):
         return self._http_factory() if self._http_factory else httpx.Client(timeout=REQUEST_TIMEOUT_S)
@@ -201,7 +230,7 @@ class OAuthManager:
                 "Content-Type": "application/json"}
 
     def _purge(self):
-        """惰性清理：超时 + 结果保留期都过去的登录请求直接丢弃（调用时需已持锁）。"""
+        """Remove expired sessions and retained results while holding the session lock."""
         now = time.time()
         drop = [k for k, s in self._states.items()
                 if now > s["expires_at"] + self._retention_s]
@@ -209,12 +238,15 @@ class OAuthManager:
             self._states.pop(k, None)
 
     def start(self, site: str = "cn") -> dict:
-        """第一步：申请 state + 授权链接。site 仅支持 cn / intl。"""
-        host = SITE_HOSTS.get(str(site or "").strip().lower())
+        """Request authorization for the selected domestic, international WorkBuddy or CodeBuddy site."""
+        site = str(site or "").strip().lower()
+        host = SITE_HOSTS.get(site)
         if not host:
-            raise ValueError(f"未知站点: {site}（仅支持 cn / intl）")
+            raise ValueError(f"未知站点（仅支持 {' / '.join(SITE_HOSTS)}）")
+        # CodeBuddy requires uppercase CLI; retain compatible parameters for other sites.
+        platform = "CLI" if site == "intl-codebuddy" else "workbuddy"
         with self._client() as c:
-            r = c.post(f"{host}{PLUGIN_PREFIX}/auth/state?platform=workbuddy",
+            r = c.post(f"{host}{PLUGIN_PREFIX}/auth/state?platform={platform}",
                        headers=self._headers(), json={})
             resp = r.json()
         data = resp.get("data") or {} if isinstance(resp, dict) else {}
@@ -235,7 +267,7 @@ class OAuthManager:
         return {"login_id": login_id, "verification_uri": auth_url, "expires_in": self._timeout_s}
 
     def poll(self, login_id: str) -> dict:
-        """第二步：轮询授权结果。未完成 {"done": False}；完成带 uid/nickname/cred 或 error。"""
+        """Poll authorization and return pending state, credentials or a safe error."""
         with self._lock:
             self._purge()
             s = self._states.get(str(login_id or ""))
@@ -254,7 +286,7 @@ class OAuthManager:
             try:
                 resp = c.get(url, headers=self._headers()).json()
             except Exception:
-                return {"done": False}     # 上游抖动视为未完成，下轮再试
+                return {"done": False}     # Retry transient upstream failures on the next poll.
             data = resp.get("data") or {} if isinstance(resp, dict) else {}
             code = resp.get("code") if isinstance(resp, dict) else None
             if code not in (0, 200):

@@ -13,7 +13,7 @@ from fastapi import FastAPI, Header
 from fastapi.testclient import TestClient
 
 from app.admin_api import CLEAR_CONFIRMATION, install_admin
-from app.admin_auth import COOKIE_NAME
+from app.admin_auth import COOKIE_NAME, origin_allowlist, same_origin
 from app.control_store import ControlStore
 
 
@@ -22,7 +22,8 @@ class AdminApiTests(unittest.TestCase):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         self.store = ControlStore(self.root / "control.sqlite3")
         self.addCleanup(self.store.close)
-        self.config = {"api_key": "synthetic-key", "control_store": self.store, "max_images": 16}
+        self.config = {"api_key": "synthetic-key", "control_store": self.store, "max_images": 16,
+                       "session_path": self.root / "admin-sessions.json"}
         self.audit = Mock()
         self.audit.storage.return_value = {"db_bytes": 0}
         self.audit.list_records.return_value = {"items": [], "next_cursor": None, "has_more": False}
@@ -95,6 +96,215 @@ class AdminApiTests(unittest.TestCase):
         self.assertFalse(self.client.get("/v1/identity", headers={"Cookie": f"{COOKIE_NAME}={cookie}"}).json()["authorization_present"])
         self.assertEqual(self.client.post("/admin/legacy", headers=self.headers).status_code, 200)
 
+    def test_same_origin_referer_fallback_is_strict_and_get_only(self):
+        from starlette.requests import Request
+        valid = "http://testserver/dashboard/credentials?tab=oauth"
+        cases = [
+            ("GET", {"Referer": valid}, True),
+            ("HEAD", {"Referer": "http://TESTSERVER:80/dashboard"}, True),
+            ("GET", {"Sec-Fetch-Site": "same-origin"}, True),
+            ("GET", {}, False),
+            ("POST", {"Referer": valid}, False),
+            ("DELETE", {"Referer": valid}, False),
+            ("GET", {"Sec-Fetch-Site": "cross-site", "Referer": valid}, False),
+            ("GET", {"Sec-Fetch-Site": "same-site", "Referer": valid}, False),
+            ("GET", {"Sec-Fetch-Site": "none", "Referer": valid}, False),
+            ("GET", {"Sec-Fetch-Site": "", "Referer": valid}, False),
+            ("GET", {"Origin": "null", "Referer": valid, "Sec-Fetch-Site": "same-origin"}, False),
+            ("GET", {"Origin": "", "Referer": valid, "Sec-Fetch-Site": "same-origin"}, False),
+            ("GET", {"Origin": "https://evil.invalid", "Referer": valid}, False),
+            ("GET", {"Origin": "http://testserver/path", "Referer": valid}, False),
+            ("GET", {"Origin": "http://testserver", "Referer": "https://evil.invalid"}, True),
+        ]
+        for invalid in ("https://testserver/dashboard", "http://testserver:8787/dashboard",
+                        "http://testserver:0/dashboard", "http://testserver.evil.invalid/dashboard",
+                        "http://user:password@testserver/dashboard", "http://@testserver/dashboard",
+                        "http://testserver/dashboard#fragment", "//testserver/dashboard", "/dashboard",
+                        "http://testserver:invalid/dashboard", "http://[invalid", "null"):
+            cases.append(("GET", {"Referer": invalid}, False))
+        for method, headers, expected in cases:
+            with self.subTest(method=method, headers=headers):
+                request = Request({"type": "http", "method": method, "scheme": "http",
+                                   "server": ("testserver", 80), "path": "/admin/oauth/poll", "query_string": b"",
+                                   "headers": [(key.lower().encode(), value.encode()) for key, value in headers.items()]})
+                self.assertIs(same_origin(request), expected)
+
+
+    def test_same_origin_allowlist_matches_exact_origin_only(self):
+        from starlette.requests import Request
+
+        def check(headers, allowed, method="GET"):
+            request = Request({"type": "http", "method": method, "scheme": "http",
+                               "server": ("testserver", 80), "path": "/admin/session", "query_string": b"",
+                               "headers": [(key.lower().encode(), value.encode()) for key, value in headers.items()]})
+            return same_origin(request, allowed)
+
+        allowed = origin_allowlist("https://chat.example.com,http://10.0.0.1:8787")
+        self.assertEqual(allowed, frozenset({("https", "chat.example.com", 443), ("http", "10.0.0.1", 8787)}))
+        self.assertTrue(check({"Origin": "https://chat.example.com"}, allowed))
+        self.assertTrue(check({"Origin": "https://CHAT.example.com:443"}, allowed))
+        self.assertTrue(check({"Origin": "http://10.0.0.1:8787"}, allowed))
+        self.assertFalse(check({"Origin": "http://chat.example.com"}, allowed))
+        self.assertFalse(check({"Origin": "https://chat.example.com:8443"}, allowed))
+        self.assertFalse(check({"Origin": "https://sub.chat.example.com"}, allowed))
+        self.assertFalse(check({"Origin": "https://chat.example.com/path"}, allowed))
+        self.assertFalse(check({"Origin": "https://evil.invalid"}, allowed))
+        self.assertFalse(check({"Origin": "null"}, allowed))
+        self.assertFalse(check({}, allowed, method="POST"))
+        self.assertFalse(check({"Referer": "https://chat.example.com/dashboard"}, allowed))
+        self.assertTrue(check({"Origin": "http://testserver"}, ()))
+
+    def test_allowed_origins_permit_foreign_origin_login_and_cookie_writes(self):
+        self.config["admin_allowed_origins"] = "https://chat.example.com"
+        foreign = {"Origin": "https://chat.example.com"}
+        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}).status_code, 403)
+        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+                                          headers={"Origin": "https://evil.invalid"}).status_code, 403)
+        login = self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers=foreign)
+        self.assertEqual(login.status_code, 200, login.text)
+        csrf = {**foreign, "X-CSRF-Token": login.json()["csrf_token"]}
+        self.assertEqual(self.client.post("/admin/legacy", headers=csrf).status_code, 200)
+        self.assertEqual(self.client.post("/admin/legacy", headers={**csrf, "Origin": "https://evil.invalid"}).status_code, 403)
+
+    def test_allowed_origins_setting_validates_normalizes_and_applies_hot(self):
+        response = self.client.patch("/admin/settings", headers=self.headers, json={
+            "revision": 0, "values": {"admin_allowed_origins": "chat.example.com, http://10.0.0.1:8787/ https://dup.example.com,,https://dup.example.com"}})
+        self.assertEqual(response.status_code, 200, response.text)
+        stored = self.store.snapshot()["settings"]["admin_allowed_origins"]
+        self.assertEqual(stored, "https://chat.example.com,http://10.0.0.1:8787,https://dup.example.com")
+        self.assertEqual(self.config["admin_allowed_origins"], stored)
+        login = self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+                                 headers={"Origin": "https://chat.example.com"})
+        self.assertEqual(login.status_code, 200, login.text)
+        cleared = self.client.patch("/admin/settings", headers=self.headers, json={
+            "revision": 1, "values": {"admin_allowed_origins": ""}})
+        self.assertEqual(cleared.status_code, 200, cleared.text)
+        self.assertEqual(self.config["admin_allowed_origins"], "")
+        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"},
+                                          headers={"Origin": "https://chat.example.com"}).status_code, 403)
+        for invalid in ("ftp://chat.example.com", "https://chat.example.com/path", "http://user@chat.example.com",
+                        "https://chat.example.com#fragment", "https://chat.example.com:0", "::"):
+            with self.subTest(invalid=invalid):
+                rejected = self.client.patch("/admin/settings", headers=self.headers, json={
+                    "revision": self.store.snapshot()["revision"], "values": {"admin_allowed_origins": invalid}})
+                self.assertEqual(rejected.status_code, 400)
+        self.assertEqual(self.store.snapshot()["settings"]["admin_allowed_origins"], "")
+    def test_lan_oauth_poll_uses_referer_without_disabling_csrf(self):
+        origin = "http://192.168.1.10:8787"
+        client = self.enterContext(TestClient(self.app, base_url=origin))
+        login = client.post("/admin/session", headers={"Origin": origin}, json={"api_key": "synthetic-key"})
+        self.assertEqual(login.status_code, 200, login.text)
+        token = login.json()["csrf_token"]
+        started = client.post("/admin/oauth/start", headers={"Origin": origin, "X-CSRF-Token": token})
+        self.assertEqual(started.status_code, 200, started.text)
+        params = {"login_id": started.json()["login_id"]}
+        referer = origin + "/dashboard/credentials"
+        rejected = [
+            {"Referer": referer},
+            {"Referer": referer, "X-CSRF-Token": "wrong"},
+            {"Referer": "http://evil.invalid/dashboard", "X-CSRF-Token": token},
+            {"Referer": referer, "X-CSRF-Token": token, "Sec-Fetch-Site": "cross-site"},
+        ]
+        for headers in rejected:
+            with self.subTest(headers=headers):
+                self.assertEqual(client.get("/admin/oauth/poll", params=params, headers=headers).status_code, 403)
+        other = self.enterContext(TestClient(self.app, base_url=origin))
+        other_login = other.post("/admin/session", headers={"Origin": origin}, json={"api_key": "synthetic-key"})
+        self.assertEqual(other_login.status_code, 200)
+        response = other.get("/admin/oauth/poll", params=params, headers={
+            "Referer": referer, "X-CSRF-Token": other_login.json()["csrf_token"]})
+        self.assertEqual(response.status_code, 404)
+        self.gateway._OAUTH.poll.assert_not_called()
+        self.gateway._save_oauth_credential.assert_not_called()
+        response = client.get("/admin/oauth/poll", params=params, headers={"Referer": referer, "X-CSRF-Token": token})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["imported"], "first.info")
+        self.assertTrue(self.auth.csrf_enabled())
+        self.gateway._OAUTH.poll.assert_called_once()
+        self.gateway._save_oauth_credential.assert_called_once()
+
+    def test_admin_csrf_defaults_to_enabled_and_requires_explicit_false(self):
+        self.assertTrue(self.auth.csrf_enabled())
+        for value in (True, None, 0, "false"):
+            with self.subTest(value=value):
+                self.config["admin_csrf"] = value
+                self.assertTrue(self.auth.csrf_enabled())
+                self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}).status_code, 403)
+        self.config["admin_csrf"] = False
+        self.assertFalse(self.auth.csrf_enabled())
+
+    def test_disabled_csrf_allows_cookie_writes_and_oauth_poll(self):
+        self.config["admin_csrf"] = False
+        response = self.client.post("/admin/session", json={"api_key": "synthetic-key"})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertTrue(response.json()["csrf_token"])
+        self.assertIn("HttpOnly", response.headers["set-cookie"])
+        self.assertIn("SameSite=strict", response.headers["set-cookie"])
+        self.assertIn("Path=/admin", response.headers["set-cookie"])
+        self.assertEqual(self.client.post("/admin/legacy").status_code, 200)
+        self.assertEqual(self.client.post("/admin/legacy", headers={
+            "Origin": "https://different.invalid", "X-CSRF-Token": "invalid"}).status_code, 200)
+        started = self.client.post("/admin/oauth/start?site=cn")
+        self.assertEqual(started.status_code, 200, started.text)
+        for _ in range(2):
+            polled = self.client.get("/admin/oauth/poll", params={"login_id": started.json()["login_id"]})
+            self.assertEqual(polled.status_code, 200, polled.text)
+            self.assertEqual(polled.json()["imported"], "first.info")
+        self.gateway._OAUTH.start.assert_called_once_with(site="cn")
+        self.gateway._OAUTH.poll.assert_called_once()
+        self.gateway._save_oauth_credential.assert_called_once()
+        self.assertEqual(self.client.delete("/admin/session").status_code, 200)
+        self.assertEqual(self.client.post("/admin/legacy").status_code, 401)
+
+    def test_disabled_csrf_keeps_authentication_and_sensitive_action_checks(self):
+        self.config["admin_csrf"] = False
+        self.assertEqual(self.client.post("/admin/legacy").status_code, 401)
+        self.assertEqual(self.client.post("/admin/legacy", headers={"X-Api-Key": "wrong"}).status_code, 401)
+        self.assertEqual(self.client.post("/admin/session", json={"api_key": "wrong"}).status_code, 401)
+        self.login()
+        cookie = self.client.cookies.get(COOKIE_NAME)
+        self.assertFalse(self.client.get("/v1/identity", headers={"Cookie": f"{COOKIE_NAME}={cookie}"}).json()["authorization_present"])
+        response = self.client.post("/admin/logs/clear", json={"scope": "all", "confirmation": CLEAR_CONFIRMATION})
+        self.assertEqual(response.status_code, 403)
+        self.audit.clear.assert_not_called()
+        self.gateway.admin_delete_guard.side_effect = ValueError("referenced")
+        self.assertEqual(self.client.delete("/admin/credentials/first.info").status_code, 409)
+        self.config["api_key"] = "rotated-key"
+        self.assertEqual(self.client.post("/admin/legacy").status_code, 401)
+        self.config["api_key"] = ""
+        for path in ("/admin/session", "/admin/settings", "/admin/credentials"):
+            self.assertEqual(self.client.get(path).status_code, 503)
+
+    def test_disabled_csrf_keeps_oauth_ownership_and_official_site_checks(self):
+        self.config["admin_csrf"] = False
+        self.login()
+        started = self.client.post("/admin/oauth/start")
+        self.assertEqual(started.status_code, 200)
+        other = self.enterContext(TestClient(self.app))
+        self.login(other)
+        response = other.get("/admin/oauth/poll", params={"login_id": started.json()["login_id"]})
+        self.assertEqual(response.status_code, 404)
+        self.gateway._OAUTH.poll.assert_not_called()
+        self.gateway._save_oauth_credential.assert_not_called()
+        self.gateway._OAUTH.start.return_value = {"login_id": "evil", "verification_uri": "https://www.codebuddy.cn.evil.invalid/login"}
+        self.assertEqual(self.client.post("/admin/oauth/start").status_code, 502)
+
+    def test_disabled_csrf_keeps_login_throttle(self):
+        self.config["admin_csrf"] = False
+        for _ in range(10):
+            self.assertEqual(self.client.post("/admin/session", json={"api_key": "wrong"}).status_code, 401)
+        self.assertEqual(self.client.post("/admin/session", json={"api_key": "synthetic-key"}).status_code, 429)
+
+    def test_admin_csrf_cannot_be_changed_through_management_settings(self):
+        for enabled in (True, False):
+            with self.subTest(enabled=enabled):
+                self.config["admin_csrf"] = enabled
+                response = self.client.patch("/admin/settings", headers=self.headers, json={
+                    "revision": 0, "values": {"admin_csrf": not enabled}})
+                self.assertEqual(response.status_code, 400)
+                self.assertIs(self.config["admin_csrf"], enabled)
+                self.assertNotIn("admin_csrf", self.store.snapshot()["settings"])
+
     def test_session_cookie_flags_logout_and_rotation(self):
         response = self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers={"Origin": "http://testserver"})
         cookie = response.headers["set-cookie"]
@@ -110,6 +320,39 @@ class AdminApiTests(unittest.TestCase):
         self.assertEqual(self.client.get("/admin/settings").status_code, 401)
         self.assertEqual(self.client.get("/admin/settings", headers=self.headers).status_code, 401)
         self.assertEqual(self.client.get("/admin/settings", headers={"X-Api-Key": "rotated-key"}).status_code, 200)
+
+    def test_logout_reports_when_the_session_could_not_be_persistently_revoked(self):
+        """A logout that cannot reach durable storage must not answer `authenticated: false`."""
+        from unittest.mock import patch
+        response = self.client.post("/admin/session", json={"api_key": "synthetic-key"}, headers={"Origin": "http://testserver"})
+        csrf = {"Origin": "http://testserver", "X-CSRF-Token": response.json()["csrf_token"]}
+        old = self.client.cookies.get(COOKIE_NAME)
+        with patch("app.admin_auth.tempfile.mkstemp", side_effect=OSError("read-only")), \
+                patch("app.admin_auth.os.unlink", side_effect=OSError("read-only")):
+            denied = self.client.delete("/admin/session", headers=csrf)
+        self.assertEqual(denied.status_code, 503)
+        self.assertTrue(self.auth.storage()["degraded"])
+        # The cookie is still valid, so the client can retry rather than silently lose access.
+        self.assertEqual(self.client.get("/admin/settings", headers={"Cookie": f"{COOKIE_NAME}={old}"}).status_code, 200)
+        self.assertEqual(self.client.delete("/admin/session", headers=csrf).status_code, 200)
+        self.assertEqual(self.client.get("/admin/settings", headers={"Cookie": f"{COOKIE_NAME}={old}"}).status_code, 401)
+
+    def test_session_storage_state_is_reported_in_settings(self):
+        state = self.client.get("/admin/settings", headers=self.headers).json()["session"]
+        self.assertFalse(state["degraded"])
+        self.assertIsNone(state["last_error"])
+        self.assertTrue(state["path"])
+
+    def test_a_superseded_snapshot_that_cannot_be_revoked_fails_closed(self):
+        """Mid-process epoch changes must deny with 503, never serve management traffic."""
+        from unittest.mock import patch
+        self.assertEqual(self.client.get("/admin/settings", headers=self.headers).status_code, 200)
+        self.config["api_key"] = "rotated-synthetic-key"
+        with patch.object(type(self.auth), "_persist", return_value=False), \
+                patch.object(type(self.auth), "_revoke", return_value=False):
+            denied = self.client.get("/admin/settings", headers=self.headers)
+        self.assertEqual(denied.status_code, 503)
+        self.assertIn("会话快照", denied.json()["error"]["message"])
 
     def test_https_cookie_and_bounded_sessions(self):
         from starlette.requests import Request
@@ -167,6 +410,48 @@ class AdminApiTests(unittest.TestCase):
         self.gateway._save_oauth_credential.assert_not_called()
 
 
+    def test_tool_metadata_setting_is_hot_persisted_and_respects_locks(self):
+        key = "keep_tool_metadata"
+        current = self.client.get("/admin/settings", headers=self.headers).json()
+        item = next(item for item in current["items"] if item["key"] == key)
+        self.assertEqual((item["value"], item["locked"], item["mode"]), (False, False, "hot"))
+        response = self.client.patch("/admin/settings", headers=self.headers, json={
+            "revision": current["revision"], "values": {key: True}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIs(self.config[key], True)
+        self.assertIs(self.store.snapshot()["settings"][key], True)
+        self.gateway.admin_apply_settings.assert_called_once_with({key: True})
+        item = next(item for item in response.json()["items"] if item["key"] == key)
+        self.assertEqual((item["value"], item["source"], item["locked"]), (True, "management", False))
+        self.config["settings_sources"][key] = "environment"
+        response = self.client.patch("/admin/settings", headers=self.headers, json={
+            "revision": response.json()["revision"], "values": {key: False}})
+        self.assertEqual(response.status_code, 400)
+        self.assertIs(self.config[key], True)
+        self.assertIs(self.store.snapshot()["settings"][key], True)
+
+    def test_failover_settings_are_hot_and_persisted(self):
+        """Apply failover and write-timeout settings without restarting the process."""
+        current = self.client.get("/admin/settings", headers=self.headers).json()
+        items = {item["key"]: item for item in current["items"]}
+        for key, kind, default in (("failover_max", "integer", 0), ("retry_write_timeout", "boolean", False)):
+            with self.subTest(key=key):
+                spec = items[key]
+                self.assertEqual((spec["mode"], spec["locked"], spec["type"]), ("hot", False, kind))
+                self.assertEqual(spec["value"], default, "默认必须与上游行为一致：关闭")
+        response = self.client.patch("/admin/settings", headers=self.headers, json={
+            "revision": current["revision"], "values": {"failover_max": 2, "retry_write_timeout": True}})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual((self.config["failover_max"], self.config["retry_write_timeout"]), (2, True))
+        self.assertEqual(self.store.snapshot()["settings"]["failover_max"], 2)
+        self.assertIs(self.store.snapshot()["settings"]["retry_write_timeout"], True)
+        self.gateway.admin_apply_settings.assert_called_once_with(
+            {"failover_max": 2, "retry_write_timeout": True})
+        applied = {item["key"]: item for item in response.json()["items"]}
+        for key, value in (("failover_max", 2), ("retry_write_timeout", True)):
+            self.assertEqual((applied[key]["value"], applied[key]["source"], applied[key]["locked"]),
+                             (value, "management", False), applied[key])
+
     def test_settings_revision_locked_sources_and_secret_redaction(self):
         self.config["auth_dir"] = "/private-directory"
         self.config["settings_sources"] = {"max_images": "environment"}
@@ -184,9 +469,28 @@ class AdminApiTests(unittest.TestCase):
         stale = self.client.patch("/admin/settings", headers=self.headers, json={"revision": 0, "values": {"max_images": 6}})
         self.assertEqual(stale.status_code, 409)
 
+    def test_model_inventory_uses_revision_after_identity_sync(self):
+        def inventory():
+            self.store.update_model("custom:synced", {"public_id": "synced-model", "upstream_id": "upstream", "custom": True}, 0)
+            return [{"id": "custom:synced", "public_id": "synced-model", "upstream_id": "upstream", "custom": True}]
+        self.gateway.admin_model_inventory.side_effect = inventory
+        response = self.client.get("/admin/models", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["revision"], 1)
+        self.assertEqual(response.json()["models"][0]["public_id"], "synced-model")
+
+
+    def test_dashboard_granularity_is_validated_and_forwarded(self):
+        response = self.client.get("/admin/dashboard?days=1&granularity=hour", headers=self.headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.audit.dashboard.assert_called_with(1, granularity="hour")
+        for value in ("week", "minute", "unknown"):
+            self.assertEqual(self.client.get("/admin/dashboard?days=1&granularity=" + value, headers=self.headers).status_code, 400)
+
+
     def test_model_rules_preview_and_credential_constraints(self):
         response = self.client.put("/admin/models/upstream", headers=self.headers,
-                                    json={"revision": 0, "public_id": "public", "credential_ids": ["fingerprint"], "region": "cn"})
+                                    json={"revision": 0, "public_id": "public", "credential_ids": ["fingerprint"]})
         self.assertEqual(response.status_code, 200, response.text)
         models = self.client.get("/admin/models", headers=self.headers).json()
         self.assertEqual(models["models"][0]["public_id"], "public")
@@ -232,6 +536,23 @@ class AdminApiTests(unittest.TestCase):
         response = self.client.post("/admin/credentials/upload", headers=self.headers, json=payload)
         self.assertFalse(response.json()["results"][0]["ok"])
 
+    def test_upload_normalizes_token_aliases_to_canonical_fields(self):
+        """Persist token aliases as accessToken and remove alias keys."""
+        data = self.credential()
+        auth = data.pop("auth")
+        data["auth"] = {**{k: v for k, v in auth.items() if k != "accessToken"},
+                        "access_token": auth["accessToken"], "token_type": "Bearer",
+                        "refresh_token": "synthetic-refresh"}
+        payload = {"files": [{"name": "first.info", "content": json.dumps(data)}]}
+        response = self.client.post("/admin/credentials/upload", headers=self.headers, json=payload)
+        self.assertTrue(response.json()["results"][0]["ok"], response.text)
+        saved = json.loads(self.gateway._store_credential.call_args.args[2].decode("utf-8"))
+        self.assertEqual(saved["auth"]["accessToken"], "synthetic-token")
+        self.assertEqual(saved["auth"]["refreshToken"], "synthetic-refresh")
+        self.assertNotIn("access_token", saved["auth"])
+        self.assertNotIn("refresh_token", saved["auth"])
+        self.assertNotIn("token", saved["auth"])
+
     def test_export_only_selected_info_and_symlink_identity_protection(self):
         content = json.dumps(self.credential())
         (self.root / "first.info").write_text(content)
@@ -264,11 +585,31 @@ class AdminApiTests(unittest.TestCase):
         with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
             self.assertEqual(archive.namelist(), ["0.info", "1.info"])
 
+    def test_oauth_international_products_are_selectable_without_arbitrary_hosts(self):
+        sites = {"cn": "www.codebuddy.cn", "intl": "www.workbuddy.ai", "intl-codebuddy": "www.codebuddy.ai"}
+        for site, host in sites.items():
+            with self.subTest(site=site):
+                uri = f"https://{host}/login"
+                self.gateway._OAUTH.start.return_value = {"login_id": site, "verification_uri": uri}
+                response = self.client.post("/admin/oauth/start", params={"site": site}, headers=self.headers)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.json()["verification_uri"], uri)
+                self.gateway._OAUTH.start.assert_called_with(site=site)
+        self.gateway._OAUTH.start.reset_mock()
+        for site in ("", "codebuddy", "https://www.codebuddy.ai", "https://evil.invalid"):
+            with self.subTest(invalid=site):
+                response = self.client.post("/admin/oauth/start", params={"site": site}, headers=self.headers)
+                self.assertEqual(response.status_code, 400)
+        self.gateway._OAUTH.start.assert_not_called()
+
     def test_oauth_binding_csrf_idempotence_and_whitelist(self):
+        self.gateway._OAUTH.start.return_value = {
+            "login_id": "task", "verification_uri": "https://www.codebuddy.ai/login"}
         csrf = self.login()
-        response = self.client.post("/admin/oauth/start", headers=csrf)
+        response = self.client.post("/admin/oauth/start?site=intl-codebuddy", headers=csrf)
         self.assertEqual(response.status_code, 200, response.text)
-        self.assertEqual(response.json()["verification_uri"], "https://www.codebuddy.cn/login")
+        self.assertEqual(response.json()["verification_uri"], "https://www.codebuddy.ai/login")
+        self.gateway._OAUTH.start.assert_called_once_with(site="intl-codebuddy")
         self.assertEqual(self.client.get("/admin/oauth/poll?login_id=task").status_code, 403)
         other = self.enterContext(TestClient(self.app))
         other_csrf = self.login(other)

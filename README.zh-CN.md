@@ -7,10 +7,11 @@
 - 支持 Chat Completions、Responses 和 Anthropic Messages，包含工具调用与流式输出。
 - 内置 **WebUI**：扫码添加账号，管理模型、凭证、日志与设置，无需桌面端。
 - 多账号自动选路，兼容国内／国际站，自动刷新凭证。
+- 按账号配置国内 Buddy 自动旅行，可独立关闭；本分支已移除签到功能。
 
 ## 快速开始
 
-需要 Git 和 Docker Compose；以下方式从源码构建，已包含 WebUI。
+需要 Git 和 Docker Compose；直接拉取 GHCR 已构建镜像（内含 WebUI），无需在本机编译。
 
 ```bash
 git clone https://github.com/maiphucgiang/codebuddy2api.git
@@ -18,20 +19,26 @@ cd codebuddy2api
 cp .env.example .env
 ```
 
-编辑 `.env`，将 `CODEBUDDY2API_KEY` 设置为你自己的随机密钥；已有 `.env` 请勿覆盖。然后启动：
+编辑 `.env`：将 `CODEBUDDY2API_KEY` 设置为自己的随机密钥，并指定镜像；升级时保留已有 `.env`：
+
+```dotenv
+CODEBUDDY2API_IMAGE=ghcr.io/maiphucgiang/codebuddy2api:latest
+```
 
 ```bash
-docker compose build
-docker compose up -d
+docker compose pull
+docker compose up -d --no-build
 ```
+
+`latest` 跟随稳定发行版；需固定部署时改用已发布的版本标签。镜像功能以对应版本为准，不包含尚未合并的源码分支改动。
+
+首次使用：
 
 1. 打开 **http://127.0.0.1:8787/dashboard**，使用刚设置的 API key 登录。
 2. 在「凭证管理」扫码添加国内或国际账号，也可导入 `.info` 文件。
 3. 在「模型路由」查看可用模型，将其对外 ID 填入客户端。
 
-按模板配置时仅允许本机访问。远程访问前请配置 HTTPS 并限制网络访问；保留并妥善备份 `auth/` 数据目录。
-
-[使用发布镜像或本地 Python 运行 →](docs/deployment.zh-CN.md)
+按模板配置时仅允许本机访问。远程访问前请配置 HTTPS 并限制网络访问；保留并妥善备份 `auth/` 数据目录。如需直接运行源码或在终端登录，见[部署指南](docs/deployment.zh-CN.md)。
 
 ## 客户端接入
 
@@ -46,14 +53,38 @@ docker compose up -d
 
 [Codex CLI、Claude Code / CC Switch 等配置示例 →](docs/clients.zh-CN.md)
 
+## 项目结构
+
+```
+.
+├── converter.py         # 网关入口：协议适配、选路、调度
+├── app/                 # 管理 API、凭证、目录、审计与策略模块
+├── web/                 # WebUI 前端（React/TypeScript，构建产物由网关托管）
+├── tests/               # 离线回归测试
+├── docs/                # 用户文档（中英双语）
+├── examples/            # 客户端配置示例
+├── scripts/             # 版本与依赖锁定工具
+├── Dockerfile           # 多阶段镜像：前端构建 + Python 运行时
+├── docker-compose.yml   # 推荐部署方式
+├── .env.example         # 全部运行时环境变量及注释
+└── .github/workflows/   # CI：测试、镜像发布、CodeQL
+```
+
 ## 文档
 
 | 指南 | 内容 |
 |------|------|
 | [WebUI 使用指南](docs/webui.zh-CN.md) | 添加账号、模型路由、日志审计、设置与备份 |
-| [部署指南](docs/deployment.zh-CN.md) | 发布镜像、本地运行、命令行登录与升级 |
+| [部署指南](docs/deployment.zh-CN.md) | 发布镜像、升级、反向代理/HTTPS、本地运行与命令行登录 |
 | [客户端配置](docs/clients.zh-CN.md) | Codex CLI、Claude Code、CC Switch 与通用客户端 |
 | [进阶参考](docs/advanced.zh-CN.md) | 参数、API、模型调度、请求限制与故障排查 |
+
+## 常见问题
+
+- **绑定域名后经 HTTPS 反代无法登录 WebUI？** 将对外来源加入 `admin_allowed_origins` 信任列表——见[管理 Origin 校验](docs/advanced.zh-CN.md#管理-origin--csrf-开关)。
+- **服务器没有 Docker？** 可用 Python 直接完成终端登录并运行网关——见[本地 Python 运行](docs/deployment.zh-CN.md#本地-python-运行)。
+- **数据在哪里？** 全部位于 `auth/`（Docker 中为 `/data/auth`）：凭证、设置与日志数据库——见[数据与备份](docs/webui.zh-CN.md#数据与备份)。
+- **镜像标签怎么选？** `latest` 跟随稳定版，`edge` 跟随 main，版本标签固定某一发行版——见[使用已发布镜像](docs/deployment.zh-CN.md#使用已发布镜像)。
 
 ## 免责声明
 

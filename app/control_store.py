@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 import sqlite3
 import threading
+import time
+import uuid
 
 from .settings import validate_settings
 from .audit_store import _secure_path, safe_label
@@ -21,13 +23,24 @@ def _identifier(value, label):
     return value
 
 
-def validate_model(source, rule, models=None, known_models=()):
-    _identifier(source, "上游模型 ID")
-    if not isinstance(rule, dict) or set(rule) - {"public_id", "enabled", "keep_original", "region", "profile", "credential_ids"}:
+def buddy_claim_reserved(record):
+    """Only pre-claim reservations may expire; a pending send can outlive its process."""
+    return bool(record and (record["claimed"] or record["stage"] not in {"reserved", "agree", "buddy_agree"}))
+
+
+def validate_model(source, rule, models=None, known_models=(), *, legacy_scopes=False):
+    _identifier(source, "模型规则 ID")
+    if not isinstance(rule, dict) or set(rule) - {"public_id", "upstream_id", "custom", "enabled", "keep_original", "region", "profile", "credential_ids"}:
         raise ValueError("模型规则字段无效")
-    clean = {"public_id": source, "enabled": True, "keep_original": False,
+    clean = {"public_id": source, "upstream_id": source, "custom": False,
+             "enabled": True, "keep_original": False,
              "region": None, "profile": None, "credential_ids": [], **rule}
+    _identifier(clean["upstream_id"], "上游模型 ID")
+    if type(clean["custom"]) is not bool or (clean["custom"] and clean["keep_original"]):
+        raise ValueError("自建模型不能公开内部规则标识")
     _identifier(clean["public_id"], "公开模型 ID")
+    if clean["custom"] and clean["public_id"] == source:
+        raise ValueError("自建模型必须使用独立的对外 ID")
     if type(clean["enabled"]) is not bool or type(clean["keep_original"]) is not bool:
         raise ValueError("enabled/keep_original 必须为布尔值")
     if clean["region"] not in (None, "cn", "intl") or clean["profile"] not in (None, "cn-cli", "cn-work", "intl-cli", "intl-work"):
@@ -41,6 +54,8 @@ def validate_model(source, rule, models=None, known_models=()):
         _identifier(identity, "账号指纹")
     if len(set(ids)) != len(ids):
         raise ValueError("账号指纹重复")
+    if ids and (clean["region"] or clean["profile"]) and not legacy_scopes:
+        raise ValueError("指定账号与区域/产品范围只能选择一种")
     all_rules = {**(models or {}), source: clean}
     real_ids = set(known_models) | set(all_rules) | {"auto"}
     aliases = {}
@@ -76,6 +91,21 @@ class ControlStore:
             elif version != self.SCHEMA_VERSION:
                 raise ValueError("管理数据库 schema 不受支持或已有库为空，未执行初始化")
             self._snapshot = self._load()
+            self._db.execute("CREATE TABLE IF NOT EXISTS buddy_bootstrap ("
+                             "account_key TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, attempted_at REAL NOT NULL, "
+                             "retry_at REAL NOT NULL, stage TEXT NOT NULL, outcome TEXT NOT NULL, "
+                             "consent_source TEXT NOT NULL, agreement_revision TEXT NOT NULL, "
+                             "agreed INTEGER NOT NULL DEFAULT 0, claimed INTEGER NOT NULL DEFAULT 0)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS travel_writes ("
+                             "account_key TEXT PRIMARY KEY, attempt_id TEXT NOT NULL, operation TEXT NOT NULL, "
+                             "phase TEXT NOT NULL, location_id INTEGER, reserved_at REAL NOT NULL, confirmed INTEGER NOT NULL DEFAULT 0)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS buddy_consents ("
+                             "account_key TEXT PRIMARY KEY, agreement_revision TEXT NOT NULL, accepted_at REAL NOT NULL)")
+            self._db.execute("CREATE TABLE IF NOT EXISTS buddy_tasks ("
+                             "account_key TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, request_id TEXT NOT NULL, "
+                             "accept_started INTEGER NOT NULL DEFAULT 0, chat_started INTEGER NOT NULL DEFAULT 0, "
+                             "completed INTEGER NOT NULL DEFAULT 0, model TEXT, chat_state TEXT NOT NULL DEFAULT 'pending', "
+                             "total_tokens INTEGER, updated_at REAL NOT NULL)")
             self._db.execute("COMMIT")
         except Exception:
             if self._db.in_transaction:
@@ -90,14 +120,16 @@ class ControlStore:
         data = json.loads(row[1])
         if not isinstance(data, dict) or set(data) != {"settings", "models", "credentials"}:
             raise ValueError("管理数据库状态无效")
-        validate_settings(data["settings"])
+        data["settings"] = validate_settings(data["settings"], legacy=True)
         if not isinstance(data["models"], dict) or not isinstance(data["credentials"], dict):
             raise ValueError("管理数据库策略无效")
         for source, rule in data["models"].items():
-            validate_model(source, rule, data["models"])
+            validate_model(source, rule, data["models"], legacy_scopes=True)  # Preserve legacy scope intersections.
         for identity, metadata in data["credentials"].items():
             _identifier(identity, "账号指纹")
-            if not isinstance(metadata, dict) or set(metadata) - {"enabled", "label"} or type(metadata.get("enabled")) is not bool:
+            if (not isinstance(metadata, dict) or set(metadata) - {"enabled", "label", "auto_checkin", "auto_travel"}
+                    or type(metadata.get("enabled")) is not bool
+                    or any(key in metadata and type(metadata[key]) is not bool for key in ("auto_checkin", "auto_travel"))):
                 raise ValueError("管理数据库凭证元数据无效")
         return {"revision": row[0], **data}
 
@@ -138,11 +170,210 @@ class ControlStore:
             state["models"][source] = validate_model(source, rule, state["models"], known_models)
         return self._update(revision, change)
 
+    def delete_model(self, source, revision):
+        if type(revision) is not int:
+            raise ValueError("revision 必须为整数")
+        def change(state):
+            if not state["models"].get(source, {}).get("custom"):
+                raise ValueError("只能删除自建模型，目录模型请停用")
+            del state["models"][source]
+        return self._update(revision, change)
+
+
     def set_credential(self, account_key, enabled):
         _identifier(account_key, "账号指纹")
         if type(enabled) is not bool:
             raise ValueError("enabled 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(account_key, {}).update(enabled=enabled))
+
+
+    def set_auto_travel(self, account_key, enabled):
+        _identifier(account_key, "账号指纹")
+        if type(enabled) is not bool:
+            raise ValueError("auto_travel 必须为布尔值")
+        return self._update(None, lambda state: state["credentials"].setdefault(
+            account_key, {"enabled": True}).update(auto_travel=enabled))
+
+    def has_buddy_consent(self, identity, revision):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            return self._db.execute("SELECT 1 FROM buddy_consents WHERE account_key=? AND agreement_revision=?",
+                                    (identity, revision)).fetchone() is not None
+
+    def save_buddy_consent(self, identity, revision):
+        _identifier(identity, "账号指纹")
+        _identifier(revision, "协议版本")
+        with self._lock:
+            self._db.execute("INSERT INTO buddy_consents VALUES(?,?,?) ON CONFLICT(account_key) DO UPDATE SET "
+                             "agreement_revision=excluded.agreement_revision, accepted_at=excluded.accepted_at",
+                             (identity, revision, time.time()))
+
+
+    def buddy_record(self, identity):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM buddy_bootstrap WHERE account_key=?", (identity,))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_buddy(self, identity, source, revision, *, retry_seconds, now=None):
+        """Reserve first-claim writes across processes without changing configuration revisions."""
+        _identifier(identity, "账号指纹")
+        _identifier(revision, "协议版本")
+        if source not in {"manual", "environment"}:
+            raise ValueError("确认来源无效")
+        now = time.time() if now is None else now
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self.buddy_record(identity)
+                if previous and (buddy_claim_reserved(previous) or previous["retry_at"] > now):
+                    self._db.execute("COMMIT")
+                    return None
+                attempt = uuid.uuid4().hex
+                self._db.execute(
+                    "INSERT INTO buddy_bootstrap VALUES(?,?,?,?,?,?,?,?,0,0) "
+                    "ON CONFLICT(account_key) DO UPDATE SET attempt_id=excluded.attempt_id, "
+                    "attempted_at=excluded.attempted_at, retry_at=excluded.retry_at, stage=excluded.stage, "
+                    "outcome=excluded.outcome, consent_source=excluded.consent_source, "
+                    "agreement_revision=excluded.agreement_revision, agreed=0, claimed=0",
+                    (identity, attempt, now, now + retry_seconds, "reserved", "pending", source, revision))
+                self._db.execute("COMMIT")
+                return attempt
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def buddy_checkpoint(self, identity, attempt, stage, outcome, *, agreed=False, claimed=False):
+        _identifier(stage, "首领阶段")
+        if outcome not in {"pending", "uncertain", "success"}:
+            raise ValueError("首领结果无效")
+        with self._lock:
+            updated = self._db.execute(
+                "UPDATE buddy_bootstrap SET stage=?, outcome=?, agreed=MAX(agreed,?), claimed=MAX(claimed,?) "
+                "WHERE account_key=? AND attempt_id=?",
+                (stage, outcome, int(agreed), int(claimed), identity, attempt))
+            if updated.rowcount != 1:
+                raise ValueError("首领预留已变化")
+
+    def travel_write_record(self, identity):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM travel_writes WHERE account_key=?", (identity,))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_travel_write(self, identity, operation, location_id=None, *, expected_attempt=None):
+        """Reserve one unresolved travel write per account without expiry-based replay."""
+        _identifier(identity, "账号指纹")
+        if operation not in {"claim", "depart"}:
+            raise ValueError("旅行操作无效")
+        if operation == "depart" and (type(location_id) is not int or not 0 < location_id <= 2**31 - 1):
+            raise ValueError("派遣地点无效")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                previous = self.travel_write_record(identity)
+                current_attempt = previous["attempt_id"] if previous else None
+                if current_attempt != expected_attempt or previous and previous["phase"] not in {"cancelled", "reconciled"}:
+                    self._db.execute("COMMIT")
+                    return None
+                attempt = uuid.uuid4().hex
+                self._db.execute(
+                    "INSERT INTO travel_writes VALUES(?,?,?,'reserved',?,?,0) "
+                    "ON CONFLICT(account_key) DO UPDATE SET attempt_id=excluded.attempt_id,operation=excluded.operation, "
+                    "phase='reserved',location_id=excluded.location_id,reserved_at=excluded.reserved_at,confirmed=0",
+                    (identity, attempt, operation, location_id, time.time()))
+                self._db.execute("COMMIT")
+                return attempt
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def transition_travel_write(self, identity, attempt, phase):
+        """Late receipts cannot reopen or replace an already reconciled reservation."""
+        _identifier(identity, "账号指纹")
+        expected = {"sent": ("reserved",), "confirmed": ("sent", "confirmed", "reconciled"),
+                    "cancelled": ("reserved", "sent", "cancelled"),
+                    "reconciled": ("reserved", "sent", "confirmed", "reconciled")}.get(phase)
+        if expected is None:
+            raise ValueError("旅行写入阶段无效")
+        with self._lock:
+            updated = self._db.execute(
+                "UPDATE travel_writes SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                "confirmed=MAX(confirmed,?) WHERE account_key=? AND attempt_id=? AND phase IN ("
+                + ",".join("?" for _ in expected) + ")",
+                (phase, phase, int(phase in {"confirmed", "reconciled"}), identity, attempt, *expected))
+            if updated.rowcount != 1:
+                raise ValueError("旅行写入预留已变化")
+
+
+    def buddy_task_record(self, identity):
+        _identifier(identity, "账号指纹")
+        with self._lock:
+            cursor = self._db.execute("SELECT * FROM buddy_tasks WHERE account_key=?", (identity,))
+            row = cursor.fetchone()
+            return dict(zip((column[0] for column in cursor.description), row)) if row else None
+
+    def reserve_buddy_task(self, identity, operation, *, model=None):
+        """Reserve one conversation with a fresh owner token for each unsent attempt."""
+        _identifier(identity, "账号指纹")
+        if operation not in {"accept", "chat"}:
+            raise ValueError("新手任务操作无效")
+        if operation == "chat":
+            _identifier(model, "模型")
+        with self._lock:
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._db.execute("INSERT OR IGNORE INTO buddy_tasks "
+                                 "(account_key,conversation_id,request_id,updated_at) VALUES(?,?,?,?)",
+                                 (identity, str(uuid.uuid4()), uuid.uuid4().hex, time.time()))
+                previous = self.buddy_task_record(identity)
+                if previous[operation + "_started"] or previous["completed"] or (operation == "accept" and previous["chat_started"]):
+                    self._db.execute("COMMIT")
+                    return None
+                if operation == "accept":
+                    self._db.execute("UPDATE buddy_tasks SET accept_started=1,updated_at=? WHERE account_key=?",
+                                     (time.time(), identity))
+                else:
+                    self._db.execute("UPDATE buddy_tasks SET chat_started=1,request_id=?,model=?,"
+                                     "chat_state='pending',total_tokens=NULL,updated_at=? WHERE account_key=?",
+                                     (uuid.uuid4().hex, model, time.time(), identity))
+                record = self.buddy_task_record(identity)
+                self._db.execute("COMMIT")
+                return record
+            except Exception:
+                if self._db.in_transaction:
+                    self._db.execute("ROLLBACK")
+                raise
+
+    def release_buddy_task(self, identity, request_id):
+        """Release only the caller's known-unsent reservation, never a recorded outcome."""
+        _identifier(identity, "账号指纹")
+        _identifier(request_id, "请求 ID")
+        with self._lock:
+            updated = self._db.execute(
+                "UPDATE buddy_tasks SET chat_started=0,model=NULL,updated_at=? "
+                "WHERE account_key=? AND request_id=? AND chat_started=1 AND completed=0 "
+                "AND chat_state='pending' AND total_tokens IS NULL",
+                (time.time(), identity, request_id))
+            return updated.rowcount == 1
+
+
+    def buddy_task_checkpoint(self, identity, *, completed=False, chat_state=None, total_tokens=None):
+        _identifier(identity, "账号指纹")
+        if chat_state not in {None, "success", "uncertain"}:
+            raise ValueError("新手对话结果无效")
+        if total_tokens is not None and (type(total_tokens) is not int or not 0 <= total_tokens <= 10**9):
+            raise ValueError("新手对话用量无效")
+        with self._lock:
+            self._db.execute("UPDATE buddy_tasks SET completed=MAX(completed,?), "
+                             "chat_state=COALESCE(?,chat_state),total_tokens=COALESCE(?,total_tokens),updated_at=? "
+                             "WHERE account_key=?",
+                             (int(completed), chat_state, total_tokens, time.time(), identity))
+
 
     def close(self):
         with self._lock:

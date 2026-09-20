@@ -1,11 +1,8 @@
-"""账号/租户目录、路径复用和启动屏障回归；仅临时合成凭据与 mock，无联网。
-
-运行：.venv/bin/python -B -m unittest -v tests/test_identity_sync.py
-"""
+"""Test account catalogs, path reuse and startup synchronization with synthetic offline credentials."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import io
 import json
@@ -22,6 +19,11 @@ from app import credits
 
 DOMAINS = {"cn-cli": "www.codebuddy.cn", "cn-work": "www.workbuddy.cn",
            "intl-cli": "www.codebuddy.ai", "intl-work": "www.workbuddy.ai"}
+
+
+def scopes(items):
+    """Use matching selector/root fixtures to isolate account routing behavior."""
+    return {"picker": items, "account": items}
 
 
 def model(name, credits=None):
@@ -56,13 +58,15 @@ class IdentitySyncTests(unittest.TestCase):
         self.enterContext(patch("socket.socket.connect", side_effect=AssertionError("network forbidden")))
         self.enterContext(patch.object(c, "_log"))
         self.credit_fetch = self.enterContext(patch.object(credits, "fetch_credits", side_effect=balance))
-        self.catalog_fetch = self.enterContext(patch.object(credits, "fetch_model_catalog",
-            side_effect=lambda token, **kw: [model("a-only"), model("shared")]
-            if kw["uid"] == "A" else [model("shared")]))
+        self.catalog_fetch = self.enterContext(
+            patch.object(credits, "fetch_model_scopes",
+                         side_effect=lambda token, **kw: scopes(
+                             [model("a-only"), model("shared")] if kw["uid"] == "A"
+                             else [model("shared")])))
         self.addCleanup(c.invalidate_model_table)
 
     def write_credential(self, name="slot.info", **kwargs):
-        # 与真实导入一致使用原子替换，避免同大小原地写入命中文件系统时间戳粒度。
+        # Atomic replacement avoids timestamp-resolution ambiguity from equal-size in-place writes.
         return c.atomic_write_credential(self.root, name, json.dumps(credential(**kwargs)).encode("utf-8"))
 
     def configure(self, *paths):
@@ -205,8 +209,8 @@ class IdentitySyncTests(unittest.TestCase):
         tables = {profile: [model("shared"), model(profile + "-only")] for profile in DOMAINS}
         tables["cn-work"].append(model("auto"))
         tables["intl-cli"].append(model("default-model"))
-        self.catalog_fetch.side_effect = lambda token, **kw: tables[
-            next(profile for profile, domain in DOMAINS.items() if domain == kw["domain"])]
+        self.catalog_fetch.side_effect = lambda token, **kw: scopes(tables[
+            next(profile for profile, domain in DOMAINS.items() if domain == kw["domain"])])
         self.sync()
         self.assertEqual(len(c.CONFIG["account_catalogs"]), 4)
         for region in ("cn", "intl"):
@@ -247,8 +251,8 @@ class IdentitySyncTests(unittest.TestCase):
         self.assertEqual([item["id"] for item in self.cache.models(self.key())], ["a-only", "shared"])
         self.assertEqual(self.picked_uid("a-only"), "A")
 
-    def test_zero_balance_account_keeps_all_declared_models(self):
-        self.catalog_fetch.side_effect = lambda token, **kw: (
+    def test_zero_balance_account_keeps_paid_and_free_models(self):
+        self.catalog_fetch.side_effect = lambda token, **kw: scopes(
             [model("free-only", credits="x0.00"), model("paid-only", credits="x0.03")]
             if kw["uid"] == "A" else [model("paid-only", credits="x0.03")])
         self.configure(self.write_credential("a.info"), self.write_credential("b.info", uid="B"))
@@ -260,6 +264,10 @@ class IdentitySyncTests(unittest.TestCase):
         self.assertTrue(self.pool._eligible(entries["A"], "free-only"))
         self.assertEqual({self.picked_uid("paid-only") for _ in range(6)}, {"A", "B"})
         self.assertEqual(self.picked_uid("free-only"), "A")
+        # Restoring the balance leaves routing unchanged.
+        self.ledger.update_credits(entries["A"]["id"], {
+            "credits": 100, "intl": False, "segments": [], "soonest_expiry": None})
+        self.assertEqual({self.picked_uid("paid-only") for _ in range(6)}, {"A", "B"})
 
     def test_old_v1_root_and_unbound_profile_caches_never_publish(self):
         self.configure(self.write_credential())
@@ -359,7 +367,7 @@ class IdentitySyncTests(unittest.TestCase):
         def replace_during_catalog(*args, **kwargs):
             self.write_credential(uid="B")
             self.pool.reload([path])
-            return [model("a-only")]
+            return scopes([model("a-only")])
         self.catalog_fetch.side_effect = replace_during_catalog
         self.sync()
         self.assertIsNone(self.cache.age(old_key))

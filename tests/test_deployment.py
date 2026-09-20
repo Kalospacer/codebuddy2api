@@ -1,8 +1,8 @@
-"""部署模板、Docker 运行文件与 Python 3.12 语法的离线回归。"""
+"""Test deployment templates, Docker runtime files and Python 3.12 syntax offline."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import ast
 import pathlib
@@ -16,10 +16,11 @@ import unittest
 from textwrap import dedent
 
 
-ROOT = Path(__file__).resolve().parents[1]  # 仓库根
+ROOT = Path(__file__).resolve().parents[1]
 RUNTIME_DEFAULTS = {
     "max_images": 16, "image_policy": "truncate",
     "max_request_bytes": 33554432, "log_body_limit": 65536,
+    "admin_csrf": True, "keep_tool_metadata": False,
 }
 API_ENDPOINTS = {
     "chat/completions": "POST", "responses": "POST", "messages": "POST",
@@ -50,12 +51,12 @@ def docker_sources():
 
 
 def _local_dependency(source: str, module: str) -> str | None:
-    """把一条 import 映射到仓库内的运行时文件；外部依赖返回 None。"""
-    if module.startswith("."):  # 包内相对导入：相对当前文件所在目录解析
+    """Resolve repository runtime imports, returning None for external dependencies."""
+    if module.startswith("."):  # Resolve package-relative imports from the source directory.
         base = pathlib.PurePosixPath(source).parent
         candidate = (base / module.lstrip(".").replace(".", "/")).with_suffix(".py")
         return str(candidate) if (ROOT / str(candidate)).is_file() else None
-    if not module.startswith("app."):  # 仅校验仓库内运行时模块
+    if not module.startswith("app."):  # Validate only repository runtime modules.
         return None
     candidate = pathlib.PurePosixPath(module.replace(".", "/")).with_suffix(".py")
     if (ROOT / str(candidate)).is_file():
@@ -77,8 +78,19 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(values["CODEBUDDY2API_KEY"], "")
         self.assertEqual(values["CODEBUDDY2API_BIND"], "127.0.0.1")
         self.assertEqual(values["CODEBUDDY2API_IMAGE"], "codebuddy2api:local")
-        self.assertEqual(values["CODEBUDDY2API_AUTO_TRIAL"], "false")
+        self.assertNotIn("CODEBUDDY2API_AUTO_TRIAL", values)
+        self.assertNotIn("CODEBUDDY2API_AUTO_TRIAL", (ROOT / "docker-compose.yml").read_text())
+        self.assertEqual(values["CODEBUDDY2API_ADMIN_CSRF"], str(RUNTIME_DEFAULTS["admin_csrf"]).lower())
+        self.assertNotIn("CODEBUDDY2API_ADMIN_ORIGINS", values)
+        self.assertNotIn("CODEBUDDY2API_KEEP_TOOL_METADATA", values)
 
+    def test_tool_metadata_compose_environment_is_optional(self):
+        key = "CODEBUDDY2API_KEEP_TOOL_METADATA"
+        self.assertRegex((ROOT / "docker-compose.yml").read_text(), rf"(?m)^ +{key}: *$")
+        self.assertRegex((ROOT / ".env.example").read_text(), rf"(?m)^# {key}=(true|false)$")
+        origins = "CODEBUDDY2API_ADMIN_ORIGINS"
+        self.assertRegex((ROOT / "docker-compose.yml").read_text(), rf"(?m)^ +{origins}: *$")
+        self.assertRegex((ROOT / ".env.example").read_text(), rf"(?m)^# {origins}=https://")
     def test_docker_copies_and_allows_all_local_runtime_imports(self):
         files = docker_sources()
         self.assertTrue({"app/client_profiles.py", "app/site_routing.py", "app/trial_rewards.py"} <= files)
@@ -113,7 +125,7 @@ class DeploymentTests(unittest.TestCase):
                 target = Path(directory) / filename
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copyfile(ROOT / filename, target)
-            # 不在仓库内导入运行时；临时 HOME、净环境及审计钩子阻断联网和凭据访问。
+            # Isolate imports and block network or credential access with a temporary HOME and audit hooks.
             command = dedent("""\
                 import os
                 import sys
@@ -159,12 +171,15 @@ class DeploymentTests(unittest.TestCase):
         self.assertNotIn("env_file:", text)
         self.assertNotIn("required:", text)
         for name, fallback in (("MAX_IMAGES", "16"), ("IMAGE_POLICY", "truncate"),
-                               ("MAX_REQUEST_BYTES", "33554432"), ("LOG_BODY_LIMIT", "65536")):
+                               ("MAX_REQUEST_BYTES", "33554432"), ("LOG_BODY_LIMIT", "65536"), ("ADMIN_CSRF", "true")):
             self.assertIn("${CODEBUDDY2API_" + name + ":-" + fallback + "}", text)
         for filename in ("README.md", "README.zh-CN.md"):
             doc = (ROOT / filename).read_text()
             self.assertIn("cp .env.example .env", doc)
-            self.assertIn("docker compose build", doc)
+            self.assertIn("docker compose pull", doc)
+            self.assertIn("docker compose up -d --no-build", doc)
+            self.assertIn("ghcr.io/maiphucgiang/codebuddy2api:latest", doc)
+            self.assertNotIn("docker compose build", doc)
             self.assertNotRegex(doc, r"\bdocker-compose\s")
 
     def test_readmes_link_guides_and_webui_setup(self):

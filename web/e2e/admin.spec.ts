@@ -68,6 +68,7 @@ const settings = {
     shm_bytes: 32768,
     degraded: false,
   },
+  session: { degraded: false, last_error: null, path: "/tmp/admin-sessions.json" },
 };
 async function mockAPI(page: Page, authenticated = true) {
   const calls: { method: string; path: string; body: unknown }[] = [];
@@ -138,12 +139,20 @@ async function mockAPI(page: Page, authenticated = true) {
     if (path === "/admin/credentials/mock-account")
       return send({ id: credential.id, enabled: false, revision: 2 });
     if (path === "/admin/credentials/mock-account.info") return send({ ok: true });
-    if (path === "/admin/oauth/start")
+    if (path === "/admin/oauth/start") {
+      const hosts: Record<string, string> = {
+        cn: "www.codebuddy.cn",
+        intl: "www.workbuddy.ai",
+        "intl-codebuddy": "www.codebuddy.ai",
+      };
+      const host = hosts[url.searchParams.get("site") ?? "cn"];
+      if (!host) return send({ error: { message: "未知登录站点" } }, 400);
       return send({
         login_id: "mock-login",
-        verification_uri: "https://www.codebuddy.cn/login?state=mock",
+        verification_uri: `https://${host}/login?state=mock`,
         expires_in: 120,
       });
+    }
     if (path === "/admin/oauth/poll") {
       polls++;
       return send({ done: true, imported: "mock-account.info" });
@@ -231,6 +240,20 @@ test("credential OAuth terminates, upload/export and safe-name deletion are wire
   const downloadPromise = page.waitForEvent("download");
   await page.getByRole("button", { name: "我理解明文风险，下载已选凭证" }).click();
   expect((await downloadPromise).suggestedFilename()).toBe("mock-account.info");
+  const unicodeFilename = "测试 账号.info";
+  await page.route("**/admin/credentials/export", (route) =>
+    route.fulfill({
+      body: '{"test_fixture":true}',
+      contentType: "application/octet-stream",
+      headers: {
+        "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(unicodeFilename)}`,
+      },
+    }),
+  );
+  await page.getByRole("button", { name: "导出已选 (1)" }).click();
+  const unicodeDownload = page.waitForEvent("download");
+  await page.getByRole("button", { name: "我理解明文风险，下载已选凭证" }).click();
+  expect((await unicodeDownload).suggestedFilename()).toBe(unicodeFilename);
   await page.getByRole("button", { name: "删除", exact: true }).click();
   await page.getByRole("button", { name: "确认删除凭证" }).click();
   await expect
@@ -240,6 +263,31 @@ test("credential OAuth terminates, upload/export and safe-name deletion are wire
       ),
     )
     .toBe(true);
+});
+test("international OAuth choices send distinct sites and show the selected official host", async ({
+  page,
+}) => {
+  const mock = await mockAPI(page);
+  await page.goto("/dashboard/credentials");
+  await page.getByRole("button", { name: "添加凭证" }).click();
+  const select = page.getByLabel("登录站点");
+  await expect(select).toHaveValue("cn");
+  for (const [site, label, host] of [
+    ["intl", "国际 · WorkBuddy", "www.workbuddy.ai"],
+    ["intl-codebuddy", "国际 · CodeBuddy", "www.codebuddy.ai"],
+  ]) {
+    await select.selectOption({ label });
+    await expect(select).toHaveValue(site);
+    await page.getByRole("button", { name: "发起 OAuth 授权" }).click();
+    await expect(page.getByRole("link", { name: /打开官方授权页面/ })).toHaveAttribute(
+      "href",
+      `https://${host}/login?state=mock`,
+    );
+    await expect(select).toBeDisabled();
+    expect(mock.calls.some((call) => call.path === `/admin/oauth/start?site=${site}`)).toBe(true);
+    await page.getByRole("button", { name: "停止轮询" }).click();
+    await expect(select).toBeEnabled();
+  }
 });
 test("log tabs, cursor, details and guarded destructive clear", async ({ page }) => {
   const mock = await mockAPI(page);

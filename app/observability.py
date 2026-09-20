@@ -1,8 +1,5 @@
-"""Metadata-only observation for the three public inference POST endpoints.
-
-Request bodies and headers are never inspected. Response parsing retains two
-16 KiB buffers at most, discards oversized SSE lines/JSON, and never changes the ASGI wire. Route
-hooks should provide model/account identifiers (never a credential file/token).
+"""Observe inference metadata with bounded response parsing; never inspect request bodies or headers.
+Preserve the ASGI wire and exclude credential files or tokens from route metadata.
 """
 from __future__ import annotations
 
@@ -11,10 +8,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 import json
 import time
-import uuid
 from typing import Any
 
 from app.audit_store import AuditStore, METRICS, number, safe_attempt, safe_label
+from app.request_context import current_context, ensure_context
 
 _PATHS = {"/v1/chat/completions": "chat", "/v1/responses": "responses", "/v1/messages": "messages"}
 _PARSE_LIMIT = 16384
@@ -26,12 +23,7 @@ def _mapping(value):
 
 
 def normalize_usage(usage):
-    """Keep provider counters independent; cache/reasoning are not extra total.
-
-No total is fabricated: Anthropic input/cache semantics differ from OpenAI.
-A known zero is retained. `usage_source` identifies observation provenance, not
-an inferred billing rate; credit is never derived from token counts.
-"""
+    """Preserve provider usage counters and known zeroes without inventing totals or billing credits."""
     usage = _mapping(usage)
     result = {}
     aliases = {"input_tokens": ("input_tokens", "prompt_tokens"),
@@ -65,6 +57,7 @@ class _Observation:
     monotonic_start: float
     attempts: list = field(default_factory=list)
     failed: bool = False
+    failure_seq: int = 0
     terminal: bool = False
     body_finished: bool = False
     status: int | None = None
@@ -76,6 +69,7 @@ class _Observation:
 
     def fail(self, code):
         self.failed = True
+        self.failure_seq += 1
         self.record["error_code"] = safe_label(code, 80) or "upstream_error"
 
     def usage(self, value, source, priority):
@@ -154,14 +148,45 @@ def observe_usage(usage):
 
 def observe_attempt(stage, **safe_metadata):
     observation = _current.get()
-    if observation is not None and len(observation.attempts) < 32:
-        observation.attempts.append(safe_attempt({**safe_metadata, "stage": stage}))
+    if observation is not None:
+        context = current_context()
+        metadata = context.attempt_metadata() if context is not None else {}
+        entry = safe_attempt({**metadata, **safe_metadata, "stage": stage})
+        if len(observation.attempts) < 32:
+            observation.attempts.append(entry)
+        else:
+            # Reserve the last slot for a bounded overflow marker, not an unbounded trace.
+            previous = observation.attempts[-1]
+            dropped = previous.get("dropped", 0) + 1 if previous.get("stage") == "attempts_truncated" else 2
+            observation.attempts[-1] = safe_attempt({"stage": "attempts_truncated", "dropped": dropped})
 
 
 def observe_failure(code):
+    """Record a failure and return its sequence number for scoped recovery."""
     observation = _current.get()
-    if observation is not None:
-        observation.fail(code)
+    if observation is None:
+        return None
+    observation.fail(code)
+    return observation.failure_seq
+
+
+def observe_failure_seq():
+    """Return the current failure sequence, or zero when no failure exists."""
+    observation = _current.get()
+    return observation.failure_seq if observation is not None else None
+
+
+def observe_recovery(through=None):
+    """Mark a matching failure recovered while retaining attempts and any newer failure."""
+    observation = _current.get()
+    if observation is None or not observation.failed:
+        return
+    if through is not None and observation.failure_seq != through:
+        return
+    code = observation.record.get("error_code") or "upstream_error"
+    observation.failed = False
+    observation.record["error_code"] = None
+    observe_attempt("failover_recovered", code=code)
 
 
 class _Parser:
@@ -248,6 +273,7 @@ class _Parser:
 class AuditMiddleware:
     def __init__(self, app, config):
         self.app = app
+        self.config = config
         if isinstance(config, AuditStore) or callable(getattr(config, "record_request", None)):
             self.store = config
         elif isinstance(config, dict):
@@ -284,7 +310,7 @@ class AuditMiddleware:
             await self.app(scope, receive, send)
             return
         started, monotonic_start = time.time(), time.monotonic()
-        observation = _Observation({"id": uuid.uuid4().hex, "epoch": -1,
+        observation = _Observation({"id": ensure_context(scope, self.config).request_id, "epoch": -1,
                                     "detail_generation": -1, "started_at": started,
                                     "protocol": _PATHS[scope["path"]],
                                     **{key: None for key in METRICS}}, monotonic_start)
@@ -294,7 +320,8 @@ class AuditMiddleware:
 
         async def observed_receive():
             message = await receive()
-            if message.get("type") == "http.disconnect":
+            # Ignore disconnect events synthesized after the response body is complete.
+            if message.get("type") == "http.disconnect" and not observation.body_finished:
                 nonlocal cancelled
                 cancelled = True
             return message
@@ -348,9 +375,7 @@ class AuditMiddleware:
                     observation.fail("incomplete_response")
                 if observation.streaming and not observation.terminal and not cancelled and not observation.failed:
                     observation.fail("incomplete_stream")
-                # A client that closes the connection right after consuming the full
-                # body still delivered everything: that is success, not cancellation.
-                outcome = "cancelled" if (cancelled and not observation.body_finished) else (
+                outcome = "cancelled" if cancelled else (
                     "error" if observation.failed or not observation.status or observation.status >= 400 else "success")
                 observation.record.update(status_code=observation.status, outcome=outcome,
                                           streaming=observation.streaming,

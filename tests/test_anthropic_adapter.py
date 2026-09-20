@@ -1,14 +1,10 @@
 #!/usr/bin/env python3
-"""
-test_anthropic_adapter.py — 验证 Anthropic API 适配层的转换逻辑。
-
-直接运行：python3 tests/test_anthropic_adapter.py
-"""
+"""Test Anthropic request and response adaptation."""
 
 import json
 import sys
 from pathlib import Path
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from app.adapters.anthropic_adapter import (
     anthropic_request_to_chat,
@@ -17,7 +13,7 @@ from app.adapters.anthropic_adapter import (
 
 
 def test_simple_text_request():
-    """测试：简单文本消息 + system 字符串。"""
+    """Convert plain text messages and string system instructions."""
     req = {
         "model": "deepseek-v4-pro",
         "max_tokens": 4096,
@@ -37,7 +33,7 @@ def test_simple_text_request():
 
 
 def test_system_array():
-    """测试：system 为 text block 数组。"""
+    """Convert system text-block arrays."""
     req = {
         "model": "auto",
         "max_tokens": 1024,
@@ -53,7 +49,7 @@ def test_system_array():
 
 
 def test_text_and_tool_use():
-    """测试：assistant 消息含 text + tool_use。"""
+    """Convert assistant text and tool_use blocks together."""
     req = {
         "model": "deepseek-v4-pro",
         "max_tokens": 4096,
@@ -89,7 +85,7 @@ def test_text_and_tool_use():
 
 
 def test_tool_only_no_text():
-    """测试：assistant 消息只有 tool_use，没有 text。"""
+    """Convert assistant tool calls without text."""
     req = {
         "model": "auto",
         "max_tokens": 4096,
@@ -120,7 +116,7 @@ def test_tool_only_no_text():
 
 
 def test_tool_result():
-    """测试：tool_result → tool 角色消息。"""
+    """Map tool_result blocks to Chat tool messages."""
     req = {
         "model": "auto",
         "max_tokens": 4096,
@@ -161,7 +157,7 @@ def test_tool_result():
 
 
 def test_tool_result_with_user_text():
-    """测试：同一 user 消息包含 text + tool_result。"""
+    """Preserve mixed user text and tool results."""
     req = {
         "model": "auto",
         "max_tokens": 4096,
@@ -182,15 +178,17 @@ def test_tool_result_with_user_text():
     chat = anthropic_request_to_chat(req)
     msgs = chat["messages"]
 
-    assert msgs[0]["role"] == "user"
-    assert msgs[0]["content"] == "Continue."
-    assert msgs[1]["role"] == "tool"
-    assert msgs[1]["tool_call_id"] == "toolu_xyz"
+    # Tool results must immediately follow assistant tool calls.
+    assert msgs[0]["role"] == "tool"
+    assert msgs[0]["tool_call_id"] == "toolu_xyz"
+    assert msgs[0]["content"] == "output here"
+    assert msgs[1]["role"] == "user"
+    assert msgs[1]["content"] == "Continue."
     print("✅ test_tool_result_with_user_text")
 
 
 def test_tools_conversion():
-    """测试：Anthropic tools 格式 → Chat 格式。"""
+    """Convert Anthropic tools to Chat function definitions."""
     req = {
         "model": "deepseek-v4-pro",
         "max_tokens": 4096,
@@ -217,7 +215,7 @@ def test_tools_conversion():
 
 
 def test_string_content():
-    """测试：content 为简单字符串（不是 blocks 数组）。"""
+    """Accept plain string content instead of block arrays."""
     req = {
         "model": "auto",
         "max_tokens": 1024,
@@ -233,7 +231,7 @@ def test_string_content():
 
 
 def test_stream_converter_text():
-    """测试：Chat SSE 文本流 → Anthropic SSE 事件流。"""
+    """Convert Chat text deltas to Anthropic SSE events."""
     conv = AnthropicStreamConverter(model="deepseek-v4-pro")
 
     chunks = [
@@ -248,7 +246,7 @@ def test_stream_converter_text():
     for line in chunks:
         result = conv.feed_line(line)
         if result:
-            # Anthropic SSE 格式：event: xxx\ndata: {...}\n\n
+            # Parse Anthropic named SSE events.
             for evt_block in result.strip().split("\n\n"):
                 if not evt_block:
                     continue
@@ -274,7 +272,6 @@ def test_stream_converter_text():
 
     types = [e["type"] for e in all_events]
 
-    # 必须包含的事件类型
     assert "message_start" in types
     assert "content_block_start" in types
     assert "content_block_delta" in types
@@ -282,16 +279,13 @@ def test_stream_converter_text():
     assert "message_delta" in types
     assert "message_stop" in types
 
-    # 验证 content_block_start 的 type=text
     cbs = [e for e in all_events if e["type"] == "content_block_start"][0]
     assert cbs["content_block"]["type"] == "text"
 
-    # 验证 text_delta
     deltas = [e for e in all_events if e["type"] == "content_block_delta"]
     assert len(deltas) >= 2
     assert deltas[0]["delta"]["type"] == "text_delta"
 
-    # 验证 stop_reason
     md = [e for e in all_events if e["type"] == "message_delta"][0]
     assert md["delta"]["stop_reason"] == "end_turn"
 
@@ -299,7 +293,7 @@ def test_stream_converter_text():
 
 
 def test_stream_converter_tool_use():
-    """测试：Chat SSE tool_calls → Anthropic tool_use 事件。"""
+    """Convert Chat tool-call deltas to Anthropic tool_use events."""
     conv = AnthropicStreamConverter(model="deepseek-v4-pro")
 
     chunks = [
@@ -339,17 +333,14 @@ def test_stream_converter_tool_use():
     assert "message_delta" in types
     assert "message_stop" in types
 
-    # 验证 tool_use content_block
     cbs = [e for e in all_events if e["type"] == "content_block_start"][0]
     assert cbs["content_block"]["type"] == "tool_use"
     assert cbs["content_block"]["name"] == "Bash"
 
-    # 验证 input_json_delta
     deltas = [e for e in all_events if e["type"] == "content_block_delta"]
     for d in deltas:
         assert d["delta"]["type"] == "input_json_delta"
 
-    # 验证 stop_reason
     md = [e for e in all_events if e["type"] == "message_delta"][0]
     assert md["delta"]["stop_reason"] == "tool_use"
 
@@ -357,7 +348,7 @@ def test_stream_converter_tool_use():
 
 
 def test_nonstream_response():
-    """测试：非流式响应对象生成。"""
+    """Build a complete non-streaming Message response."""
     conv = AnthropicStreamConverter(model="deepseek-v4-pro")
     conv.feed_line('data: {"id":"c1","choices":[{"index":0,"delta":{"content":"Hi"},"finish_reason":null}]}')
     conv.feed_line('data: {"id":"c1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}')
@@ -377,7 +368,7 @@ def test_nonstream_response():
 
 
 def test_nonstream_response_tool_use():
-    """测试：非流式响应含 tool_use。"""
+    """Include tool_use blocks in non-streaming responses."""
     conv = AnthropicStreamConverter(model="deepseek-v4-pro")
     conv.feed_line('data: {"id":"c2","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"Bash","arguments":"{\\"cmd\\": \\"ls\\"}"}}]}}]}')
     conv.feed_line('data: {"id":"c2","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}')
@@ -393,7 +384,7 @@ def test_nonstream_response_tool_use():
 
 
 def test_empty_messages():
-    """测试：无 messages 的请求。"""
+    """Handle requests without messages."""
     req = {
         "model": "auto",
         "max_tokens": 1024,
@@ -404,6 +395,57 @@ def test_empty_messages():
     assert len(chat["messages"]) == 1
     assert chat["messages"][0]["role"] == "system"
     print("✅ test_empty_messages")
+
+def test_disable_parallel_tool_use_is_mapped():
+    """Preserve disable_parallel_tool_use through upstream adaptation."""
+    base = {"model": "auto", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "t", "input_schema": {"type": "object"}}]}
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "auto",
+                                      "disable_parallel_tool_use": True}})
+    assert chat["tool_choice"] == "auto"
+    assert chat["parallel_tool_calls"] is False
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "auto",
+                                      "disable_parallel_tool_use": False}})
+    assert chat["parallel_tool_calls"] is True
+    chat = anthropic_request_to_chat({**base, "tool_choice": {"type": "auto"}})
+    assert "parallel_tool_calls" not in chat
+    print("✅ test_disable_parallel_tool_use_is_mapped")
+
+def test_stop_sequences_are_mapped():
+    """Map stop_sequences with explicit stop precedence and reject invalid types."""
+    base = {"model": "auto", "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}]}
+    chat = anthropic_request_to_chat({**base, "stop_sequences": ["\n\n", "END"]})
+    assert chat["stop"] == ["\n\n", "END"]
+    chat = anthropic_request_to_chat({**base, "stop": ["X"], "stop_sequences": ["Y"]})
+    assert chat["stop"] == ["X"]
+    try:
+        anthropic_request_to_chat({**base, "stop_sequences": "END"})
+        raise AssertionError("non-array stop_sequences must raise")
+    except ValueError:
+        pass
+    print("✅ test_stop_sequences_are_mapped")
+
+def test_tool_result_is_error_is_preserved():
+    """Distinguish failed tool results by a content prefix."""
+    def conv(is_error):
+        block = {"type": "tool_result", "tool_use_id": "toolu_1", "content": "exit 1"}
+        if is_error is not None:
+            block["is_error"] = is_error
+        req = {"model": "auto", "max_tokens": 64, "messages": [{"role": "user", "content": [block]}]}
+        return anthropic_request_to_chat(req)["messages"][0]["content"]
+    assert conv(True).startswith("[tool execution failed]\nexit 1")
+    assert conv(False) == "exit 1"
+    assert conv(None) == "exit 1"
+    # Preserve images and prepend tool failure as a separate text block.
+    req = {"model": "auto", "max_tokens": 64, "messages": [{"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": "toolu_2", "is_error": True, "content": [
+            {"type": "image", "source": {"type": "url", "url": "https://synthetic.invalid/x.png"}},
+            {"type": "text", "text": "boom"}]}]}]}
+    content = anthropic_request_to_chat(req)["messages"][0]["content"]
+    assert isinstance(content, list) and content[0] == {"type": "text", "text": "[tool execution failed]"}
+    print("✅ test_tool_result_is_error_is_preserved")
 
 
 if __name__ == "__main__":
@@ -420,4 +462,7 @@ if __name__ == "__main__":
     test_nonstream_response()
     test_nonstream_response_tool_use()
     test_empty_messages()
-    print(f"\n🎉 All {13} tests passed!")
+    test_disable_parallel_tool_use_is_mapped()
+    test_stop_sequences_are_mapped()
+    test_tool_result_is_error_is_preserved()
+    print(f"\n🎉 All {16} tests passed!")

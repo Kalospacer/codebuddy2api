@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   api,
   errorMessage,
@@ -13,6 +13,7 @@ import {
   Badge,
   ClearLogs,
   Drawer,
+  DrawerPresence,
   Empty,
   ErrorNotice,
   Fields,
@@ -43,6 +44,8 @@ export function Logs() {
   const [detail, setDetail] = useState<RecordValue | null>(null);
   const [detailError, setDetailError] = useState<string | null>(null);
   const [detailLoading, setDetailLoading] = useState(false);
+  const detailRequest = useRef<AbortController | null>(null);
+  useEffect(() => () => detailRequest.current?.abort(), []);
   const [clear, setClear] = useState(false);
   const params = new URLSearchParams({ kind, limit: "50" });
   Object.entries(filters).forEach(([key, value]) => {
@@ -50,20 +53,42 @@ export function Logs() {
   });
   if (cursors.length) params.set("cursor", cursors.at(-1)!);
   const resource = useResource(`/logs?${params.toString()}`, normalize);
+  const closeDetail = () => {
+    detailRequest.current?.abort();
+    detailRequest.current = null;
+    setDetail(null);
+    setDetailError(null);
+    setDetailLoading(false);
+  };
   const openDetail = (item: RecordValue) => {
+    detailRequest.current?.abort();
+    detailRequest.current = null;
     setDetail(item);
     setDetailError(null);
+    setDetailLoading(false);
     if (kind !== "request") return;
     if (typeof item.id !== "string") {
       setDetailError("请求记录缺少 ID，无法加载详情");
       return;
     }
+    const controller = new AbortController();
+    detailRequest.current = controller;
+    const active = () => detailRequest.current === controller && !controller.signal.aborted;
     setDetailLoading(true);
     void api
-      .get<unknown>(`/logs/${encodeURIComponent(item.id)}`)
-      .then((res) => setDetail(object(res.data)))
-      .catch((err: unknown) => setDetailError(errorMessage(err)))
-      .finally(() => setDetailLoading(false));
+      .get<unknown>(`/logs/${encodeURIComponent(item.id)}`, { signal: controller.signal })
+      .then((res) => {
+        if (active()) setDetail(object(res.data));
+      })
+      .catch((err: unknown) => {
+        if (active()) setDetailError(errorMessage(err));
+      })
+      .finally(() => {
+        if (active()) {
+          detailRequest.current = null;
+          setDetailLoading(false);
+        }
+      });
   };
   return (
     <>
@@ -91,6 +116,7 @@ export function Logs() {
             aria-selected={kind === value}
             className={kind === value ? s.selectedTab : ""}
             onClick={() => {
+              closeDetail();
               setKind(value);
               setCursors([]);
               setFilters(emptyFilters);
@@ -193,50 +219,58 @@ export function Logs() {
                   </tr>
                 </thead>
                 <tbody>
-                  {resource.data.items.map((item, i) => (
-                    <tr key={text(item.id) + i}>
-                      <td>
-                        {typeof item.started_at === "number"
-                          ? new Date(item.started_at * 1000).toLocaleString("zh-CN")
-                          : text(item.started_at)}
-                        <small className={s.mono}>{text(item.id)}</small>
-                      </td>
-                      <td>
-                        <strong>{text(kind === "request" ? item.model : item.action)}</strong>
-                        <small>{text(kind === "request" ? item.profile : item.kind)}</small>
-                      </td>
-                      <td>
-                        <Badge
-                          tone={
-                            item.outcome === "success"
-                              ? "good"
-                              : item.outcome === "error"
-                                ? "bad"
-                                : "neutral"
-                          }
-                        >
-                          {text(item.outcome ?? item.level ?? item.status)}
-                        </Badge>
-                        {item.status_code !== undefined && (
-                          <small>HTTP {text(item.status_code)}</small>
+                  {resource.data.items.map((item, i) => {
+                    const outcome =
+                      kind === "request" ? item.outcome : object(item.details ?? {}).outcome;
+                    return (
+                      <tr key={text(item.id) + i}>
+                        <td>
+                          {typeof item.started_at === "number"
+                            ? new Date(item.started_at * 1000).toLocaleString("zh-CN")
+                            : text(item.started_at)}
+                          <small className={s.mono}>{text(item.id)}</small>
+                        </td>
+                        <td>
+                          <strong>{text(kind === "request" ? item.model : item.action)}</strong>
+                          <small>{text(kind === "request" ? item.profile : item.kind)}</small>
+                        </td>
+                        <td>
+                          <Badge
+                            tone={
+                              outcome === "success"
+                                ? "good"
+                                : outcome === "error"
+                                  ? "bad"
+                                  : outcome === "warning"
+                                    ? "warn"
+                                    : "neutral"
+                            }
+                          >
+                            {outcome === "warning"
+                              ? "警告"
+                              : text(outcome ?? item.level ?? item.status)}
+                          </Badge>
+                          {item.status_code !== undefined && (
+                            <small>HTTP {text(item.status_code)}</small>
+                          )}
+                        </td>
+                        {kind === "request" && (
+                          <>
+                            <td>{metric(item.duration_ms)} ms</td>
+                            <td>
+                              {metric(item.total_tokens)}
+                              <small>{metric(item.credit)} Credit</small>
+                            </td>
+                          </>
                         )}
-                      </td>
-                      {kind === "request" && (
-                        <>
-                          <td>{metric(item.duration_ms)} ms</td>
-                          <td>
-                            {metric(item.total_tokens)}
-                            <small>{metric(item.credit)} Credit</small>
-                          </td>
-                        </>
-                      )}
-                      <td>
-                        <button disabled={detailLoading} onClick={() => openDetail(item)}>
-                          查看详情
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
+                        <td>
+                          <button disabled={detailLoading} onClick={() => openDetail(item)}>
+                            查看详情
+                          </button>
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -264,51 +298,49 @@ export function Logs() {
           </div>
         </div>
       </Panel>
-      {detail && (
-        <Drawer
-          title="日志详情与实际尝试"
-          onClose={() => {
-            setDetail(null);
-            setDetailError(null);
-          }}
-        >
-          <ErrorNotice message={detailError} />
-          {detailLoading ? (
-            <p role="status">正在加载详情…</p>
-          ) : (
-            <>
-              <Fields
-                data={Object.fromEntries(
-                  Object.entries(detail).filter(([key]) => key !== "attempts"),
-                )}
-              />
-              {Array.isArray(detail.attempts) && (
-                <Panel title="实际尝试">
-                  {detail.attempts.length ? (
-                    list(detail.attempts).map((attempt, i) => (
-                      <div key={i}>
-                        <h3>尝试 {i + 1}</h3>
-                        <Fields data={attempt} />
-                      </div>
-                    ))
-                  ) : (
-                    <p>暂无尝试记录。</p>
+      <DrawerPresence>
+        {detail && (
+          <Drawer title="日志详情与实际尝试" onClose={closeDetail}>
+            <ErrorNotice message={detailError} />
+            {detailLoading ? (
+              <p role="status">正在加载详情…</p>
+            ) : (
+              <>
+                <Fields
+                  data={Object.fromEntries(
+                    Object.entries(detail).filter(([key]) => key !== "attempts"),
                   )}
-                </Panel>
-              )}
-            </>
-          )}
-        </Drawer>
-      )}
-      {clear && (
-        <ClearLogs
-          onClose={() => setClear(false)}
-          onDone={() => {
-            setCursors([]);
-            resource.reload();
-          }}
-        />
-      )}
+                />
+                {Array.isArray(detail.attempts) && (
+                  <Panel title="实际尝试">
+                    {detail.attempts.length ? (
+                      list(detail.attempts).map((attempt, i) => (
+                        <div key={i}>
+                          <h3>尝试 {i + 1}</h3>
+                          <Fields data={attempt} />
+                        </div>
+                      ))
+                    ) : (
+                      <p>暂无尝试记录。</p>
+                    )}
+                  </Panel>
+                )}
+              </>
+            )}
+          </Drawer>
+        )}
+      </DrawerPresence>
+      <DrawerPresence>
+        {clear && (
+          <ClearLogs
+            onClose={() => setClear(false)}
+            onDone={() => {
+              setCursors([]);
+              resource.reload();
+            }}
+          />
+        )}
+      </DrawerPresence>
     </>
   );
 }

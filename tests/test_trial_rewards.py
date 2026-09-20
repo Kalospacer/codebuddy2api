@@ -1,12 +1,8 @@
-"""Offline trial tests: synthetic headers, MockTransport, disposable ledger directories.
-
-Run: python -B -m unittest -v tests/test_trial_rewards.py
-No converter import, credentials, external scripts, or live HTTP requests.
-"""
+"""Test trial claims with synthetic headers, MockTransport and disposable ledgers."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
@@ -65,7 +61,8 @@ class ClaimTrialTests(unittest.TestCase):
         with mock_http(respond):
             result = trial.claim_trial(headers())
         self.assertEqual(len(calls), 1)
-        self.assertEqual(set(result), {"ok", "already", "code", "status"})
+        self.assertTrue({"ok", "already", "code", "status"} <= set(result))
+        self.assertFalse(set(result) - {"ok", "already", "code", "status", "error"})
         return result
 
     def test_four_profiles_and_invalid_routing_rejected_before_client(self):
@@ -100,7 +97,7 @@ class ClaimTrialTests(unittest.TestCase):
 
         with mock_http(respond) as factory:
             self.assertTrue(trial.claim_trial(supplied)["ok"])
-        # 与网关其它 HTTP 调用一致，保留部署环境代理支持。
+        # Preserve deployment proxy support consistently with other HTTP clients.
         factory.assert_called_once_with(timeout=12.0, follow_redirects=False)
         self.assertEqual(supplied, original)
         self.assertEqual(len(calls), 1)
@@ -177,7 +174,8 @@ class ClaimTrialTests(unittest.TestCase):
 
             with self.subTest(exception=exception), mock_http(fail):
                 result = trial.claim_trial(headers())
-                self.assertEqual(result, {"ok": False, "already": False, "code": None, "status": None})
+                self.assertEqual(result, {"ok": False, "already": False, "code": None, "status": None,
+                                          "error": "timeout" if exception is httpx.ReadTimeout else "network_error"})
                 self.assertEqual(len(calls), 1)
 
 

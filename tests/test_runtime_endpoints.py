@@ -1,8 +1,8 @@
-"""网关限额、协议集成、网络失败与配置回归；所有上游调用均由 MockTransport 接管。"""
+"""Test gateway limits, protocol integration and transport failures using MockTransport."""
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # 仓库根：允许直接运行本文件
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
 
 import asyncio
 import contextlib
@@ -10,9 +10,12 @@ import io
 import json
 import os
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock, patch
+
+from itertools import product
 
 import httpx
 from fastapi import FastAPI
@@ -20,6 +23,8 @@ from fastapi.testclient import TestClient
 
 import converter
 from app import upstream_io
+from app import runtime_management
+from app.usage_snapshots import UsageSnapshots
 
 
 ROUTES = ("/v1/chat/completions", "/v1/responses", "/v1/messages")
@@ -74,6 +79,233 @@ class EndpointTests(unittest.TestCase):
         self.requests.append(request)
         return self.respond(request)
 
+    def test_stateful_responses_fields_are_rejected(self):
+        """Reject server-side conversation references in this stateless gateway."""
+        for field, value in (("previous_response_id", "resp_abc"), ("conversation", "conv_abc")):
+            with self.subTest(field=field):
+                self.requests.clear()
+                response = self.client.post("/v1/responses", json={
+                    "model": "auto", "input": [{"role": "user", "content": "hi"}], field: value})
+                self.assertEqual(response.status_code, 400, response.text)
+                body = response.json()
+                error = body.get("error") or body["detail"]["error"]
+                self.assertEqual(error["param"], field)
+                self.assertEqual(len(self.requests), 0)
+
+    def test_multiple_candidates_are_rejected_before_reaching_upstream(self):
+        """Accept only one completion in the aggregation path."""
+        for n in (2, 0, "2", True, 1.5):
+            with self.subTest(n=n):
+                self.requests.clear()
+                response = self.client.post("/v1/chat/completions", json={
+                    "model": "auto", "messages": [{"role": "user", "content": "hi"}], "n": n})
+                self.assertEqual(response.status_code, 400, response.text)
+                body = response.json()
+                error = body.get("error") or body["detail"]["error"]
+                self.assertEqual(error["param"], "n")
+                self.assertEqual(len(self.requests), 0)
+        self.requests.clear()
+        response = self.client.post("/v1/chat/completions", json={
+            "model": "auto", "messages": [{"role": "user", "content": "hi"}], "n": 1})
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(len(self.requests), 1)
+
+    def test_tool_arguments_must_be_objects_of_declared_tools(self):
+        """Reject non-object tool arguments and unknown declared-tool names."""
+        body = {"tools": TOOLS}
+        call = lambda name, args: [{"id": "c1", "function": {"name": name, "arguments": args}}]
+        healthy = converter._tool_calls_healthy
+        self.assertTrue(healthy(None, body))
+        self.assertTrue(healthy(call("synthetic_tool", "{}"), body))
+        self.assertTrue(healthy(call("synthetic_tool", "{\"x\": 1}"), body))
+        for bad_args in ("null", "[]", "42", "\"text\"", "{"):
+            with self.subTest(args=bad_args):
+                self.assertFalse(healthy(call("synthetic_tool", bad_args), body))
+        self.assertFalse(healthy(call("undeclared", "{}"), body))
+        self.assertFalse(healthy(call("", "{}"), body))
+        # Without declared tools, valid object arguments do not require a name match.
+        self.assertTrue(healthy(call("anything", "{}"), {"tools": []}))
+        self.assertTrue(healthy(call("anything", "{}"), None))
+
+    def test_count_tokens_estimates_instead_of_constant_zero(self):
+        """Return input-dependent token estimates rather than a fabricated constant."""
+        short = self.client.post("/v1/messages/count_tokens", json={
+            "model": "auto", "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(short.status_code, 200, short.text)
+        small = short.json()["input_tokens"]
+        self.assertGreater(small, 0)
+        long = self.client.post("/v1/messages/count_tokens", json={
+            "model": "auto", "system": "s" * 400,
+            "messages": [{"role": "user", "content": "x" * 4000}]})
+        big = long.json()["input_tokens"]
+        self.assertGreater(big, small)
+        cjk = self.client.post("/v1/messages/count_tokens", json={
+            "model": "auto", "messages": [{"role": "user", "content": "汉" * 100}]})
+        self.assertGreaterEqual(cjk.json()["input_tokens"], 100)  # Do not apply ASCII estimates to CJK text.
+        bad = self.client.post("/v1/messages/count_tokens", content=b"{ not json",
+                               headers={"Content-Type": "application/json"})
+        self.assertEqual(bad.status_code, 400)
+
+    def test_inference_errors_follow_the_client_protocol_shape(self):
+        """Shape protocol-specific inference errors while retaining admin detail envelopes."""
+        converter.CONFIG["api_key"] = "secret"
+        try:
+            for route in ("/v1/chat/completions", "/v1/responses"):
+                with self.subTest(route=route):
+                    response = self.client.post(route, json={})
+                    self.assertEqual(response.status_code, 401, response.text)
+                    body = response.json()
+                    self.assertIn("error", body)
+                    self.assertNotIn("detail", body)
+                    self.assertEqual(body["error"]["type"], "auth_error")
+            response = self.client.post("/v1/messages", json={})
+            self.assertEqual(response.status_code, 401, response.text)
+            body = response.json()
+            self.assertEqual(body["type"], "error")
+            self.assertEqual(body["error"]["type"], "authentication_error")
+            # Anthropic HTTP 404 uses not_found_error despite the upstream error type.
+            converter.CONFIG["model_guard"] = True
+            try:
+                missing = self.client.post("/v1/messages", json={
+                    "model": "no-such-model", "max_tokens": 64,
+                    "messages": [{"role": "user", "content": "hi"}]},
+                    headers={"Authorization": "Bearer secret"})
+                self.assertEqual(missing.status_code, 404, missing.text)
+                self.assertEqual(missing.json()["error"]["type"], "not_found_error")
+            finally:
+                converter.CONFIG["model_guard"] = False
+            response = self.client.get("/admin/credentials")
+            self.assertEqual(response.status_code, 401, response.text)
+            self.assertIn("detail", response.json())
+        finally:
+            converter.CONFIG["api_key"] = ""
+
+    def test_omitted_stream_defaults_to_nonstream_and_bad_type_rejected(self):
+        """Default to non-streaming JSON and reject non-Boolean stream values."""
+        bodies = {
+            "/v1/chat/completions": {"model": "auto", "messages": [{"role": "user", "content": "hi"}]},
+            "/v1/responses": {"model": "auto", "input": [{"role": "user", "content": "hi"}]},
+            "/v1/messages": {"model": "auto", "max_tokens": 64,
+                             "messages": [{"role": "user", "content": "hi"}]},
+        }
+        for route, body in bodies.items():
+            with self.subTest(route=route):
+                self.requests.clear()
+                response = self.client.post(route, json=body)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.headers["content-type"], "application/json")
+                self.assertNotIn("data:", response.text)
+                response = self.client.post(route, json={**body, "stream": "true"})
+                self.assertEqual(response.status_code, 400, response.text)
+                self.assertEqual(response.json()["error"]["param"], "stream")
+                response = self.client.post(route, json={**body, "stream": False})
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(response.headers["content-type"], "application/json")
+
+    def test_discarded_tool_generations_are_recorded_with_usage(self):
+        """Audit every discarded tool-repair generation within the configured retry budget."""
+        self.enterContext(patch.dict(converter.CONFIG, tool_stream_passthrough=False))
+        good = {"tool_calls": [{"index": 0, "id": "ok", "type": "function",
+                                "function": {"name": "synthetic_tool", "arguments": "{}"}}]}
+        bad = {"tool_calls": [{"index": 0, "id": "bad", "type": "function",
+                               "function": {"name": "synthetic_tool", "arguments": "{"}}]}
+        attempts = []
+        with patch.object(converter, "observe_attempt",
+                          side_effect=lambda stage, **kw: attempts.append((stage, kw))):
+            calls = {"n": 0}
+            def flaky(request):
+                calls["n"] += 1
+                return httpx.Response(200, content=sse(bad if calls["n"] == 1 else good, "tool_calls"))
+            self.respond = flaky
+            self.requests.clear()
+            payload = payload_for(ROUTES[0], 0)
+            payload["tools"] = TOOLS
+            response = self.client.post(ROUTES[0], json=payload)
+            self.assertEqual(response.status_code, 200, response.text)
+            self.assertEqual(calls["n"], 2)
+            retries = [kw for stage, kw in attempts if stage == "tool_args_retry"]
+            self.assertEqual(len(retries), 1)
+            self.assertEqual(retries[0]["attempt"], 1)
+            self.assertIn("total_tokens", retries[0])  # Audit discarded generation usage.
+
+            converter.CONFIG["tool_call_max_retry"] = 0
+            try:
+                self.respond = lambda request: httpx.Response(200, content=sse(bad, "tool_calls"))
+                self.requests.clear()
+                nonstream = dict(payload, stream=False)  # Surface failures as HTTP status codes.
+                response = self.client.post(ROUTES[0], json=nonstream)
+                self.assertEqual(response.status_code, 502, response.text)
+                self.assertEqual(len(self.requests), 1)  # Zero budget disables retries.
+                # Audit usage from the final exhausted attempt as well.
+                exhausted = [kw for stage, kw in attempts if stage == "tool_args_exhausted"]
+                self.assertEqual(len(exhausted), 1)
+                self.assertIn("total_tokens", exhausted[0])
+            finally:
+                converter.CONFIG["tool_call_max_retry"] = 3
+
+    def test_credential_selection_runs_off_the_event_loop(self):
+        """Offload blocking credential routing to the thread pool for all protocols."""
+        import inspect
+        import re
+        src = inspect.getsource(converter)
+        direct = re.findall(r"^\s+(?:body|chat_body), cred, headers, url = _route_chat\(", src, re.M)
+        pooled = re.findall(r"await run_in_threadpool\(_route_chat", src)
+        self.assertEqual(direct, [])
+        # All initial and failover routing must run outside the event-loop thread.
+        self.assertGreaterEqual(len(pooled), 3)
+
+    def test_tool_metadata_policy_reaches_all_protocols(self):
+        description = "Read sandbox data without destructive changes."
+        schema = {"type": "object", "title": "Lookup inputs", "properties": {
+            "path": {"type": "string", "title": "Data path", "description": description, "enum": ["sandbox", "local"]}},
+            "required": ["path"]}
+        function = {"name": "lookup_data", "description": description, "parameters": schema}
+        for route, keep, desensitize, no_compact, stream in product(ROUTES, (False, True), (False, True), (False, True), (False, True)):
+            with self.subTest(route=route, keep=keep, desensitize=desensitize, no_compact=no_compact, stream=stream):
+                converter.CONFIG.update(keep_tool_metadata=keep, desensitize=desensitize, no_compact=no_compact)
+                payload = payload_for(route, 0, stream)
+                if route == "/v1/messages":
+                    payload["tools"] = [{"name": function["name"], "description": description, "input_schema": schema}]
+                elif route == "/v1/responses":
+                    payload["tools"] = [{"type": "function", **function}]
+                else:
+                    payload["tools"] = [{"type": "function", "function": function}]
+                self.requests.clear()
+                response = self.client.post(route, json=payload)
+                self.assertEqual(response.status_code, 200, response.text)
+                self.assertEqual(len(self.requests), 1)
+                sent = json.loads(self.requests[0].content)["tools"][0]["function"]
+                retained = keep or (not desensitize and route != "/v1/responses")
+                self.assertEqual("description" in sent, retained)
+                self.assertEqual("title" in sent["parameters"], retained)
+                prop = sent["parameters"]["properties"]["path"]
+                self.assertEqual("description" in prop, retained)
+                self.assertEqual("title" in prop, retained)
+                self.assertEqual(sent["name"], function["name"])
+                self.assertEqual(sent["parameters"]["required"], ["path"])
+                self.assertEqual(prop["enum"], ["sandbox", "local"])
+                if retained:
+                    self.assertEqual(sent["description"].replace("\u200b", ""), description)
+                    self.assertEqual("\u200b" in sent["description"], desensitize)
+
+    def test_kept_tool_descriptions_still_obey_request_size_budget(self):
+        converter.CONFIG.update(keep_tool_metadata=True, desensitize=True, max_request_bytes=2048)
+        for route in ROUTES:
+            with self.subTest(route=route):
+                payload = payload_for(route, 0, False)
+                function = {"name": "lookup_data", "description": "x" * 4096, "parameters": {"type": "object"}}
+                if route == "/v1/messages":
+                    payload["tools"] = [{"name": function["name"], "description": function["description"], "input_schema": function["parameters"]}]
+                elif route == "/v1/responses":
+                    payload["tools"] = [{"type": "function", **function}]
+                else:
+                    payload["tools"] = [{"type": "function", "function": function}]
+                response = self.client.post(route, json=payload)
+                self.assertEqual(response.status_code, 413, response.text)
+                self.assertEqual(response.json()["error"]["code"], "request_too_large")
+        self.credentials.assert_not_called()
+        self.assertFalse(self.requests)
+
     def test_default_truncates_to_newest_16_for_all_routes_and_stream_flags(self):
         for route in ROUTES:
             for stream in (False, True):
@@ -100,7 +332,7 @@ class EndpointTests(unittest.TestCase):
                 with self.subTest(route=route, stream=stream):
                     response = self.client.post(route, json=payload_for(route, 17, stream))
                     self.assertEqual(response.status_code, 413)
-                    error = response.json()["detail"]["error"]
+                    error = response.json()["error"]
                     self.assertEqual((error["code"], error["image_count"], error["max_images"]),
                                      ("too_many_images", 17, 16))
         self.credentials.assert_not_called()
@@ -130,7 +362,7 @@ class EndpointTests(unittest.TestCase):
         payload["messages"][0]["content"][1]["image_url"]["url"] = "data:image/png;base64," + "A" * 2000
         response = self.client.post(ROUTES[0], json=payload)
         self.assertEqual(response.status_code, 413)
-        self.assertEqual(response.json()["detail"]["error"]["code"], "request_too_large")
+        self.assertEqual(response.json()["error"]["code"], "request_too_large")
         self.credentials.assert_not_called()
         self.assertFalse(self.requests)
 
@@ -318,6 +550,7 @@ class EndpointTests(unittest.TestCase):
 
 
     def test_invalid_tool_calls_exhaust_retries_without_returning_bad_tool(self):
+        self.enterContext(patch.dict(converter.CONFIG, tool_stream_passthrough=False))
         bad = {"tool_calls": [{"index": 0, "id": "bad-call", "function": {
             "name": "synthetic_tool", "arguments": "{"}}]}
         self.respond = lambda request: httpx.Response(200, content=sse(bad, "tool_calls"))
@@ -353,10 +586,328 @@ class TransportBoundaryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, 1)
 
 
+class InboundBodyLimitTests(unittest.TestCase):
+    """Reject oversized inference bodies before parsing without affecting admin routes."""
+
+    def _app(self, limit):
+        from app.inbound_limits import InboundBodyLimitMiddleware
+        from fastapi import Request
+        app = FastAPI()
+
+        @app.post("/v1/chat/completions")
+        async def inference(request: Request):
+            return {"size": len(await request.body())}
+
+        @app.post("/admin/x")
+        async def admin(request: Request):
+            return {"size": len(await request.body())}
+
+        app.add_middleware(InboundBodyLimitMiddleware, config={"max_inbound_bytes": limit})
+        return TestClient(app)
+
+    def test_over_limit_rejected_before_parsing_and_under_limit_passes(self):
+        client = self._app(1024)
+        ok = client.post("/v1/chat/completions", json={"messages": []})
+        self.assertEqual(ok.status_code, 200, ok.text)
+        big = client.post("/v1/chat/completions", content=b"x" * 2048,
+                          headers={"Content-Type": "application/json"})
+        self.assertEqual(big.status_code, 413)
+        self.assertEqual(big.json()["error"]["code"], "request_too_large")
+        self.assertNotIn("detail", big.json())
+        big_admin = client.post("/admin/x", content=b"x" * 2048)
+        self.assertEqual(big_admin.status_code, 200)  # Admin routes are outside this limit.
+
+    def test_chunked_body_is_counted_and_rejected(self):
+        from app.inbound_limits import InboundBodyLimitMiddleware
+        reached = []
+
+        async def app(scope, receive, send):
+            reached.append(True)
+
+        middleware = InboundBodyLimitMiddleware(app, {"max_inbound_bytes": 10})
+        chunks = [{"type": "http.request", "body": b"12345678", "more_body": True},
+                  {"type": "http.request", "body": b"9" * 8, "more_body": False}]
+        sent = []
+
+        async def receive():
+            return chunks.pop(0) if chunks else {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+
+        import asyncio
+        asyncio.run(middleware({"type": "http", "method": "POST", "path": "/v1/chat/completions"}, receive, send))
+        self.assertFalse(reached)  # Reject over-budget requests before dispatch.
+        self.assertEqual(sent[0]["status"], 413)
+
+
+class InboundStreamingTests(unittest.IsolatedAsyncioTestCase):
+    async def exercise_stream(self, path, disconnect=False):
+        from app.inbound_limits import ConcurrencyLimitMiddleware, InboundBodyLimitMiddleware
+        from starlette.responses import StreamingResponse
+
+        disconnected = asyncio.Event()
+        closed = asyncio.Event()
+        chunks = [{"type": "http.request", "body": b"{", "more_body": True},
+                  {"type": "http.request", "body": b"}", "more_body": False}]
+        sent = []
+
+        async def receive():
+            if chunks:
+                return chunks.pop(0)
+            await disconnected.wait()
+            return {"type": "http.disconnect"}
+
+        async def send(message):
+            sent.append(message)
+            if disconnect and message["type"] == "http.response.body" and message.get("body"):
+                disconnected.set()
+
+        async def stream():
+            try:
+                yield b"data: first\n\n"
+                if disconnect:
+                    await asyncio.Event().wait()
+                else:
+                    await asyncio.sleep(0)
+                    yield b"data: [DONE]\n\n"
+            finally:
+                closed.set()
+
+        async def app(scope, receive, send):
+            request = await receive()
+            self.assertEqual(request["body"], b"{}")
+            self.assertFalse(request["more_body"])
+            await StreamingResponse(stream(), media_type="text/event-stream")(scope, receive, send)
+
+        config = {"max_inbound_bytes": 1024, "max_concurrent": 1}
+        middleware = ConcurrencyLimitMiddleware(InboundBodyLimitMiddleware(app, config), config)
+        scope = {"type": "http", "method": "POST", "path": path,
+                 "asgi": {"version": "3.0", "spec_version": "2.3"}}
+        await asyncio.wait_for(middleware(scope, receive, send), 2)
+        self.assertTrue(closed.is_set())
+        self.assertFalse(middleware._gate().locked())
+        body = b"".join(m.get("body", b"") for m in sent)
+        self.assertIn(b"data: first", body)
+        if disconnect:
+            self.assertNotIn(b"[DONE]", body)
+        else:
+            self.assertIn(b"[DONE]", body)
+            self.assertFalse(sent[-1].get("more_body", False))
+
+    async def test_buffered_requests_keep_streaming_until_completion(self):
+        for path in ROUTES:
+            with self.subTest(path=path):
+                await self.exercise_stream(path)
+
+    async def test_real_disconnect_closes_the_stream_and_releases_capacity(self):
+        await self.exercise_stream("/v1/messages", disconnect=True)
+
+
+
+class ConcurrencyLimitTests(unittest.IsolatedAsyncioTestCase):
+    """Reject excess concurrency with Retry-After and recover after slots are released."""
+
+    async def test_full_gate_returns_503_and_recovers(self):
+        from app.inbound_limits import ConcurrencyLimitMiddleware
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_app(scope, receive, send):
+            entered.set()
+            await release.wait()
+            await send({"type": "http.response.start", "status": 200, "headers": []})
+            await send({"type": "http.response.body", "body": b"{}"})
+
+        mw = ConcurrencyLimitMiddleware(slow_app, {"max_concurrent": 1})
+        scope = {"type": "http", "method": "POST", "path": "/v1/chat/completions"}
+
+        async def receive():
+            return {"type": "http.request", "body": b"{}", "more_body": False}
+
+        sent = []
+
+        async def send(message):
+            sent.append(message)
+
+        first = asyncio.create_task(mw(scope, receive, send))
+        try:
+            await asyncio.wait_for(entered.wait(), 2)
+            for path in ROUTES:
+                with self.subTest(path=path):
+                    sent.clear()
+                    await mw({**scope, "path": path}, receive, send)
+                    self.assertEqual(sent[0]["status"], 503)
+                    headers = dict(sent[0]["headers"])
+                    self.assertEqual(headers[b"retry-after"], b"3")
+                    body = sent[1]["body"]
+                    self.assertEqual(int(headers[b"content-length"]), len(body))
+                    payload = json.loads(body)
+                    self.assertEqual(payload["error"]["code"], "concurrency_limit")
+                    if path == "/v1/messages":
+                        self.assertEqual(payload["type"], "error")
+                        self.assertEqual(payload["error"]["type"], "api_error")
+                    else:
+                        self.assertNotIn("type", payload)
+                        self.assertEqual(payload["error"]["type"], "rate_limit_error")
+        finally:
+            release.set()
+            await asyncio.wait_for(first, 2)
+        sent.clear()
+        await mw(scope, receive, send)
+        self.assertEqual(sent[0]["status"], 200)
+
+
+class AuxiliaryCapacityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_saturated_generation_gate_does_not_block_token_counting(self):
+        from app.inbound_limits import ConcurrencyLimitMiddleware
+
+        middleware = ConcurrencyLimitMiddleware(converter.app, {"max_concurrent": 1})
+        gate = middleware._gate()
+        await gate.acquire()
+        try:
+            with patch.dict(converter.CONFIG, {"api_key": ""}):
+                async with httpx.AsyncClient(transport=httpx.ASGITransport(app=middleware),
+                                             base_url="http://test") as client:
+                    response = await client.post("/v1/messages/count_tokens", json={
+                        "model": "auto", "messages": [{"role": "user", "content": "hello"}]})
+                    self.assertEqual(response.status_code, 200, response.text)
+                    self.assertGreater(response.json()["input_tokens"], 0)
+                    unknown = await client.post("/v1/messages/unknown", json={})
+                    self.assertEqual(unknown.status_code, 404)
+                    wrong_method = await client.get("/v1/messages")
+                    self.assertEqual(wrong_method.status_code, 405)
+            self.assertTrue(gate.locked())
+        finally:
+            gate.release()
+
+
+
+class StartupUsageHydrationTests(unittest.TestCase):
+    """Exercise the real main() startup path, not a look-alike helper call."""
+
+    def setUp(self):
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"CODEBUDDY_AUTH_DIR": str(self.root)}, clear=False))
+        self.path = self.root / "usage-snapshots.json"
+
+    def credential(self, uid="synthetic-uid"):
+        now = time.time()
+        path = self.root / "account.info"
+        path.write_text(json.dumps({"account": {"uid": uid}, "auth": {
+            "accessToken": "synthetic-token", "refreshToken": "synthetic-refresh",
+            "domain": "www.codebuddy.cn", "expiresAt": (now + 86400) * 1000,
+            "lastRefreshTime": now * 1000}}), encoding="utf-8")
+        return path
+
+    def test_main_publishes_cached_usage_before_serving(self):
+        """The aggregate must be populated by the time uvicorn.run is entered."""
+        path = self.credential()
+        # Preseed the cache for the identity this credential will resolve to.
+        probe = converter.CredentialPool([path], blocks_path=self.root / "blocks.json")
+        entry = probe._entries[0]
+        snapshots = UsageSnapshots(self.path)
+        snapshots.store(entry["id"], entry["account_key"], "domestic",
+                        {"by_day": {"2026-09-19": {"m": 6.0}}, "total_credits": 6.0,
+                         "requests": 3, "partial": False})
+
+        observed = {}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(converter.CONFIG))
+            stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check",
+                                                  "--auth-file", str(path)]))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(patch.object(converter.threading, "Thread"))       # No real threads.
+            stack.enter_context(patch.object(converter, "credits_mod", None))      # No network.
+            stack.enter_context(patch.object(converter, "seed_credentials"))
+            stack.enter_context(patch.object(converter, "preflight", return_value=True))
+            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
+            # handle is left open on Windows.
+            stack.enter_context(patch.object(runtime_management, "initialize"))
+            stack.enter_context(patch.object(runtime_management, "install"))
+
+            def capture(*args, **kwargs):
+                # Inspect the aggregate at the moment the server would start serving.
+                observed["usage"] = converter.CONFIG.get("usage_daily")
+                observed["accounts"] = converter.CONFIG.get("usage_daily_accounts")
+            stack.enter_context(patch.object(converter.uvicorn, "run", side_effect=capture))
+            converter.main()
+
+        self.assertIsNotNone(observed["usage"], "main() never published usage")
+        self.assertEqual(observed["usage"]["total_credits"], 6.0)
+        self.assertEqual(observed["usage"]["requests"], 3)
+        self.assertEqual(observed["usage"]["stale_accounts"], ["account.info"])
+        self.assertTrue(observed["accounts"][entry["id"]]["stale"])
+
+    def test_main_without_a_cache_leaves_usage_empty(self):
+        """An empty deployment must not be disturbed by the hydration step."""
+        path = self.credential()
+        observed = {}
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(converter.CONFIG))
+            stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check",
+                                                  "--auth-file", str(path)]))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(patch.object(converter.threading, "Thread"))
+            stack.enter_context(patch.object(converter, "credits_mod", None))
+            stack.enter_context(patch.object(converter, "seed_credentials"))
+            stack.enter_context(patch.object(converter, "preflight", return_value=True))
+            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
+            # handle is left open on Windows.
+            stack.enter_context(patch.object(runtime_management, "initialize"))
+            stack.enter_context(patch.object(runtime_management, "install"))
+            stack.enter_context(patch.object(converter.uvicorn, "run",
+                                            side_effect=lambda *a, **k: observed.setdefault("usage",
+                                                                                            converter.CONFIG.get("usage_daily"))))
+            converter.main()
+        self.assertIsNone(observed["usage"])
+        self.assertFalse(self.path.exists())
+
+    def test_main_starts_no_maintenance_thread_before_hydration(self):
+        """Hydration must complete before the maintenance threads are started."""
+        path = self.credential()
+        probe = converter.CredentialPool([path], blocks_path=self.root / "blocks.json")
+        entry = probe._entries[0]
+        UsageSnapshots(self.path).store(entry["id"], entry["account_key"], "domestic",
+                                       {"by_day": {}, "total_credits": 1.0, "requests": 1,
+                                        "partial": False})
+        events = []
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(patch.dict(converter.CONFIG))
+            stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check",
+                                                  "--auth-file", str(path)]))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(patch.object(converter, "credits_mod", None))
+            stack.enter_context(patch.object(converter, "seed_credentials"))
+            stack.enter_context(patch.object(converter, "preflight", return_value=True))
+            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
+            # handle is left open on Windows.
+            stack.enter_context(patch.object(runtime_management, "initialize"))
+            stack.enter_context(patch.object(runtime_management, "install"))
+            real_thread = converter.threading.Thread
+
+            def note_thread(*args, **kwargs):
+                events.append(("thread", converter.CONFIG.get("usage_daily") is not None))
+                return Mock()
+            stack.enter_context(patch.object(converter.threading, "Thread", side_effect=note_thread))
+            stack.enter_context(patch.object(converter.uvicorn, "run"))
+            converter.main()
+        # Every thread must have been started after usage was published.
+        self.assertTrue(events)
+        self.assertTrue(all(published for _, published in events), events)
+
+
 class ConfigurationTests(unittest.TestCase):
-    def configure(self, env=None, flags=(), invalid=False):
+    def configure(self, env=None, flags=(), invalid=False, stored=None, expected_host=None):
         with contextlib.ExitStack() as stack:
             directory = stack.enter_context(tempfile.TemporaryDirectory())
+            if stored:
+                from app.control_store import ControlStore
+                store = ControlStore(Path(directory) / "control.sqlite3")
+                try:
+                    store.update_settings(stored, store.snapshot()["revision"])
+                finally:
+                    store.close()
             stack.enter_context(patch.object(converter, "managed_auth_dir", return_value=Path(directory)))
             stack.enter_context(patch.object(converter, "app", FastAPI()))
             stack.enter_context(patch.dict(os.environ, env or {}, clear=True))
@@ -368,37 +919,116 @@ class ConfigurationTests(unittest.TestCase):
             stack.enter_context(patch.object(converter, "credits_mod", None))
             stack.enter_context(patch.object(converter.threading, "Thread"))
             server = stack.enter_context(patch.object(converter.uvicorn, "run"))
+            from app import runtime_management
+            close = stack.enter_context(patch.object(runtime_management, "close", wraps=runtime_management.close))
             if invalid:
                 with self.assertRaises(SystemExit) as caught:
                     converter.main()
                 self.assertEqual(caught.exception.code, 2)
                 seed.assert_not_called()
                 server.assert_not_called()
+                if stored:
+                    close.assert_called_once_with(converter.CONFIG)
                 return
             converter.main()
             server.assert_called_once()
+            if expected_host is not None:
+                self.assertEqual(server.call_args.kwargs["host"], expected_host)
             return {key: converter.CONFIG[key] for key in (
-                "max_images", "image_policy", "max_request_bytes", "log_body_limit")}
+                "max_images", "image_policy", "max_request_bytes", "log_body_limit", "admin_csrf",
+                "keep_tool_metadata", "admin_allowed_origins")}
 
     def test_defaults(self):
         self.assertEqual(self.configure(), {"max_images": 16, "image_policy": "truncate",
-                                           "max_request_bytes": 33554432, "log_body_limit": 65536})
+                                           "max_request_bytes": 33554432, "log_body_limit": 65536,
+                                           "admin_csrf": True, "keep_tool_metadata": False, "admin_allowed_origins": ""})
+
+    def test_open_binding_without_key_requires_explicit_opt_in(self):
+        # Reject unauthenticated public binding by default.
+        self.configure(flags=("--host", "0.0.0.0"), invalid=True)
+        # Explicit configuration allows unauthenticated binding.
+        self.configure(env={"CODEBUDDY2API_ALLOW_OPEN_NOAUTH": "true"}, flags=("--host", "0.0.0.0"))
+        # Configured authentication permits public binding.
+        self.configure(env={"CODEBUDDY2API_KEY": "k"}, flags=("--host", "0.0.0.0"))
+
+    def test_persisted_host_is_validated_after_configuration_resolution(self):
+        for host in ("0.0.0.0", "::"):
+            with self.subTest(host=host):
+                self.configure(stored={"host": host}, invalid=True)
+                self.configure(stored={"host": host}, env={"CODEBUDDY2API_KEY": "k"}, expected_host=host)
+                self.configure(stored={"host": host}, env={"CODEBUDDY2API_ALLOW_OPEN_NOAUTH": "true"},
+                               expected_host=host)
+        self.configure(stored={"host": "0.0.0.0"}, flags=("--host", "127.0.0.1"), expected_host="127.0.0.1")
+        self.configure(stored={"host": "127.0.0.1"}, flags=("--host", "0.0.0.0"), invalid=True)
+        self.configure(stored={"host": "0.0.0.0"}, env={"CODEBUDDY2API_KEY": ""},
+                       flags=("--api-key", "k"), expected_host="0.0.0.0")
+
 
     def test_environment_and_explicit_cli_precedence(self):
         env = {"CODEBUDDY2API_MAX_IMAGES": "8", "CODEBUDDY2API_IMAGE_POLICY": "error",
                "CODEBUDDY2API_MAX_REQUEST_BYTES": "100000", "CODEBUDDY2API_LOG_BODY_LIMIT": "0"}
         self.assertEqual(self.configure(env), {"max_images": 8, "image_policy": "error",
-                                               "max_request_bytes": 100000, "log_body_limit": 0})
+                                               "max_request_bytes": 100000, "log_body_limit": 0,
+                                               "admin_csrf": True, "keep_tool_metadata": False, "admin_allowed_origins": ""})
         env["CODEBUDDY2API_IMAGE_POLICY"] = "invalid-overridden"
         self.assertEqual(self.configure(env, ("--max-images", "0", "--image-policy", "truncate"))["max_images"], 0)
+
+    def test_admin_csrf_startup_flag_and_environment_precedence(self):
+        cases = [
+            ({}, ("--admin-csrf", "false"), False),
+            ({"CODEBUDDY2API_ADMIN_CSRF": "false"}, (), False),
+            ({"CODEBUDDY2API_ADMIN_CSRF": "true"}, (), True),
+            ({"CODEBUDDY2API_ADMIN_CSRF": "true"}, ("--admin-csrf", "false"), False),
+            ({"CODEBUDDY2API_ADMIN_CSRF": "false"}, ("--admin-csrf", "true"), True),
+            ({"CODEBUDDY2API_ADMIN_CSRF": "false"}, ("--admin-csrf",), True),
+            ({"CODEBUDDY2API_ADMIN_CSRF": "invalid-overridden"}, ("--admin-csrf", "true"), True),
+        ]
+        for env, flags, expected in cases:
+            with self.subTest(env=env, flags=flags):
+                self.assertIs(self.configure(env, flags)["admin_csrf"], expected)
+
+    def test_tool_metadata_flag_and_environment_precedence(self):
+        key = "CODEBUDDY2API_KEEP_TOOL_METADATA"
+        cases = [
+            ({}, ("--keep-tool-metadata",), True),
+            ({}, ("--keep-tool-metadata", "false"), False),
+            ({key: "true"}, (), True),
+            ({key: "false"}, (), False),
+            ({key: "true"}, ("--keep-tool-metadata", "false"), False),
+            ({key: "false"}, ("--keep-tool-metadata", "true"), True),
+            ({key: "invalid-overridden"}, ("--keep-tool-metadata",), True),
+        ]
+        for env, flags, expected in cases:
+            with self.subTest(env=env, flags=flags):
+                self.assertIs(self.configure(env, flags)["keep_tool_metadata"], expected)
+        self.configure({key: "invalid"}, invalid=True)
+        self.configure({key: ""}, invalid=True)
+        self.configure(flags=("--keep-tool-metadata", "invalid"), invalid=True)
+
+    def test_admin_allowed_origins_flag_and_environment_precedence(self):
+        key = "CODEBUDDY2API_ADMIN_ORIGINS"
+        cases = [
+            ({}, (), ""),
+            ({key: "chat.example.com"}, (), "https://chat.example.com"),
+            ({key: "env.example.com"}, ("--admin-allowed-origins", "cli.example.com:8443"), "https://cli.example.com:8443"),
+            ({}, ("--admin-allowed-origins", "a.example.com,http://b.example.com:8080"), "https://a.example.com,http://b.example.com:8080"),
+            ({key: "invalid-overridden"}, ("--admin-allowed-origins", "cli.example.com"), "https://cli.example.com"),
+        ]
+        for env, flags, expected in cases:
+            with self.subTest(env=env, flags=flags):
+                self.assertEqual(self.configure(env, flags)["admin_allowed_origins"], expected)
 
     def test_invalid_config_fails_before_side_effects(self):
         for env in ({"CODEBUDDY2API_MAX_IMAGES": "-1"}, {"CODEBUDDY2API_MAX_IMAGES": "1.5"},
                     {"CODEBUDDY2API_IMAGE_POLICY": "drop"}, {"CODEBUDDY2API_MAX_REQUEST_BYTES": "0"},
-                    {"CODEBUDDY2API_LOG_BODY_LIMIT": "-1"}):
+                    {"CODEBUDDY2API_LOG_BODY_LIMIT": "-1"}, {"CODEBUDDY2API_ADMIN_CSRF": "invalid"},
+                    {"CODEBUDDY2API_ADMIN_ORIGINS": "ftp://example.com"},
+                    {"CODEBUDDY2API_ADMIN_ORIGINS": "https://example.com/path"}):
             with self.subTest(env=env):
                 self.configure(env, invalid=True)
         self.configure(flags=("--max-images", "-1"), invalid=True)
+        self.configure(flags=("--admin-csrf", "invalid"), invalid=True)
+        self.configure(flags=("--admin-allowed-origins", "example.com:0"), invalid=True)
 
 
 class LogIntegrationTests(unittest.TestCase):
