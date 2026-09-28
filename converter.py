@@ -2092,15 +2092,22 @@ def admin_del_credential(name: str,
     _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
     rollback = {}
-    if CONFIG.get("management") is not None:
-        identity = CONFIG["management"].admin_delete_guard(os.path.basename(name), unbind=unbind)
-        if identity is not None:
-            rollback = CONFIG["management"].admin_unbind_credential(identity)
-    if pool is None or not pool.remove_file(os.path.basename(name)):
-        # A failed removal rolls the unbind back so routing never widens silently.
-        if CONFIG.get("management") is not None and rollback:
-            CONFIG["management"].admin_restore_bindings(rollback)
-        raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
+    identity = None
+    management = CONFIG.get("management")
+    # Serialize with model-rule edits so a rebind cannot slip between unbind and removal.
+    with CONFIG.get("admin_mutation_lock") or nullcontext():
+        if management is not None:
+            identity = management.admin_delete_guard(os.path.basename(name), unbind=unbind)
+            if identity is not None:
+                rollback = management.admin_unbind_credential(identity)
+        if pool is None or not pool.remove_file(os.path.basename(name)):
+            # A failed removal rolls the unbind back so routing never widens silently.
+            if management is not None and rollback:
+                management.admin_restore_bindings(rollback)
+            raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
+        if identity is not None and management is not None:
+            # Sweep any rebind that raced the removal from outside the shared lock.
+            management.admin_unbind_credential(identity)
     return {"removed": os.path.basename(name)}
 
 

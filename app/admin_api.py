@@ -82,6 +82,8 @@ def install_admin(app, config, gateway):
     # otherwise never clear a snapshot belonging to a superseded key.
     auth.reconcile()
     mutation_lock = threading.RLock()
+    # The confirmed credential delete shares this lock so rule edits cannot interleave.
+    config["admin_mutation_lock"] = mutation_lock
     oauth_lock = threading.RLock()
     oauth_tasks = OrderedDict()
 

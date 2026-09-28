@@ -10,6 +10,7 @@ import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+import threading
 
 
 from fastapi import HTTPException
@@ -84,6 +85,25 @@ class UnbindDeleteTests(unittest.TestCase):
                          [self.identity])  # A failed removal never widens routing to automatic.
         response = client.delete("/admin/credentials/account.info?unbind=1", headers=headers)
         self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"], [])
+        self.assertFalse(self.path.exists())
+
+    def test_route_sweeps_a_rebind_that_raced_the_removal(self):
+        self.bind()
+        config = dict(self.config, api_key="secret", management=self.management,
+                      admin_mutation_lock=threading.RLock())
+        self.enterContext(patch.dict(converter.CONFIG, config))
+        client = TestClient(converter.app)
+        headers = {"X-Api-Key": "secret"}
+        real_remove = self.pool.remove_file
+        def rebind_during_removal(file_name):
+            # A writer outside the shared lock rebinds while the credential is pooled.
+            revision = self.store.snapshot()["revision"]
+            self.store.update_model("glm-4-flash", {"credential_ids": [self.identity]}, revision)
+            return real_remove(file_name)
+        with patch.object(self.pool, "remove_file", side_effect=rebind_during_removal):
+            response = client.delete("/admin/credentials/account.info?unbind=1", headers=headers)
+            self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"], [])
         self.assertFalse(self.path.exists())
 
