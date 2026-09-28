@@ -342,9 +342,13 @@ class CredentialRuntimeTests(unittest.TestCase):
         data["auth"]["accessToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
         path.write_text(json.dumps(data), encoding="utf-8")
         pool.reload([path], reset=True)  # A damaged file must not block other credentials.
-        entry = pool.entries()[0]
-        with self.assertRaises(converter.auth_oauth.AuthTokenTypeError):
-            entry["cm"].get_headers()
+        self.assertEqual(pool.entries(), [])  # The stale identity is evicted, not retained.
+        with self.assertRaises(converter.auth_oauth.AuthTokenTypeError):  # Direct use fails fast.
+            converter.CredentialManager(path).get_headers()
+        pool.reload([path], reset=False)  # The next scan rejects it once like any new file.
+        self.assertEqual(pool.entries(), [])
+        rejected = [c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]
+        self.assertEqual(len(rejected), 1)
 
 
 if __name__ == "__main__":

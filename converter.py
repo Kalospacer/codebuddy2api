@@ -549,6 +549,13 @@ class CredentialPool:
                         entry["cm"].invalidate()
                     try:
                         summary = entry["cm"].summary()
+                    except auth_oauth.AuthTokenTypeError:
+                        # An envelope replacement must not keep serving the stale identity.
+                        by_id.pop(cid, None)
+                        if entry.get("uid"):
+                            have_uids.pop(entry.get("account_key"), None)
+                        self._drop_entry(entry)
+                        continue
                     except Exception:
                         continue  # A damaged file must not block other credentials.
                     generation = entry["cm"]._generation
@@ -683,6 +690,21 @@ class CredentialPool:
             update()
             return True
 
+
+    def _drop_entry(self, entry):
+        """Purge one entry whose file became unusable, mirroring prune()'s cleanup."""
+        cid = entry["id"]
+        if self._ledger is not None:
+            self._ledger.remove(cid)
+        self.forget_credential_state(entry)
+        self._entries = [e for e in self._entries if e is not entry]
+        self._model_fail = {key: until for key, until in self._model_fail.items() if key[0] != cid}
+        self._sticky = OrderedDict((key, value) for key, value in self._sticky.items() if value[0] != cid)
+        self._sync_pending.discard(cid)
+        self._syncing.discard(cid)
+        self._sync_retry.pop(cid, None)
+        self._sync_attempts.pop(cid, None)
+        invalidate_model_table()
     def prune(self):
         """Remove missing credential files and their session bindings."""
         with self._lock:
