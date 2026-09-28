@@ -11,8 +11,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.audit_store import AuditStore
 from app.observability import (AuditMiddleware, _Observation, _Parser, normalize_usage,
-                               observe_attempt, observe_failure, observe_route, observe_usage)
-
+                               observe_attempt, observe_failure, observe_responses_projection,
+                               observe_route, observe_usage)
 
 class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -49,6 +49,7 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
             observe_route("public-model", "upstream-model", "profile-a", "fingerprint")
             observe_attempt("send", status_code=200, body="private request", token="sk-synthetic")
             observe_usage({"input_tokens": 12, "credit": 0})
+            observe_responses_projection({"mode": "balanced", "max_item_bytes": 40000, "truncated_items": 2})
             for message in messages:
                 await send(message)
         sent = await self.invoke(app)
@@ -64,8 +65,25 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(record["usage_source"], "mixed")
         self.assertEqual(record["usage_sources"]["input_tokens"], "upstream_hook")
         self.assertIsNone(record["first_token_ms"])
+        self.assertEqual(record["responses_projection_mode"], "balanced")
+        self.assertEqual(record["responses_projection_max_bytes"], 40000)
+        self.assertEqual(record["responses_truncated_items"], 2)
         self.assertNotIn("private", json.dumps(record))
         self.assertNotIn("sk-synthetic", json.dumps(record))
+
+    async def test_non_responses_audit_omits_projection_fields(self):
+        body = json.dumps({"model": "public-model", "choices": [{"message": {"content": "ok"}}]}).encode()
+        messages = [{"type": "http.response.start", "status": 200,
+                    "headers": [(b"content-type", b"application/json")]},
+                   {"type": "http.response.body", "body": body}]
+        async def app(scope, receive, send):
+            for message in messages:
+                await send(message)
+        await self.invoke(app, path="/v1/chat/completions")
+        record = self.only_record()
+        for key in ("responses_projection_mode", "responses_projection_max_bytes",
+                    "responses_truncated_items"):
+            self.assertNotIn(key, record)
 
     async def stream(self, chunks, path="/v1/chat/completions", complete=True):
         async def app(scope, receive, send):

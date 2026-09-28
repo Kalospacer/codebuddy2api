@@ -39,7 +39,7 @@ def reply(text=REFUSAL, *, field="content", finish="stop"):
 
 
 def payload(route, *, stream=False, tools=False, identity=IDENTITY.lower()):
-    # Lowercase identity uses conservative Responses projection and retains fallback context.
+    # Lowercase identity exercises the same Responses path while retaining fallback context.
     system = (identity + ".\n" + BRANCH + ": main\n## Planning\n"
               + "Read relevant source files, preserve project conventions, and verify changes with tests.\n" * 5)
     user = {"role": "user", "content": "List the repository files."}

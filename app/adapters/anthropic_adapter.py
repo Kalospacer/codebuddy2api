@@ -7,6 +7,10 @@ import os
 import time
 from typing import Any
 
+from app.reasoning import extract_reasoning_text, map_reasoning_controls
+from app.upstream_io import (StreamOutputBudget, merge_tool_call_delta, new_tool_state,
+                             seal_tool_identities, tool_identity_complete)
+
 # ---------------------------------------------------------------------------
 # ID generation
 # ---------------------------------------------------------------------------
@@ -90,6 +94,7 @@ def anthropic_request_to_chat(body: dict) -> dict:
             raise ValueError("stop_sequences must be an array of strings")
         chat["stop"] = stop_sequences
 
+    map_reasoning_controls(body, chat, protocol="messages")
     return chat
 
 
@@ -121,6 +126,9 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
 
     # Structured content blocks
     blocks = content
+    if role != "assistant" and any(isinstance(block, dict) and block.get("type") in
+                                  ("thinking", "redacted_thinking") for block in blocks):
+        raise ValueError("thinking requires an assistant message")
 
     # User messages may contain tool results.
     if role == "user":
@@ -154,11 +162,14 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
     if role == "assistant":
         content_out = _convert_content_blocks(blocks)
         tool_calls: list[dict] = []
+        thoughts: list[str] = []
         for block in blocks:
             if not isinstance(block, dict):
                 continue
-            bt = block.get("type", "")
-            if bt == "tool_use":
+            thought = extract_reasoning_text(block)
+            if thought is not None:
+                thoughts.append(thought)
+            elif block.get("type") == "tool_use":
                 tc = {
                     "id": block.get("id", _rand_id("call_")),
                     "type": "function",
@@ -173,6 +184,8 @@ def _convert_anthropic_message(msg: dict) -> list[dict]:
         msg_out["content"] = content_out if content_out or has_text else None
         if tool_calls:
             msg_out["tool_calls"] = tool_calls
+        if thoughts:
+            msg_out["reasoning_content"] = "".join(thoughts)
         return [msg_out]
 
     content_out = _convert_content_blocks(blocks)
@@ -236,9 +249,17 @@ def _convert_anthropic_tools(tools: list) -> list:
 class AnthropicStreamConverter:
     """Convert Chat SSE increments to Anthropic Messages events."""
 
-    def __init__(self, model: str = "unknown"):
+    def __init__(self, model: str = "unknown", *, realtime: bool = False,
+                 budget: StreamOutputBudget | None = None, tool_states: dict | None = None,
+                 declared_names=None):
         self.msg_id = _rand_id("msg_")
         self.model = model
+        self._realtime = bool(realtime)
+        self._budget = budget if budget is not None else StreamOutputBudget(0)
+        self._tool_states = tool_states
+        self._local_tool_states: dict[int, dict] = {}
+        self._declared_names = frozenset(
+            value for value in (declared_names or ()) if isinstance(value, str) and value)
         self.created_at = int(time.time())
 
         # Stream state
@@ -257,6 +278,8 @@ class AnthropicStreamConverter:
         # Tool blocks indexed by upstream call position.
         self._tool_uses: dict[int, dict] = {}
         self._next_block_idx = 0
+        self._active_wire_block: int | None = None
+        self._deferred_blocks: dict[int, dict] = {}
 
         # Completion metadata
         self._finish_reason: str | None = None
@@ -282,6 +305,14 @@ class AnthropicStreamConverter:
     def finish(self) -> str:
         """Emit final events and close the message."""
         events: list[str] = []
+        if self._realtime:
+            if (self._tool_uses and self._finish_reason not in
+                    ("tool_calls", "length", "content_filter", "content-filter", "refusal")
+                    and not self._content_filter):
+                raise ValueError("tool calls require a tool_calls finish reason")
+            seal_tool_identities(self._tool_states if self._tool_states is not None
+                                 else self._local_tool_states, self._declared_names)
+            self._flush_ready_tools(events)
 
         # Close thinking blocks.
         if self._thinking_block_open:
@@ -304,6 +335,7 @@ class AnthropicStreamConverter:
                     "content_block_stop", {"index": tc["block_idx"]}
                 ))
                 tc["open"] = False
+                tc["terminal_closed"] = True
 
         # Map the finish reason.
         sr = self._finish_reason or "stop"
@@ -325,6 +357,30 @@ class AnthropicStreamConverter:
         events.append(self._evt("message_stop", {}))
 
         return "".join(events)
+
+    def mark_content_filter(self) -> None:
+        """Keep a detector-confirmed refusal from becoming a tool-choice error."""
+        self._content_filter = True
+
+    def set_validated_tools(self, tool_calls) -> None:
+        """Accept terminal metadata already validated by the shared Chat accumulator."""
+        if not self._realtime:
+            return
+        expected = [self._tool_uses[index] for index in sorted(self._tool_uses)]
+        if len(expected) != len(tool_calls or []):
+            raise ValueError("validated tool calls do not match stream items")
+        for slot, call in zip(expected, tool_calls or []):
+            function = call.get("function") or {}
+            state = slot.get("state")
+            values = ((slot.get("id"), call.get("id")),
+                      (slot.get("name"), function.get("name")))
+            if state is not None:
+                values += ((state.get("id"), call.get("id")),
+                           (state.get("name"), function.get("name")),
+                           (state.get("arguments"), function.get("arguments")))
+            if any(left != right for left, right in values):
+                raise ValueError("validated tool metadata does not match stream items")
+            slot["validated"] = True
 
     def get_nonstream_response(self) -> dict:
         """Return the complete non-streaming Message response."""
@@ -377,13 +433,24 @@ class AnthropicStreamConverter:
 
         for choice in chunk.get("choices", []):
             delta = choice.get("delta", {})
-            finish = choice.get("finish_reason")
+            finish = choice.get("finish_reason") or None
+            if self._finish_reason is not None:
+                if (any(delta.get(key) for key in ("content", "reasoning_content", "refusal"))
+                        or bool(delta.get("tool_calls")) or bool(delta.get("function_call"))):
+                    raise ValueError("output after finish_reason")
+                if finish is not None and finish != self._finish_reason:
+                    raise ValueError("changed finish_reason")
 
             # Emit reasoning before text.
             thinking = delta.get("reasoning_content")
             if thinking:
+                self._budget.charge_text(thinking)
                 self._thinking_content += thinking
                 if not self._thinking_block_open:
+                    if self._text_block_open:
+                        events.append(self._evt("content_block_stop", {
+                            "index": self._text_block_idx}))
+                        self._text_block_open = False
                     self._thinking_block_idx = self._next_block_idx
                     self._next_block_idx += 1
                     events.append(self._evt("content_block_start", {
@@ -405,6 +472,7 @@ class AnthropicStreamConverter:
                         "index": self._thinking_block_idx
                     }))
                     self._thinking_block_open = False
+                self._budget.charge_text(content)
                 self._text_content += content
                 if not self._text_block_open:
                     self._text_block_idx = self._next_block_idx
@@ -423,44 +491,48 @@ class AnthropicStreamConverter:
             for tc in delta.get("tool_calls", []):
                 idx = tc.get("index", 0)
                 if idx not in self._tool_uses:
-                    block_idx = self._next_block_idx
-                    self._next_block_idx += 1
+                    block_idx = None if self._realtime else self._next_block_idx
+                    if not self._realtime:
+                        self._next_block_idx += 1
                     self._tool_uses[idx] = {
-                        "id": tc.get("id", ""),
-                        "name": "",
-                        "args": "",
-                        "block_idx": block_idx,
-                        "open": False,
+                        "id": "", "name": "", "args": "", "block_idx": block_idx,
+                        "open": False, "emitted_args_length": 0,
                     }
                 slot = self._tool_uses[idx]
-                if tc.get("id"):
-                    slot["id"] = tc["id"]
-                fn = tc.get("function", {})
-                if fn.get("name"):
-                    slot["name"] = fn["name"]
+                if self._realtime:
+                    state = self._sync_tool_state(idx, tc)
+                    slot["state"] = state
+                else:
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function", {})
+                    if fn.get("name"):
+                        slot["name"] = fn["name"]
+                    slot["_pending_args"] = fn.get("arguments") or ""
 
-                if not slot["open"]:
-                    # Close thinking before a tool block begins.
-                    if self._thinking_block_open:
-                        events.append(self._evt("content_block_stop", {
-                            "index": self._thinking_block_idx
+                if self._realtime:
+                    events.extend(self._flush_tool_slot(idx, slot))
+                else:
+                    if not slot["open"]:
+                        self._close_content_blocks(events)
+                        events.append(self._evt("content_block_start", {
+                            "index": slot["block_idx"],
+                            "content_block": {"type": "tool_use", "id": slot["id"], "name": slot["name"], "input": {}},
                         }))
-                        self._thinking_block_open = False
-                    events.append(self._evt("content_block_start", {
-                        "index": slot["block_idx"],
-                        "content_block": {"type": "tool_use", "id": slot["id"], "name": slot["name"], "input": {}},
-                    }))
-                    slot["open"] = True
-
-                if fn.get("arguments"):
-                    slot["args"] += fn["arguments"]
-                    events.append(self._evt("content_block_delta", {
-                        "index": slot["block_idx"],
-                        "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]},
-                    }))
+                        slot["open"] = True
+                    arguments = self._new_tool_arguments(slot)
+                    if arguments:
+                        events.append(self._evt("content_block_delta", {
+                            "index": slot["block_idx"],
+                            "delta": {"type": "input_json_delta", "partial_json": arguments},
+                        }))
 
             if finish:
                 self._finish_reason = finish
+                if self._realtime:
+                    seal_tool_identities(self._tool_states if self._tool_states is not None
+                                         else self._local_tool_states, self._declared_names)
+                    self._flush_ready_tools(events)
 
                 # Close open blocks when the upstream finishes.
                 if self._thinking_block_open:
@@ -481,13 +553,136 @@ class AnthropicStreamConverter:
                             "index": tc["block_idx"]
                         }))
                         tc["open"] = False
+                        tc["terminal_closed"] = True
 
         return "".join(events)
+
+    def _close_content_blocks(self, events: list[str]) -> None:
+        if self._thinking_block_open:
+            events.append(self._evt("content_block_stop", {"index": self._thinking_block_idx}))
+            self._thinking_block_open = False
+        if self._realtime and self._text_block_open:
+            events.append(self._evt("content_block_stop", {"index": self._text_block_idx}))
+            self._text_block_open = False
+
+    def _sync_tool_state(self, index: int, tool: dict) -> dict:
+        state = ((self._tool_states or {}).get(index)
+                 if self._tool_states is not None else self._local_tool_states.get(index))
+        if state is None:
+            if self._tool_states is not None:
+                raise ValueError("tool state missing from realtime accumulator")
+            state = new_tool_state()
+            self._local_tool_states[index] = state
+        if self._tool_states is None:
+            merge_tool_call_delta(state, tool, declared_names=self._declared_names,
+                                  charge=self._budget.charge_text)
+        else:
+            state["identity_complete"] = tool_identity_complete(
+                state, self._declared_names, terminal=bool(state.get("_terminal")))
+        slot = self._tool_uses[index]
+        slot["id"] = state.get("id") or ""
+        slot["name"] = state.get("name") or ""
+        return state
+
+    def _flush_tool_slot(self, index: int, slot: dict) -> list[str]:
+        """Open one ready tool and flush its buffered arguments exactly once."""
+        if not self._realtime or slot.get("terminal_closed"):
+            return []
+        state = slot.get("state")
+        if state is None or not state.get("identity_complete"):
+            return []
+        events: list[str] = []
+        if not slot.get("open"):
+            if slot.get("block_idx") is None:
+                slot["block_idx"] = self._next_block_idx
+                self._next_block_idx += 1
+            self._close_content_blocks(events)
+            events.append(self._evt("content_block_start", {
+                "index": slot["block_idx"],
+                "content_block": {"type": "tool_use", "id": state["id"],
+                                  "name": state["name"], "input": {}},
+            }))
+            slot["open"] = True
+            state["identity_emitted"] = True
+        arguments = self._new_tool_arguments(slot)
+        if arguments:
+            events.append(self._evt("content_block_delta", {
+                "index": slot["block_idx"],
+                "delta": {"type": "input_json_delta", "partial_json": arguments},
+            }))
+        return events
+
+    def _flush_ready_tools(self, events: list[str]) -> None:
+        for index in sorted(self._tool_uses):
+            events.extend(self._flush_tool_slot(index, self._tool_uses[index]))
+
+    def _tool_arguments(self, slot: dict) -> str:
+        if self._realtime and slot.get("state") is not None:
+            return slot["state"].get("arguments") or ""
+        return slot["args"]
+
+    def _new_tool_arguments(self, slot: dict) -> str:
+        if not self._realtime:
+            piece = slot.get("_pending_args", "")
+            slot["args"] += piece
+            return piece
+        if not slot.get("open"):
+            return ""
+        arguments = self._tool_arguments(slot)
+        emitted = slot.get("emitted_args_length", 0)
+        if len(arguments) < emitted or not arguments.startswith(slot.get("_emitted_prefix", "")):
+            raise ValueError("non-append-only tool arguments")
+        piece = arguments[emitted:]
+        slot["emitted_args_length"] = len(arguments)
+        slot["_emitted_prefix"] = arguments
+        return piece
 
     def _evt(self, event_type: str, data: dict) -> str:
         """Format an Anthropic SSE event with its event name."""
         payload = {"type": event_type, **data}
-        return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        wire = f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+        if self._realtime:
+            if event_type.startswith("content_block_"):
+                return self._serialize_block_event(event_type, data["index"], wire)
+            if event_type in ("message_delta", "message_stop") and (
+                    self._active_wire_block is not None or self._deferred_blocks):
+                raise ValueError("message ended before content blocks closed")
+        return wire
+
+    def _serialize_block_event(self, kind: str, index: int, wire: str) -> str:
+        """Keep one downstream block open; later blocks wait within the shared budget."""
+        if kind == "content_block_start":
+            if index == self._active_wire_block or index in self._deferred_blocks:
+                raise ValueError("duplicate content block start")
+            if self._active_wire_block is None:
+                self._active_wire_block = index
+                return wire
+            self._budget.charge_text(wire)
+            self._deferred_blocks[index] = {"events": [wire], "closed": False}
+            return ""
+
+        if index == self._active_wire_block:
+            if kind != "content_block_stop":
+                return wire
+            self._active_wire_block = None
+            ready = [wire]
+            while self._deferred_blocks:
+                next_index = next(iter(self._deferred_blocks))
+                block = self._deferred_blocks.pop(next_index)
+                ready.extend(block["events"])
+                if not block["closed"]:
+                    self._active_wire_block = next_index
+                    break
+            return "".join(ready)
+
+        block = self._deferred_blocks.get(index)
+        if block is None or block["closed"]:
+            raise ValueError("content event outside its block lifecycle")
+        self._budget.charge_text(wire)
+        block["events"].append(wire)
+        if kind == "content_block_stop":
+            block["closed"] = True
+        return ""
 
     def _build_content_blocks(self) -> list[dict]:
         """Build content blocks for a non-streaming response."""
@@ -511,9 +706,9 @@ class AnthropicStreamConverter:
             }
             # Parse tool arguments as a JSON object.
             try:
-                block["input"] = json.loads(tc["args"])
+                block["input"] = json.loads(self._tool_arguments(tc))
             except (json.JSONDecodeError, ValueError):
-                block["input"] = tc["args"]
+                block["input"] = self._tool_arguments(tc)
             blocks.append(block)
 
         return blocks

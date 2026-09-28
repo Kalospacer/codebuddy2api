@@ -32,6 +32,118 @@ class UpstreamHTTPError(UpstreamResponseError):
 
 
 MAX_RETRY_AFTER = 86400
+MAX_TOOL_CALLS = 256
+
+
+class StreamOutputBudget:
+    """Bound retained output and deferred protocol events across validators and adapters."""
+
+    def __init__(self, max_bytes: int = 0):
+        self.max_bytes = max(0, int(max_bytes or 0))
+        self.used_bytes = 0
+
+    def charge(self, size: int) -> None:
+        if not self.max_bytes:
+            return
+        used = self.used_bytes + max(0, int(size))
+        if used > self.max_bytes:
+            raise UpstreamResponseError(502, json.dumps({"error": {
+                "message": f"upstream response exceeds the {self.max_bytes}-byte collection budget",
+                "type": "upstream_error", "code": "response_too_large"}}).encode())
+        self.used_bytes = used
+
+    def charge_text(self, value: str) -> None:
+        self.charge(len(value.encode("utf-8")))
+
+
+def new_tool_state() -> dict:
+    """Return the state shared by the accumulator and protocol adapters."""
+    return {
+        "id": None,
+        "name": None,
+        "arguments": "",
+        "identity_complete": False,
+        "identity_emitted": False,
+        "_argument_phase": False,
+    }
+
+
+def _tool_identity_ready(state: dict, declared_names=None, *, terminal: bool = False) -> bool:
+    """Use the argument phase or terminal marker as the metadata boundary, not string shapes."""
+    identity = (state.get("id"), state.get("name"))
+    if not all(isinstance(value, str) and value for value in identity):
+        return False
+    if not terminal and not state.get("_argument_phase"):
+        return False
+    names = {value for value in (declared_names or ()) if isinstance(value, str) and value}
+    return not names or identity[1] in names
+
+
+def tool_identity_complete(state: dict, declared_names=None, *, terminal: bool = False) -> bool:
+    """Refresh and return whether a tool identity is safe to expose."""
+    ready = _tool_identity_ready(state, declared_names, terminal=terminal)
+    state["identity_complete"] = ready
+    return ready
+
+
+def seal_tool_identity(state: dict, declared_names=None) -> bool:
+    """Seal all currently retained identity fields at a terminal boundary."""
+    state["_terminal"] = True
+    return tool_identity_complete(state, declared_names, terminal=True)
+
+
+def merge_tool_call_delta(state: dict, tool: dict, *, declared_names=None, charge=None) -> dict:
+    """Append Chat metadata fragments without deduplication; keep emitted identities stable."""
+    if not isinstance(state, dict):
+        raise ValueError("tool state")
+    if not isinstance(tool, dict):
+        raise ValueError("tool")
+    state.setdefault("id", None)
+    state.setdefault("name", None)
+    state.setdefault("arguments", "")
+    state.setdefault("identity_complete", False)
+    state.setdefault("identity_emitted", False)
+    state.setdefault("_argument_phase", False)
+    function = tool.get("function", {})
+    if not isinstance(function, dict):
+        raise ValueError("function")
+
+    def merge_field(key: str, piece) -> None:
+        if piece is None:
+            return
+        if not isinstance(piece, str):
+            raise ValueError(key)
+        if not piece:
+            return
+        current = state.get(key) or ""
+        if state.get("identity_emitted"):
+            if piece == current:
+                return
+            raise ValueError("conflicting tool identity")
+        # A repeated prefix can be a real delta ("tes" + "t"), not a retransmission.
+        if charge is not None:
+            charge(piece)
+        state[key] = current + piece
+
+    merge_field("id", tool.get("id"))
+    merge_field("name", function.get("name"))
+    piece = function.get("arguments") or ""
+    if not isinstance(piece, str):
+        raise ValueError("arguments")
+    if piece:
+        if charge is not None:
+            charge(piece)
+        state["arguments"] = (state.get("arguments") or "") + piece
+        state["_argument_phase"] = True
+    tool_identity_complete(state, declared_names, terminal=bool(state.get("_terminal")))
+    return state
+
+
+def seal_tool_identities(states, declared_names=None) -> None:
+    """Seal every state in a tracker at the upstream terminal boundary."""
+    for state in (states or {}).values():
+        if isinstance(state, dict):
+            seal_tool_identity(state, declared_names)
 
 
 def parse_retry_after(value, *, now=None) -> int | None:
@@ -57,9 +169,14 @@ def parse_retry_after(value, *, now=None) -> int | None:
 class ChatSSEAccumulator:
     """Collect Chat SSE and reject error events, empty output and incomplete streams."""
 
-    def __init__(self, *, collect=True, max_collect_bytes: int = 0):
+    def __init__(self, *, collect=True, max_collect_bytes: int = 0, retain_tools=None,
+                 budget: StreamOutputBudget | None = None, declared_names=None):
         self.collect = collect
-        self.max_collect_bytes = max(0, int(max_collect_bytes or 0))
+        self.retain_tools = collect if retain_tools is None else bool(retain_tools)
+        self.budget = budget if budget is not None else StreamOutputBudget(max_collect_bytes)
+        self.max_collect_bytes = self.budget.max_bytes
+        self.declared_names = frozenset(
+            value for value in (declared_names or ()) if isinstance(value, str) and value)
         self.collected_bytes = 0
         self.content = []
         self.reasoning = []
@@ -71,12 +188,25 @@ class ChatSSEAccumulator:
 
     def feed_line(self, line):
         line = line.strip()
-        if self.done or not line.startswith("data:"):
+        if not line or not line.startswith("data:"):
             return
         data = line[5:].strip()
         if data == "[DONE]":
             self.done = True
             return
+        if self.done:
+            # Preserve the historical tolerance for ignored malformed trailers,
+            # while rejecting a valid non-empty output frame after [DONE].
+            try:
+                trailing = json.loads(data)
+            except ValueError:
+                return
+            if (isinstance(trailing, dict) and "choices" not in trailing
+                    and trailing.get("error") is None
+                    and not any(trailing.get(key) for key in ("content", "reasoning_content", "refusal",
+                                                              "tool_calls", "function_call"))):
+                return
+            raise httpx.RemoteProtocolError("output after [DONE]")
         try:
             chunk = json.loads(data)
         except ValueError:
@@ -119,7 +249,7 @@ class ChatSSEAccumulator:
             if choice.get("finish_reason") is not None and not isinstance(choice["finish_reason"], str):
                 raise ValueError("finish_reason")
             self.saw_choice = True
-            self.finish_reason = choice.get("finish_reason") or self.finish_reason
+            finish_reason = choice.get("finish_reason") or None
             delta = choice.get("delta", {})
             if not isinstance(delta, dict):
                 raise ValueError("delta")
@@ -130,21 +260,36 @@ class ChatSSEAccumulator:
                     self.saw_output = True
             if "tool_calls" in delta and not isinstance(delta["tool_calls"], list):
                 raise ValueError("tool_calls")
+            if self.finish_reason is not None:
+                has_output = (any(delta.get(key) for key in ("content", "reasoning_content", "refusal"))
+                              or bool(delta.get("tool_calls")) or bool(delta.get("function_call")))
+                if has_output:
+                    raise ValueError("output after finish_reason")
+                if finish_reason is not None and finish_reason != self.finish_reason:
+                    raise ValueError("changed finish_reason")
+            if finish_reason is not None:
+                self.finish_reason = finish_reason
             if self.collect:
                 for key in ("content", "reasoning_content", "refusal"):
                     if delta.get(key):
-                        getattr(self, key if key != "reasoning_content" else "reasoning").append(delta[key])
                         self._charge(len(delta[key].encode("utf-8")))
+                        getattr(self, key if key != "reasoning_content" else "reasoning").append(delta[key])
             for tool in delta.get("tool_calls") or []:
                 if not isinstance(tool, dict):
                     raise ValueError("tool")
-                index = tool.get("index", 0)
-                if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                idx = tool.get("index", 0)
+                if isinstance(idx, bool) or not isinstance(idx, int) or idx < 0:
                     raise ValueError("tool index")
+                if (self.retain_tools and not self.collect
+                        and tool.get("type") is not None and tool.get("type") != "function"):
+                    raise ValueError("tool type")
                 if tool.get("id") is not None and not isinstance(tool["id"], str):
                     raise ValueError("tool id")
-                slot = self.tools.setdefault(index, {"id": None, "name": None, "arguments": ""})
-                slot["id"] = tool.get("id") or slot["id"]
+                if idx not in self.tools:
+                    if self.retain_tools and not self.collect and len(self.tools) >= MAX_TOOL_CALLS:
+                        raise ValueError("too many tool calls")
+                    self.tools[idx] = new_tool_state()
+                slot = self.tools[idx]
                 function = tool.get("function", {})
                 if not isinstance(function, dict):
                     raise ValueError("function")
@@ -153,37 +298,53 @@ class ChatSSEAccumulator:
                         raise ValueError(key)
                 if tool.get("id") or function.get("name") or function.get("arguments"):
                     self.saw_output = True
-                slot["name"] = function.get("name") or slot["name"]
-                if self.collect:
+                if self.retain_tools and not self.collect:
+                    merge_tool_call_delta(
+                        slot, tool, declared_names=self.declared_names, charge=self._charge_text)
+                else:
+                    if tool.get("id"):
+                        slot["id"] = tool["id"]
+                    if function.get("name"):
+                        slot["name"] = function["name"]
                     piece = function.get("arguments") or ""
-                    slot["arguments"] += piece
-                    self._charge(len(piece.encode("utf-8")))
+                    if piece and self.collect:
+                        self._charge(len(piece.encode("utf-8")))
+                        slot["arguments"] += piece
+                slot["identity_complete"] = tool_identity_complete(
+                    slot, self.declared_names, terminal=bool(slot.get("_terminal")))
             self.filter_detector.feed(delta, choice.get("finish_reason"))
+            if finish_reason is not None:
+                seal_tool_identities(self.tools, self.declared_names)
+
+    def _charge_text(self, value: str) -> None:
+        self._charge(len(value.encode("utf-8")))
 
     def _charge(self, size: int):
-        """Fail when collected bytes exceed the configured memory budget."""
-        if not self.collect or not self.max_collect_bytes:
+        """Fail when retained output metadata exceeds the configured shared memory budget."""
+        if not self.max_collect_bytes or (not self.collect and not self.retain_tools):
             return
-        self.collected_bytes += size
-        if self.collected_bytes > self.max_collect_bytes:
-            raise UpstreamResponseError(502, json.dumps({"error": {
-                "message": f"upstream response exceeds the {self.max_collect_bytes}-byte collection budget",
-                "type": "upstream_error", "code": "response_too_large"}}).encode())
+        self.budget.charge(size)
+        self.collected_bytes = self.budget.used_bytes
 
-    def result(self):
-        if not self.saw_choice or not (self.done or self.finish_reason):
+    def validated_tool_calls(self):
+        return [{"id": value["id"], "type": "function",
+                 "function": {"name": value["name"], "arguments": value["arguments"]}}
+                for _, value in sorted(self.tools.items())]
+
+    def result(self, *, allow_empty_filter=False):
+        if not self.saw_choice or not (self.done or self.finish_reason is not None):
             raise httpx.RemoteProtocolError("Upstream SSE ended without a completion marker")
-        if not self.saw_output:
-            if self.finish_reason in ("content_filter", "content-filter", "refusal"):
+        seal_tool_identities(self.tools, self.declared_names)
+        filter_terminal = self.finish_reason in ("content_filter", "content-filter", "refusal")
+        if not self.saw_output and not (allow_empty_filter and filter_terminal):
+            if filter_terminal:
                 raw = {"error": {"type": "upstream_error", "code": self.finish_reason,
                                  "message": "Upstream rejected the response without output"}}
                 raise UpstreamResponseError(502, json.dumps(raw).encode("utf-8"))
             raw = {"error": {"type": "upstream_error", "code": "empty_response",
                              "message": "Upstream SSE ended without output"}}
             raise UpstreamResponseError(502, json.dumps(raw).encode("utf-8"))
-        tools = [{"id": value["id"], "type": "function",
-                  "function": {"name": value["name"], "arguments": value["arguments"]}}
-                 for _, value in sorted(self.tools.items())] or None
+        tools = self.validated_tool_calls() or None
         return {"content": "".join(self.content), "reasoning_content": "".join(self.reasoning) or None,
                 "refusal": "".join(self.refusal) or None,
                 "tool_calls": tools, "finish_reason": self.finish_reason,

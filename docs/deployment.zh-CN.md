@@ -16,7 +16,7 @@
 | `CODEBUDDY_AUTH_DIR` | 本地 Python 数据目录；默认仓库内 `auth/`。Compose 在容器内固定为 `/data/auth` |
 | `CODEBUDDY_IMPORT_DIR` | 可选导入目录；默认数据目录下的 `imports/`。Compose 中请使用容器路径 |
 
-示例文件列出了全部生效的运行时变量，包括入站/聚合字节上限、并发、工具重试与故障转移。Compose 会转发这些限制；未设置的可选项（工具元数据、来源白名单、故障转移等）仍可在 WebUI 配置。取零表示关闭聚合/并发限制或额外重试，而入站上限必须为正值。
+示例文件列出了全部生效的运行时变量，包括入站/聚合字节上限、并发、工具重试与故障转移。Compose 会转发这些限制；未设置的可选项（工具元数据、Responses 投影、来源白名单、故障转移等）仍可在 WebUI 配置。取零表示关闭聚合/并发限制、Responses 单项裁剪或额外重试，而入站上限必须为正值。
 
 Compose 从 `.env` 读取已声明变量，shell 变量优先。默认宿主机映射仅回环。开放远程访问前请设置随机密钥、HTTPS 与访问限制。容器内监听保持 `0.0.0.0:8787`；调整对外暴露用 `BIND/PORT`，不要改容器监听参数。
 
@@ -63,14 +63,28 @@ docker compose up -d
 ```bash
 uv sync --locked --no-build --python 3.12
 (cd web && vp install --frozen-lockfile && vp build)
-uv run --locked --no-build --env-file .env converter.py --desensitize
+uv run converter.py
 ```
 
-按上文配置 `.env` 后启动，打开 `/dashboard` 添加账号。修改前端源码后需重新构建 WebUI。
+本地启动无需 `.env`。没有显式 key 时，首次回环启动会生成 `cb-…` 默认密钥，保存到 `auth/control.sqlite3`，监听成功后仅在交互终端显示一次；以后重启复用且不再打印。请妥善保存，管理登录与 API 请求共用。首次后台或非回环部署请显式配置 key。
 
-没有 uv 时：运行 `python3 -m venv .venv` 并激活，用 `pip install --require-hashes --only-binary=:all: -r requirements.txt` 安装依赖，以 `python3 converter.py --desensitize` 启动。**纯 Python 不会加载 `.env`**；请显式导出环境变量或传递 CLI 参数。
+密码提示直接写入控制终端（`/dev/tty` 或 Windows `CONOUT$`），不经过 stdout/stderr，重定向标准输出不会收集密码；外部终端录制不在程序控制范围内。
 
-本地监听地址优先级为：显式 `--host/--port` > `CODEBUDDY2API_BIND/PORT` > WebUI 已保存值 > 默认值。希望由 `.env` 控制监听时去掉显式参数；修改需重启。`CODEBUDDY2API_IMAGE/AUTH_PATH` 仅用于 Compose；本地数据目录用 `CODEBUDDY_AUTH_DIR`。
+终端写入或数据库提交失败时，同一密钥保留为待显示，下次交互启动可重试。显示后、提交前崩溃可能再次提示；成功提交后不重复显示。
+
+没有 uv 时：运行 `python3 -m venv .venv` 并激活，用 `pip install --require-hashes --only-binary=:all: -r requirements.txt` 安装依赖，再执行 `python3 converter.py`。发行包已包含 WebUI；源码安装仍需构建界面。
+
+两种启动方式均可选读取当前工作目录的 `.env`，不搜索父目录。优先级：显式 CLI > 进程环境变量 > `.env` > SQLite 保存值 > 默认值。覆盖不改写已保存的默认 key；显式空 key 仍锁定管理。修改监听需重启，`CODEBUDDY2API_IMAGE/AUTH_PATH` 仅用于 Compose。
+
+### 升级与数据迁移
+
+升级前停止网关并备份整个数据目录。首次启动将旧 JSON 会话、冷却、积分/领取、目录和用量状态一次性导入 `control.sqlite3`；原文件保留作备份，不再参与读写。关键数据损坏或迁移失败会阻止启动，请修复或恢复备份，不要删除账本绕过检查。
+
+SQLite 状态读取或校验失败会阻止启动，不删除会话、不回退为空状态；修复控制库后再启动。仅可重建缓存的写入失败允许保留当前内存数据并告警。
+
+所有运行日志使用 `logs.sqlite3`；旧 `--log` / `CODEBUDDY2API_LOG` 仅提示弃用，不再输出文本文件。自动生成的 key 只进私有配置，不进任何日志。限制数据目录访问权限；Windows 应使用当前用户的私有目录。
+
+旧版本不能读取升级后的控制库。回滚须停机并迁回匹配的状态，不能只切代码后复用旧 JSON；升级后发生的领取、派遣或会话撤销不能用过期备份覆盖。
 
 ## 依赖锁定
 

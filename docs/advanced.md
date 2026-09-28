@@ -6,18 +6,18 @@ Use the [WebUI](webui.md) for everyday management. See [deployment](deployment.m
 
 ## Configuration and CLI
 
-Precedence: **explicit CLI flags > environment > persisted WebUI settings > defaults**. Hot settings apply immediately; restart-marked settings require a manual restart. Change locked options in the startup configuration; the WebUI does not edit `.env`.
+Precedence: **explicit CLI flags > process environment > `.env` > saved SQLite settings > defaults**. Hot settings apply immediately; restart-marked settings require a manual restart. Change locked options at their source; the WebUI does not edit `.env` or expose API keys.
 
 Compose explicitly passes some environment variables and CLI flags, so deleting a line from `.env` may not unlock it. Recreate the container after changing these values; to let the WebUI manage them, also remove the corresponding explicit Compose settings.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--host` / `--port` | `127.0.0.1` / `8787` | Local listener |
-| `--api-key` | none | Shared management and inference key; management is locked without it |
+| `--api-key` | saved default | Shared management/inference key; first local interactive startup generates and saves one if absent; explicit empty locks management |
 | `--admin-csrf [true/false]` | `true` | Startup-only management Origin/CSRF checks; disabling does not bypass API-key or session authentication |
 | `--admin-allowed-origins` | none | Extra trusted management Origins (comma-separated; bare domains mean HTTPS) for reverse-proxy sign-in; hot and WebUI-editable |
 | `--auth-file` | scan `auth/` | Explicit credential file, repeatable; disables scanning other files |
-| `--log` | none | Additional text logs, 50 MiB rotation and 2 backups; SQLite auditing remains enabled |
+| `--log` | retired | Warns without writing a file; use SQLite logs in the WebUI |
 | `--desensitize` | off | Adapt fixed CLI templates, compact runtime prompts and mask keywords with zero-width characters |
 | `--tool-stream` / `CODEBUDDY2API_TOOL_STREAM` | `passthrough` | Chat streams with tools forward frames immediately; `aggregate` buffers and validates tool arguments, regenerating within the retry budget |
 | `--no-compact` | off | With desensitization, retain fuller instructions while adapting templates and pruning runtime context; does not disable Responses projection |
@@ -31,29 +31,92 @@ Compose explicitly passes some environment variables and CLI flags, so deleting 
 | `--model-capability-guard [true/false]` | `true` | Preflight declared image, tool, reasoning and mapped output limits; changes affect new requests |
 | `--max-images` | `16` | Total images per request; `0` permits no images |
 | `--image-policy` | `truncate` | Keep newest images; `error` rejects excess images with 413 |
+| `--responses-projection-mode balanced\|passthrough` | `balanced` | Rewrite recognized harness blocks that have stable summaries; passthrough disables Responses projection |
+| `--responses-projection-max-bytes` | `40000` | Complete per-item UTF-8 limit for assistant text, tool-argument JSON and tool results; `0` disables, otherwise valid range is `256..33554432` |
 | `--tool-call-max-retry` | `3` | Extra generations after malformed tool calls (each consumes credits); `0` disables retries |
 | `--max-inbound-bytes` | `67108864` | Raw body limit for generation and token-count POSTs, before parsing (chunked included); other routes are not buffered; 413 beyond it |
-| `--max-collect-bytes` | `8388608` | Total collection budget for aggregated output (content + reasoning + tool arguments); `response_too_large` beyond it; `0` disables |
+| `--max-collect-bytes` | `8388608` | Total retained-output budget for aggregation and realtime validation (content + reasoning + tool arguments/metadata); `response_too_large` beyond it; `0` disables |
+| `--stream-mode compatible\|realtime` | `compatible` | `compatible` preserves aggregate/replay behavior; `realtime` incrementally streams all three protocols and does not regenerate tool arguments |
 | `--max-concurrent` | `64` | Concurrency limit for the three generation endpoints only; excess requests get 503 with Retry-After; token counting is unaffected; `0` disables |
 | `--max-inflight-per-account` | `0` | Per-process, per-account in-flight client inference limit; `0` disables, full accounts return 503 |
 | `--upstream-keepalive [true/false]` | `false` | Bounded connection reuse isolated by official origin; requires restart |
 | `--request-context-mode` | `legacy` | `scoped` enables explicit sessions and per-attempt tracing; changes apply to new requests |
 | `--failover-max` | `0` | Extra credentials tried when a request fails before the first response byte reaches the client; `0` keeps the upstream behaviour of surfacing the failure directly |
 | `--retry-write-timeout` | `false` | Opt a request-body write timeout into replay (fresh connection and `--failover-max`), accepting that bytes already sent may have been processed |
-| `--max-request-bytes` | `33554432` | Positive byte limit for the processed upstream JSON |
-| `--log-body-limit` | `65536` | Text-log body preview bytes; `0` logs summaries only, not the SQLite diagnostic budget |
+| `--max-request-bytes` | `33554432` | Positive byte limit for processed upstream JSON, excluding gateway-only metadata |
+| `--log-body-limit` | `65536` | Legacy text-preview option; text output is retired and SQLite diagnostics use their own budget |
 
-Environment variables include `CODEBUDDY_AUTH_DIR`, `CODEBUDDY_IMPORT_DIR`, `CODEBUDDY2API_KEY`, `CODEBUDDY2API_ADMIN_CSRF`, `CODEBUDDY2API_ADMIN_ORIGINS`, `CODEBUDDY2API_KEEP_TOOL_METADATA`, `CODEBUDDY2API_LOG`, `CODEBUDDY2API_MAX_IMAGES`, `CODEBUDDY2API_IMAGE_POLICY`, `CODEBUDDY2API_MAX_REQUEST_BYTES`, `CODEBUDDY2API_LOG_BODY_LIMIT`, `CODEBUDDY2API_FAILOVER_MAX` and `CODEBUDDY2API_RETRY_WRITE_TIMEOUT`. See [deployment](deployment.md) for startup examples.
+Environment variables include `CODEBUDDY_AUTH_DIR`, `CODEBUDDY_IMPORT_DIR`, `CODEBUDDY2API_KEY`, `CODEBUDDY2API_ADMIN_CSRF`, `CODEBUDDY2API_ADMIN_ORIGINS`, `CODEBUDDY2API_KEEP_TOOL_METADATA`, `CODEBUDDY2API_STREAM_MODE`, `CODEBUDDY2API_LOG`, `CODEBUDDY2API_RESPONSES_PROJECTION_MODE`, `CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES`, `CODEBUDDY2API_MAX_IMAGES`, `CODEBUDDY2API_IMAGE_POLICY`, `CODEBUDDY2API_MAX_REQUEST_BYTES`, `CODEBUDDY2API_LOG_BODY_LIMIT`, `CODEBUDDY2API_FAILOVER_MAX` and `CODEBUDDY2API_RETRY_WRITE_TIMEOUT`. See [deployment](deployment.md) for startup examples.
+
+### Responses projection
+
+Configure these hot settings through the WebUI, CLI, process environment or `.env`. Precedence is CLI > process environment > `.env` > saved SQLite value > default; CLI/environment values lock the WebUI fields. Compose forwards a variable only when the host environment sets it, so leaving both unset keeps the WebUI editable.
+
+`responses_projection_mode` defaults to `balanced` and accepts only `balanced` or `passthrough`. Balanced mode rewrites only recognized harness blocks that have stable summaries; text outside those blocks is not budgeted or truncated. It also applies Codex-style head/tail truncation to generated assistant content, complete tool-argument JSON and tool results according to `responses_projection_max_bytes`. Text markers report original bytes, estimated tokens and total lines. Oversized tool arguments remain valid JSON and use a bounded object containing the original head, tail and size metadata. Passthrough disables Responses projection completely.
+
+`responses_projection_max_bytes` defaults to `40000`; valid values are `0` or `256..33554432`. `0` disables per-item truncation only; global inbound/request and output gates still apply. Neither setting changes the client Base URL.
+
+Downgrading to source that predates these keys requires the offline removal of `settings.responses_projection_mode` and `settings.responses_projection_max_bytes` described under [Streaming modes](#streaming-modes).
 
 ### Tool metadata retention
 
-Off by default, preserving the existing policy: desensitization strips tool descriptions, and Responses tool projection also strips them; `--no-compact` does not change this. When enabled, Chat, Responses and Messages retain supported tool descriptions and string `description/title` annotations in parameter schemas. With desensitization enabled, retained text is still processed. Prompt compaction and existing content-filter retry conditions/counts are unchanged; fallback processing also respects this option.
+Responses projection no longer changes tool definitions or schemas. When desensitization is enabled, it strips tool descriptions and string `description/title` annotations by default; enabling this setting retains and processes that text across Chat, Responses and Messages. `--no-compact` does not change this setting.
 
 - **WebUI:** Settings → Keep tool descriptions; unlocked changes apply immediately and persist.
 - **CLI:** append `--keep-tool-metadata` or `--keep-tool-metadata true` to the existing command; explicit `false` overrides the environment.
 - **Environment:** set `CODEBUDDY2API_KEEP_TOOL_METADATA=true`. Compose passes it only when set, leaving the WebUI unlocked otherwise. Remove or comment out the variable to remove the environment lock; do not set an empty string.
 
-Use a source/image build and Compose configuration containing this feature; recreate containers after changing their environment. Retained descriptions may increase input tokens and content-filter rejections; compatibility across accounts/models is not guaranteed. Set `false` to restore the previous policy. This option does not restore other schema fields or deep nodes removed by existing Responses projection, nor relax the request-size budget.
+Use a source/image build and Compose configuration containing this feature; recreate containers after changing its environment. Retained descriptions may increase input tokens and content-filter risk; set `false` to restore the desensitization default. This setting does not change Responses balanced/passthrough mode or relax request-size limits.
+
+### Streaming modes
+
+`stream_mode` defaults to `compatible`. Configure it through `--stream-mode compatible|realtime`, `CODEBUDDY2API_STREAM_MODE`, or the WebUI enum; explicit CLI/environment sources lock that field. Every generation request, including non-streaming, records the selected mode and freezes it with `max_collect_bytes` before routing. Hot changes affect only later requests, not in-flight failovers. Non-streaming responses remain aggregated JSON; there is no client mode override.
+
+- `compatible` preserves existing behavior: Responses streams aggregate first; Chat and Messages aggregate when tools are present and otherwise pass through upstream increments. Aggregated output is validated and replayed in fragments. Non-stream requests always use the validated aggregate path in either mode.
+- `realtime` forwards reasoning, text, refusal and tool-argument increments for all three protocols. Responses assigns stable indexes when items start; Anthropic uses stable block indexes. Adapters buffer tools with missing identity until the argument phase or terminal marker, append metadata fragments without guessing from prefixes, and reject identity changes after an item starts. `max_collect_bytes` bounds retained UTF-8 output; `0` disables that limit.
+
+Realtime Messages keeps one content block open at a time. The active tool remains incremental; later tool, text or thinking blocks may wait until upstream completion. Deferred event bytes share `max_collect_bytes`. A tool still awaiting its identity does not block unrelated text before its block starts.
+
+Realtime mode never regenerates malformed or incomplete tool arguments. Tool IDs, names, declared names, JSON-object arguments and `tool_choice` are checked at the terminal boundary before a success terminal is sent. In realtime, a tool-bearing completion must also carry the upstream `tool_calls` finish marker; a `stop` marker with tool calls is rejected, while compatible mode keeps its legacy acceptance behavior. Before any downstream byte, failures retain the upstream HTTP error and existing bounded pre-response failover rules. After any byte, malformed tools, disconnects, stream errors and budget overflow produce a protocol error terminal without credential replay or switching; valid `length`, refusal and content-filter results keep their native protocol distinctions (Responses reports truncation/filtering as `incomplete`, never `completed`) and are not regenerated. Clients must therefore accept partial output followed by an error rather than assuming every opened SSE stream completes successfully. Audit records retain only an allowlisted `stream_mode` marker plus available upstream usage.
+
+Explicit filter-only terminals are valid even without output: realtime Responses emits `response.incomplete` with `content_filter`, retaining available usage. This does not permit an ordinary empty response, missing terminal or error frame to succeed.
+
+For runtime fallback, select `compatible` to restore aggregate streaming and tool-argument repair without changing saved state. Before running older source, remove the new CLI/environment option, stop the gateway and back up the **current** data directory, including its SQLite/WAL/SHM generation. Do not restore a stale pre-upgrade database: that could roll back newer claims, sessions, revocations and account state. The following offline procedure deletes only the listed `settings.<name>` keys and increments the revision, then checks integrity; all other settings and tables remain intact. Pass one key or several. Never run it against a live database or mix SQLite generations.
+
+```sh
+python3 - /path/to/control.sqlite3 settings.stream_mode <<'PY'
+import json, sqlite3, sys
+path, names = sys.argv[1], sys.argv[2:]
+keys = [name.split(".", 1)[1] for name in names if name.count(".") == 1 and name.split(".", 1)[1]]
+if len(keys) != len(names):
+    raise SystemExit("pass one or more settings.<name> keys")
+con = sqlite3.connect(path)
+try:
+    con.execute("BEGIN IMMEDIATE")
+    row = con.execute("SELECT revision,payload FROM control WHERE id=1").fetchone()
+    if row is None:
+        raise SystemExit("missing control row")
+    revision, payload = row
+    data = json.loads(payload)
+    if set(data) != {"settings", "models", "credentials"} or not isinstance(data["settings"], dict):
+        raise SystemExit("unexpected control payload")
+    present = [key for key in keys if key in data["settings"]]
+    if not present:
+        raise SystemExit("no requested key is present; no write needed")
+    for key in present:
+        del data["settings"][key]
+    con.execute("UPDATE control SET revision=?,payload=? WHERE id=1",
+                (revision + 1, json.dumps(data, ensure_ascii=False, allow_nan=False)))
+    con.commit()
+    if con.execute("PRAGMA integrity_check").fetchone()[0] != "ok":
+        raise SystemExit("integrity check failed")
+finally:
+    con.close()
+print("ok")
+PY
+```
+
+Older strict setting validators reject the unknown saved key, so changing only its value does not make old source compatible. This procedure is intentionally offline and operator-scoped; do not perform it on production without a current backup and a stopped service.
 
 ### Connection reuse and account capacity
 
@@ -83,7 +146,7 @@ Manual `POST /admin/credentials/{id}/travel` returns `buddy_confirmation` with o
 
 Travel claims and departures share an account-scoped write reservation. Uncertain results do not expire or replay; fresh status reads reconcile them without issuing upstream writes. Store failures stop claims and departures, and local readback updates preserve receipt ownership across processes.
 
-Trial credits are manual-only for eligible `intl-work` accounts: use the credential row's claim drawer or `POST /admin/credentials/{id}/trial`. Startup, periodic maintenance and balance sync never claim. Results expose safe error categories, HTTP/business codes and retry time; response bodies are capped at 64 KiB and never returned to the browser. Success/already-claimed records persist in `auth/trial-ledger.json`; failures wait at least 24 hours before another manual attempt. Keep this file when upgrading.
+Trial credits are manual-only for eligible `intl-work` accounts through the credential drawer or `POST /admin/credentials/{id}/trial`; startup and maintenance never claim. Safe results, successful claims and reservations persist in `control.sqlite3`; failed attempts retain the 24-hour backoff. Response bodies are capped at 64 KiB and never returned to the browser. Preserve the database when upgrading.
 
 `CODEBUDDY2API_AUTO_TRIAL` and `--auto-trial` are retired: old startup options warn and do nothing; saved Boolean `auto_trial` settings are ignored on load. Remove them from deployment configuration. Before reverting to older code, check these old settings to avoid re-enabling automatic claims.
 
@@ -148,7 +211,7 @@ The WebUI supports direct uploads; these rules concern path imports through `POS
 
 ## Models and scheduling
 
-Select client models from the WebUI or `GET /v1/models`. Raw catalogs remain cached by account/tenant, region, product and client version in `auth/model-catalog.json`, with a default 6-hour TTL. New credentials trigger synchronization; failed refreshes retain that account's trusted cache. Legacy unscoped caches do not become international sharing sources.
+Select client models from the WebUI or `GET /v1/models`. Raw catalogs remain cached by account/tenant, region, product and client version in `auth/control.sqlite3`, with a default 6-hour TTL. New credentials trigger synchronization; failed refreshes retain that account's trusted cache. Legacy unscoped caches do not become international sharing sources.
 
 International CLI and WorkBuddy use a deduplicated shared view from enabled, catalog-ready international accounts. A target account must have its own synchronized catalog; its existing model declarations win unchanged. Missing IDs inherit shared declarations, retaining `catalog_source` and safe `source_variants`. Conflicting inherited rates use the higher known rate, limits the smaller known value, reasoning options their intersection and differing descriptive fields are omitted; unknown prices never mean free. Domestic catalogs, credentials, balances, bindings and `auto` defaults remain independent. Shared rates are catalog references, not billing or permission guarantees.
 
@@ -181,22 +244,32 @@ Credential domain / token issuer determine the product identity. Chat and refres
 
 Both international profiles merge image-bearing consecutive `user` runs only after routing, preserving content order and image data. Domestic bodies, text-only runs and system/assistant/tool boundaries remain unchanged. Conflicting message attributes or unrepresentable content return `400 / image_user_run_not_mergeable`; final byte limits still apply. This compatibility step remains enabled when capability preflight is disabled; it neither adds retries nor makes a text model natively visual.
 
+## Reasoning compatibility
+
+Messages `enabled` / `adaptive` activate Chat reasoning; `output_config.effort` and Responses `reasoning.effort` map to `reasoning_effort`. An explicit top-level `reasoning_effort` takes precedence, except Messages `disabled` always selects `none`; model capability checks still apply. Omitted controls leave upstream defaults unchanged.
+
+Without an explicit effort, Messages activation uses the selected account's `reasoning.defaultEffort` or legacy `reasoning.effort`, restricted to its declared options. Otherwise it prefers `high`, then an available option; unknown declarations fall back to `high`. Failover resolves the replacement account's default again.
+
+Manual `enabled` requires an integer `budget_tokens >= 1024`, but the budget is not an exact upstream token limit; `max_tokens` is forwarded unchanged. This mapping does not reproduce native adaptive scheduling. Only `display: summarized` is supported.
+
+Readable history is kept in `reasoning_content`, never ordinary answer text. Responses uses readable `content` before `summary`; summaries cannot reconstruct native hidden reasoning. Signatures are not forwarded. `redacted_thinking`, encrypted-only thinking and non-empty Responses `encrypted_content` return 400 before routing; upstreams decide which readable history they use.
+
 ## Request boundaries
 
-- All three generation protocols normalize `developer` to `system`, move an existing system message first or insert a default. This normalization does not mutate the caller's payload. Responses projection and optional desensitization process content separately; the whole pipeline is not a verbatim pass-through.
+- All three generation protocols normalize `developer` to `system`, move an existing system message first or insert a default. This normalization does not mutate the caller's payload. Optional [Responses projection](#responses-projection) and desensitization process content separately; the whole pipeline is not a verbatim pass-through by default.
 - Images count across all history and tool results, including duplicates, in message/content array order. The default keeps the newest 16, removing only excess images while retaining text and message structure; emptied image content receives a text placeholder.
 - `--image-policy error` returns local `413 / too_many_images`. JSON still over budget after processing returns `413 / request_too_large`, without further text truncation to fit the limit.
 - Image count does not guarantee acceptable individual image sizes or model vision support. URL/base64 images can be converted; Responses image `file_id` is unsupported.
-- When `stream` is omitted all three endpoints follow the protocol default and return a complete JSON response; `stream` must be a boolean. Streaming Responses and Chat/Messages with tools aggregate and validate before emitting SSE; not every path forwards tokens in real time.
+- With `stream_mode=compatible` (the default), streaming Responses and Chat/Messages with tools aggregate and validate before emitting SSE; Chat/Messages without tools pass through upstream increments. `realtime` streams all three incrementally, while omitted/non-stream requests remain complete validated JSON.
 - Inference errors follow the client protocol: OpenAI routes return a top-level `error` object and Messages returns `{"type": "error", ...}`. Status codes are retained; errors after streaming starts are reported through SSE without replay.
 - Valid upstream `Retry-After` values (0–86400 seconds or equivalent HTTP dates) are returned as seconds before streaming starts; 429 only cools the selected account/model. Invalid or expired values fall back to the body's reset time or 600 seconds. Pool-generated 429 responses include the remaining wait.
 - Chat and Responses preserve an explicit client `prompt_cache_key` without generating one; cache hits and savings depend on the upstream.
 - Unsupported capabilities are rejected rather than silently degraded: chat `n` other than 1 and the Responses state fields `previous_response_id`/`conversation` (this gateway keeps no server-side response state) return 400; length-truncated or content-filtered Responses are reported as `incomplete`, never disguised as `completed`.
-- Text logs and SQLite auditing have separate budgets. Logs contain bounded, redacted previews, not complete original requests. Treat logs, credential exports and backups as private data.
+- SQLite auditing retains only bounded, redacted diagnostics, not complete original requests. Treat logs, credential exports and backups as private data.
 
 ## Deployment exposure and credential intake
 
-- The compose port mapping binds loopback by default (`CODEBUDDY2API_BIND` defaults to 127.0.0.1); after resolving CLI, environment and saved settings, a native non-loopback bind with an empty effective API key refuses to start unless `CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true` is set explicitly.
+- Compose maps loopback by default. Without a configured or saved key, `CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true` explicitly permits headless/non-loopback inference without generating a key; management stays locked. The shipped image sets this compatibility opt-in, so configure `CODEBUDDY2API_KEY` before exposing it. The opt-in never disables an existing key.
 - When a key is configured, generation and token-count POSTs verify request headers before buffering bodies or reserving inference capacity; invalid keys return 401 even while generation slots are full. Other routes retain their existing authentication and routing behavior.
 - Credential imports/uploads persist the normalized form (token aliases folded into the canonical fields); strict JSON parsing rejects NaN/Infinity, and `expiresAt`/`lastRefreshTime` must be plausible finite millisecond timestamps.
 
@@ -222,7 +295,7 @@ Both international profiles merge image-bearing consecutive `user` runs only aft
 | Streaming request fails before the first byte | Reported with the real HTTP status, exactly like `stream=false`. A 200 carrying only an in-band `error` event is read by clients as an empty answer, so the session ends silently while the audit log records a success |
 | Credential failover (`--failover-max`) | Off by default. When enabled, a failure before any byte reached the client is retried on another credential up to N times and audited as `success` with a `failover_recovered` marker. Qualifying failures: upstream HTTP 401/403/429/502/503/504 rejections and bodies the upstream provably never received (`ConnectError`/`ConnectTimeout`). Content-filter rejections, 502s from an already-open stream, read timeouts and protocol errors are never replayed; without another credential the original status surfaces. Billing note: 401/403/429/503 and transport failures happen at admission and cannot be billed; a 502/504 may already have been billed upstream, but its result never reached the client, so refusing to replay recovers no credit — it only turns a paid-for attempt into a broken session. Such replays are tagged `上游可能已处理该请求` in the log for reconciliation |
 | Write-timeout replay (`--retry-write-timeout`) | Off by default. A write timeout proves the body was not fully sent, not that the upstream ignored the bytes it received, so it stays excluded from connect retry and failover until enabled. Long cross-border sessions fail here more often than in the handshake; enable only when the upstream is confirmed not to bill partial bodies. These replays carry the same `上游可能已处理该请求` log tag |
-| Malformed tool calls | Aggregate validation permits up to `--tool-call-max-retry` (default 3) additional generations, each consuming credits and recorded with its usage in the attempt details; exhaustion returns an error |
+| Malformed tool calls | Compatible aggregate validation permits up to `--tool-call-max-retry` (default 3) additional generations, each consuming credits and recorded with its usage in the attempt details; exhaustion returns an error. Realtime mode never regenerates: it reports a protocol error before a success terminal |
 | Empty or truncated upstream stream | No valid output, a missing end marker or an error is not reported as success |
 | Content-filter rejection | With desensitization and `--no-compact`, a complete non-streaming filter-only rejection may receive one shorter-template retry on the same account. No streaming filter retry, circuit opening or account rotation |
 | Slow responses | Inspect timing and failed attempts in the WebUI, then choose a faster model supported by the account |
@@ -230,4 +303,4 @@ Both international profiles merge image-bearing consecutive `user` runs only aft
 
 ## Downgrades and rollback
 
-Feature switches hold no hidden state: disabling a guard or mode stops it for new requests, and reverting source restores previous behavior. The exceptions are persisted settings and automation state: `control.sqlite3` stores WebUI settings, model rules and reward reservations, and older code rejects unknown fields. Before downgrading source, remove newly added startup options and restore a control-store backup from before the upgrade, including its WAL/SHM files without mixing. Rollback never undoes completed upstream claims or travel dispatches.
+Feature switches hold no hidden state: disabling a guard or mode stops it for new requests, and reverting source restores previous behavior. The exceptions are persisted settings and automation state: `control.sqlite3` stores WebUI settings, model rules and reward reservations, and older code rejects unknown fields. Before downgrading source, remove newly added startup options, stop the service, back up the **current** data directory, and use the narrowly scoped offline `settings.<name>` removal procedure above with a revision increment and integrity check. Do not restore a pre-upgrade database or mix WAL/SHM generations: doing so could roll back newer claims, sessions, revocations and account state. Rollback never undoes completed upstream claims or travel dispatches.

@@ -82,9 +82,10 @@ docker compose up -d --no-build
 ## 常见问题
 
 - **绑定域名后经 HTTPS 反代无法登录 WebUI？** 将对外来源加入 `admin_allowed_origins` 信任列表——见[管理 Origin 校验](docs/advanced.zh-CN.md#管理-origin--csrf-开关)。
-- **服务器没有 Docker？** 可用 Python 直接完成终端登录并运行网关——见[本地 Python 运行](docs/deployment.zh-CN.md#本地-python-运行)。
+- **没有 Docker？** 准备依赖和 WebUI 后，直接 `uv run converter.py` 或 `python3 converter.py`，无需 `.env`；首次本地启动保存默认 key 并仅在终端显示一次——见[本地 Python 运行](docs/deployment.zh-CN.md#本地-python-运行)。
 - **数据在哪里？** 全部位于 `auth/`（Docker 中为 `/data/auth`）：凭证、设置与日志数据库——见[数据与备份](docs/webui.zh-CN.md#数据与备份)。
 - **镜像标签怎么选？** `latest` 跟随稳定版，`edge` 跟随 main，版本标签固定某一发行版——见[使用已发布镜像](docs/deployment.zh-CN.md#使用已发布镜像)。
+- **Responses 工具输出/参数被压缩或需要完全原样？** 设置 `responses_projection_mode`（默认 `balanced`，设 `passthrough` 可完全关闭投影）及 `responses_projection_max_bytes`（默认 `40000`，`0` 禁用单项裁剪）。balanced 裁剪保留头尾并显示原始 bytes、估算 tokens 与总行数，客户端地址不变——见 [Responses 投影](docs/clients.zh-CN.md#responses-投影)及[详细说明](docs/advanced.zh-CN.md#responses-投影)。
 
 ## 免责声明
 

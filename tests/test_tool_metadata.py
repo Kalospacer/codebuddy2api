@@ -1,108 +1,101 @@
-"""Tool metadata retention and projection boundaries; synthetic requests only."""
+"""Responses projection keeps complete tool metadata in every supported mode."""
 import copy
-from itertools import product
+import json
 from pathlib import Path
 import sys
 import unittest
-from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-import converter
-from app.adapters.responses_projection import _project_schema, project_responses_chat_body
+from app.adapters.responses_projection import project_responses_chat_body
+
+
+SCHEMA = {
+    "type": "object",
+    "title": "Tool inputs",
+    "description": "Read sandbox inputs.",
+    "properties": {
+        "path": {
+            "type": "string", "title": "Path", "description": "A path.",
+            "enum": ["sandbox", "local"],
+        },
+        "list": {"type": "array", "items": {"type": "string", "description": "Item"}},
+        "choice": {"anyOf": [{"type": "string"}, {"type": "integer"}]},
+        "mapping": {"type": "object", "additionalProperties": {"type": "string"}},
+        "description": {"type": "string", "title": "A description property"},
+    },
+    "required": ["path"],
+    "additionalProperties": False,
+    "x-vendor": {"deep": {"schema": "must remain"}},
+}
 
 
 def tool_body(agentic=False):
-    schema = {
-        "type": "object", "title": "Tool inputs", "description": "Read sandbox inputs.",
-        "properties": {
-            "path": {"type": "string", "description": "Read a sandbox path.", "title": "Path", "enum": ["sandbox", "local"]},
-            "list": {"type": "array", "items": {"type": "string", "description": "Item description"}},
-            "choice": {"anyOf": [{"type": "string", "description": "Text choice"}, {"type": "integer", "title": "Number"}]},
-            "joined": {"allOf": [{"type": "string", "description": "Joined choice"}]},
-            "one": {"oneOf": [{"type": "string", "title": "One choice"}]},
-            "mapping": {"type": "object", "additionalProperties": {"type": "string", "description": "Map value"}},
-            "description": {"type": "string", "title": "A property named description"},
-        },
-        "required": ["path"], "additionalProperties": False,
-    }
     return {
-        "messages": [{"role": "system", "content": "You are a coding agent running in the Codex CLI." if agentic else "You are a helpful assistant."},
-                     {"role": "user", "content": "Read a file."}],
-        "tools": [{"type": "function", "function": {"name": "lookup_data", "description": "Read sandbox data without destructive changes.",
-                   "title": "Data reader", "parameters": schema, "strict": True}}],
+        "model": "auto",
+        "messages": [
+            {"role": "system", "content": (
+                "You are a coding agent running in the Codex CLI."
+                if agentic else "You are a helpful assistant."
+            )},
+            {"role": "user", "content": "Read a file."},
+        ],
+        "tools": [{
+            "type": "function",
+            "function": {
+                "name": "lookup_data",
+                "description": "Read sandbox data.",
+                "title": "Data reader",
+                "parameters": SCHEMA,
+                "strict": True,
+            },
+        }],
     }
-
-
-def metadata(value, path=()):
-    result = {}
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in ("description", "title") and isinstance(item, str):
-                result[path + (key,)] = item
-            result.update(metadata(item, path + (key,)))
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            result.update(metadata(item, path + (index,)))
-    return result
 
 
 class ToolMetadataTests(unittest.TestCase):
-    def test_projection_retains_annotations_in_both_modes_without_mutation(self):
-        for agentic, keep in product((False, True), repeat=2):
-            with self.subTest(agentic=agentic, keep=keep):
+    def test_balanced_and_passthrough_preserve_complete_tool_schema(self):
+        for agentic, mode in ((False, "balanced"), (True, "balanced"), (False, "passthrough"), (True, "passthrough")):
+            with self.subTest(agentic=agentic, mode=mode):
                 body = tool_body(agentic)
                 before = copy.deepcopy(body)
-                result, stats = project_responses_chat_body(body, keep_tool_metadata=keep)
-                self.assertEqual(stats["mode"], "aggressive" if agentic else "conservative")
-                self.assertEqual(metadata(result["tools"]), metadata(body["tools"]) if keep else {})
-                function = result["tools"][0]["function"]
-                schema = function["parameters"]
-                self.assertEqual(function["name"], "lookup_data")
-                self.assertIs(function["strict"], True)
-                self.assertEqual(schema["required"], ["path"])
-                self.assertIs(schema["additionalProperties"], False)
-                self.assertEqual(schema["properties"]["path"]["enum"], ["sandbox", "local"])
-                self.assertEqual(schema["properties"]["description"]["type"], "string")
+                result, stats = project_responses_chat_body(body, mode=mode)
                 self.assertEqual(body, before)
-                if not keep:
-                    self.assertEqual(project_responses_chat_body(body), (result, stats))
+                self.assertEqual(result["tools"], body["tools"])
+                self.assertEqual(result["messages"], body["messages"])
+                self.assertEqual(result["tools"][0]["function"]["parameters"], SCHEMA)
+                self.assertEqual(result["tools"][0]["function"]["description"], "Read sandbox data.")
+                self.assertEqual(result["tools"][0]["function"]["title"], "Data reader")
+                self.assertIs(result["tools"][0]["function"]["strict"], True)
+                self.assertEqual(stats["mode"], mode)
+                self.assertEqual(stats["original_tools"], stats["projected_tools"])
+                self.assertEqual(stats["original_tool_chars"], stats["projected_tool_chars"])
 
-    def test_retained_metadata_is_desensitized_independently_of_compaction(self):
+    def test_projection_does_not_mutate_nested_tool_structures(self):
         body = tool_body(agentic=True)
-        before = copy.deepcopy(body)
-        for keep, no_compact, force_compact in product((False, True), repeat=3):
-            with self.subTest(keep=keep, no_compact=no_compact, force_compact=force_compact), patch.dict(
-                    converter.CONFIG, {"desensitize": True, "keep_tool_metadata": keep, "no_compact": no_compact}):
-                result = converter._chat_body_desensitize(body, force_compact=force_compact)
-                values = metadata(result["tools"])
-                if keep:
-                    self.assertEqual({key: value.replace("\u200b", "") for key, value in values.items()}, metadata(body["tools"]))
-                    self.assertIn("\u200b", result["tools"][0]["function"]["description"])
-                else:
-                    self.assertEqual(values, {})
-                self.assertEqual(result["tools"][0]["function"]["parameters"]["properties"]["path"]["enum"], ["sandbox", "local"])
-                self.assertEqual(body, before)
-        with patch.dict(converter.CONFIG, {"desensitize": False, "keep_tool_metadata": True}):
-            self.assertEqual(converter._chat_body_desensitize(body), before)
+        before = json.dumps(body, sort_keys=True, ensure_ascii=False)
+        result, _ = project_responses_chat_body(body, max_item_bytes=0)
+        self.assertEqual(json.dumps(body, sort_keys=True, ensure_ascii=False), before)
+        self.assertEqual(result["tools"], body["tools"])
+        self.assertEqual(result["tools"][0]["function"]["parameters"], SCHEMA)
 
-    def test_metadata_only_schemas_keep_the_object_fallback(self):
-        for schema in ({}, {"description": "Hint"}, {"title": "Node", "$ref": "#/$defs/value"}):
-            with self.subTest(schema=schema):
-                base = _project_schema(schema)
-                retained = _project_schema(schema, keep_tool_metadata=True)
-                self.assertEqual(base, {"type": "object"})
-                self.assertEqual(retained, {"type": "object", **{key: value for key, value in schema.items() if key in ("description", "title")}})
-
-    def test_retention_does_not_expand_other_schema_projection_rules(self):
-        schema = {"type": "string", "description": "Hint", "const": "unchanged legacy projection"}
-        self.assertEqual(_project_schema(schema, keep_tool_metadata=True), {"type": "string", "description": "Hint"})
-        self.assertEqual(_project_schema(schema, depth=6, keep_tool_metadata=True), {"type": "object"})
-        branches = {"oneOf": [schema] * 8}
-        result = _project_schema(branches, keep_tool_metadata=True)
-        self.assertEqual(len(result["oneOf"]), 6)
-        self.assertTrue(all(item == {"type": "string", "description": "Hint"} for item in result["oneOf"]))
-        self.assertEqual(len(_project_schema([schema] * 8, keep_tool_metadata=True)), 6)
+    def test_stats_expose_tool_preservation_in_official_shape(self):
+        body = tool_body()
+        _, stats = project_responses_chat_body(body, mode="balanced", max_item_bytes=40000)
+        self.assertEqual(
+            set(stats),
+            {
+                "mode", "max_item_bytes", "original_messages", "projected_messages",
+                "original_message_chars", "projected_message_chars", "original_tools",
+                "projected_tools", "original_tool_chars", "projected_tool_chars",
+                "harness_messages_projected", "truncated_items", "truncated_original_bytes",
+                "truncated_projected_bytes",
+            },
+        )
+        self.assertEqual(stats["mode"], "balanced")
+        self.assertEqual(stats["max_item_bytes"], 40000)
+        self.assertEqual(stats["original_tools"], 1)
+        self.assertEqual(stats["projected_tools"], 1)
 
 
 if __name__ == "__main__":

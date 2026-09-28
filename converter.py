@@ -18,6 +18,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager, nullcontext
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -27,7 +28,7 @@ from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.exception_handlers import http_exception_handler as _default_http_exception_handler
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.concurrency import run_in_threadpool
-import uvicorn
+import uvicorn as uvicorn  # Keep the existing embedding/test hook.
 
 try:
     from app.desensitize import desensitize_body
@@ -41,7 +42,7 @@ from app.adapters.responses_adapter import (
     responses_request_to_chat,
     ResponsesStreamConverter,
 )
-from app.adapters.responses_projection import project_responses_chat_body
+from app.adapters.responses_projection import PROJECTION_MODES, project_responses_chat_body
 from app.adapters.anthropic_adapter import (
     anthropic_request_to_chat,
     AnthropicStreamConverter,
@@ -54,24 +55,28 @@ from app.credential_cooldowns import CredentialCooldowns
 from app.model_blocks import ModelBlocks
 from app.usage_snapshots import UsageSnapshots
 from app.client_hangup import ClientHungUp, await_or_hangup
-from app.observability import (AuditMiddleware, observe_recovery, observe_route,
-                               observe_usage, observe_attempt, observe_failure,
-                               observe_failure_seq)
+from app.observability import (AuditMiddleware, observe_recovery, observe_route, observe_stream_mode,
+                               observe_responses_projection, observe_usage, observe_attempt,
+                               observe_failure, observe_failure_seq)
 from app.credential_io import (CredentialFileError, read_import_file, atomic_write_credential,
                                credential_file_lock)
-from app.upstream_io import (ChatSSEAccumulator, UpstreamHTTPError, UpstreamResponseError,
-                             open_backend_stream, parse_retry_after, read_bounded_error)
+from app.upstream_io import (ChatSSEAccumulator, StreamOutputBudget, UpstreamHTTPError,
+                             UpstreamResponseError, open_backend_stream, parse_retry_after,
+                             read_bounded_error)
 from app.inference_resources import (AccountCapacity, InferenceResourcesMiddleware, inference_lifespan,
                                      request_resources, release_credential)
 from app.request_context import SessionIdentifierError, current_context
+from app.reasoning import resolve_reasoning_effort, thinking_mode
 from app import model_capabilities
 from app.message_normalization import merge_intl_user_images
+from app.adapters.chat_input import normalize_chat_messages
 from app.model_catalog_view import INTERNATIONAL as SHARED_INTL_PROFILES, share_models
 from app.inference_auth import require_api_key
 from app.admin_auth import SessionStoreError
 from app.content_filter import ContentFilterDetector, is_filter_error
 from app.request_limits import ImageLimitError, apply_image_policy
 from app.safe_logging import format_log_body, sanitize_log_text
+from app.startup import allows_open_noauth, load_startup_env, run_server
 from app.site_routing import (DOMESTIC, INTERNATIONAL, PROFILE_ENDPOINTS, site_for_auth, site_for_headers,
                               profile_for_auth, profile_for_headers, profile_region, profile_product,
                               profile_site, chat_url_for_headers, refresh_url_for_auth)
@@ -90,6 +95,38 @@ BACKEND = "https://copilot.tencent.com"
 DEFAULT_DOMAIN = "www.codebuddy.cn"
 CBC_VERSION = CLI_VERSION
 USER_AGENT = CLI_USER_AGENT
+
+_STREAM_MODES = ("compatible", "realtime")
+_REQUEST_POLICY_KEY = object()  # Process-local object key; never serializable or client injectable.
+
+
+@dataclass(frozen=True)
+class _StreamRequestPolicy:
+    mode: str
+    aggregate: bool
+    max_collect_bytes: int
+
+    @property
+    def realtime(self):
+        return self.mode == "realtime"
+
+
+def _snapshot_stream_policy(protocol: str, body: dict) -> _StreamRequestPolicy:
+    """Freeze hot streaming choices and memory policy for one request and all failovers."""
+    mode = CONFIG.get("stream_mode", "compatible")
+    if mode not in _STREAM_MODES:
+        raise ValueError("invalid stream mode")
+    compatible_aggregate = protocol == "responses" or bool(body.get("tools"))
+    return _StreamRequestPolicy(mode, mode == "compatible" and compatible_aggregate,
+                                max(0, int(CONFIG.get("max_collect_bytes", 0) or 0)))
+
+
+def _body_with_stream_policy(body: dict, policy: _StreamRequestPolicy) -> dict:
+    """Attach a process-local snapshot without exposing an upstream payload override."""
+    routed = dict(body)
+    routed[_REQUEST_POLICY_KEY] = policy
+    return routed
+
 
 # ---------------------------------------------------------------------------
 # Platform-specific credential directories
@@ -466,15 +503,15 @@ class CredentialPool:
     """Manage credential discovery, reloads, sticky sessions, cooldowns and refresh."""
 
     def __init__(self, paths: list[Path] | None = None, scan: bool = False,
-                 blocks_path: Path | None = None, cooldowns_path: Path | None = None):
+                 blocks_path: Path | None = None, cooldowns_path: Path | None = None, *, state_store=None):
         self._lock = threading.RLock()
         self._entries: list[dict] = []   # {id, cm, fail_until}
         self._sticky: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
         self._model_fail: dict[tuple[str, str], float] = {}  # Per-credential/model 429 expiry
         # Keep unsupported-model backoff isolated by backend and model.
-        self._blocks = ModelBlocks(blocks_path, ttl_s=MODEL_SITE_BLOCK_S, max_ttl_s=MODEL_SITE_BLOCK_MAX_S)
+        self._blocks = ModelBlocks(blocks_path, ttl_s=MODEL_SITE_BLOCK_S, max_ttl_s=MODEL_SITE_BLOCK_MAX_S, store=state_store)
         # Cooldowns outlive a restart so a backend that just refused is not retried immediately.
-        self._cooldowns = CredentialCooldowns(cooldowns_path)
+        self._cooldowns = CredentialCooldowns(cooldowns_path, store=state_store)
         self._storage_warned = 0.0   # Rate limit for persistence-failure warnings
         self._rr = {None: 0, "cn": 0, "intl": 0}
         self._ledger = None              # Prefer credits expiring sooner.
@@ -1739,7 +1776,8 @@ CONFIG: dict = {"api_key": "", "cred": None, "log_path": None, "ledger": None,
                 "max_collect_bytes": 8 * 1024 * 1024, "max_concurrent": 64,
                 "upstream_keepalive": False, "max_inflight_per_account": 0,
                 "request_context_mode": "legacy",
-                "model_capability_guard": True,
+                "stream_mode": "compatible", "model_capability_guard": True,
+                "responses_projection_mode": "balanced", "responses_projection_max_bytes": 40000,
                 "failover_max": 0,     # Credential failovers allowed before the first response byte
                 "retry_write_timeout": False,  # Opt-in replay after incomplete writes
                 "usage_daily": None,     # Usage aggregated by date and model
@@ -1753,48 +1791,19 @@ _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
 
 
 # ---------------------------------------------------------------------------
-# File logging
+# Runtime audit events
 # ---------------------------------------------------------------------------
 
-_LOG_LOCK = threading.Lock()
-LOG_MAX_BYTES = 50 * 1024 * 1024  # Rotation threshold; a single entry may exceed it.
-LOG_BACKUPS = 2                    # Retain the two most recent rotated logs.
 
 
 def _log(msg: str):
-    """Write bounded redacted logs with rotation under a shared lock."""
+    """Persist allowlisted runtime events in SQLite, never free-form text or secrets."""
     audit = CONFIG.get("audit_store")
     component = re.match(r"\[(cred|credits|models|usage|trial|housekeeper)\]", msg)
     if audit is not None and component:
         # Persist event codes, not free-form lines which may contain upstream data.
         code = "cooldown" if "熔断" in msg or "冷却" in msg else "failure" if "失败" in msg or "异常" in msg else "updated"
         audit.event("runtime", component.group(1), {"code": code})
-    path = CONFIG.get("log_path")
-    if not path:
-        return
-    budget = min(max(1024, CONFIG.get("log_body_limit", 65536) + 256), max(0, LOG_MAX_BYTES - 256))
-    msg = sanitize_log_text(msg, budget)
-    line = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n"
-    try:
-        with _LOG_LOCK:
-            try:
-                size = os.path.getsize(path)
-            except FileNotFoundError:
-                size = 0
-            rotated = size > 0 and size + len(line.encode("utf-8")) > LOG_MAX_BYTES
-            if rotated:
-                for i in range(LOG_BACKUPS - 1, 0, -1):
-                    old = f"{path}.{i}"
-                    if os.path.exists(old):
-                        os.replace(old, f"{path}.{i + 1}")
-                os.replace(path, f"{path}.1")
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-            with os.fdopen(fd, "a", encoding="utf-8", newline="\n") as stream:
-                if rotated:
-                    stream.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] ==== 日志轮转 ====\n")
-                stream.write(line)
-    except OSError:
-        pass  # Logging failures must not interrupt requests.
 
 
 def _log_json(label: str, value):
@@ -1881,21 +1890,28 @@ def _cred_for(payload: dict, model: str | None = None, *, region=None, tried=(),
 def _route_chat(payload, body, rid, *, tried=()):
     """Validate account capabilities and derive each routed body from canonical input."""
     context = current_context()
+    protocol = context.protocol if context is not None else "chat"
+    mode = thinking_mode(payload) if protocol == "messages" else None
     enabled = context.capability_guard if context is not None else CONFIG.get("model_capability_guard", True)
     cred = None
     try:
-        requirements = (model_capabilities.Requirements.from_request(
-            body, payload, context.protocol if context is not None else "chat") if enabled else None)
+        requirements = model_capabilities.Requirements.from_request(body, payload, protocol) if enabled else None
         cred, headers = _cred_for(payload, body.get("model"), tried=tried, requirements=requirements)
         profile = profile_for_headers(headers)
         routed_model = _upstream_model(body.get("model"), profile)
-        if requirements is not None and CONFIG.get("cred_pool") is None:
+        metadata = None
+        if mode in ("enabled", "adaptive") or (requirements is not None and CONFIG.get("cred_pool") is None):
             entry = {"profile": profile, "account_key": account_key(
                 profile, headers.get("X-User-Id"), headers.get("X-Enterprise-Id"))}
-            failures = requirements.violations(model_capabilities.entry_model(sys.modules[__name__], entry, body.get("model")))
+            metadata = model_capabilities.entry_model(sys.modules[__name__], entry, body.get("model"))
+        if requirements is not None and CONFIG.get("cred_pool") is None:
+            failures = requirements.violations(metadata)
             if failures:
                 raise model_capabilities.capability_error(failures)
         canonical = body
+        effort = resolve_reasoning_effort(body.get("reasoning_effort"), mode, metadata)
+        if effort != body.get("reasoning_effort"):
+            body = {**body, "reasoning_effort": effort}
         if routed_model != body.get("model"):
             body = {**body, "model": routed_model}
         body, merged_runs, merged_messages = merge_intl_user_images(body, profile)
@@ -2599,19 +2615,22 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     if not isinstance(messages, list) or not messages or any(not isinstance(message, dict) for message in messages):
         raise HTTPException(status_code=400, detail={"error": {
             "message": "messages must be a non-empty array of objects", "type": "invalid_request_error"}})
+    # Keep error paths tied to caller positions when the upstream system message moves.
+    message_indices = list(range(len(messages)))
     # Upstreams reject developer roles; copy them as system messages without changing content.
     messages = [
         dict(message, role="system") if message.get("role") == "developer" else message
         for message in messages
     ]
-    body["messages"] = messages
     if messages[0].get("role") != "system":
         system_index = next((index for index, message in enumerate(messages) if message.get("role") == "system"), None)
         if system_index is None:
             messages = [{"role": "system", "content": "You are a helpful assistant."}, *messages]
+            message_indices.insert(0, None)
         else:
             messages = [messages[system_index], *messages[:system_index], *messages[system_index + 1:]]
-        body["messages"] = messages
+            message_indices.insert(0, message_indices.pop(system_index))
+    body["messages"] = normalize_chat_messages(messages, message_indices=message_indices)
     _normalize_tool_choice(body)
     body["stream"] = True
     body.setdefault("stream_options", {"include_usage": True})
@@ -2620,12 +2639,18 @@ def _prepare_chat_body(body: dict, *, region=None, session_payload=None) -> dict
     return body
 
 
+def _upstream_chat_body(body: dict) -> dict:
+    """Exclude process-local metadata from both wire JSON and its byte budget."""
+    return {key: value for key, value in body.items()
+            if key is not _REQUEST_POLICY_KEY and not (isinstance(key, str) and key.startswith("_"))}
+
+
 def _guard_request_size(body: dict) -> int:
     """Validate and measure upstream JSON bytes without truncating text or tool arguments."""
     size = 0
     limit = CONFIG["max_request_bytes"]
     try:
-        for part in json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False).iterencode(body):
+        for part in json.JSONEncoder(ensure_ascii=False, separators=(",", ":"), allow_nan=False).iterencode(_upstream_chat_body(body)):
             size += len(part.encode("utf-8"))
             if size > limit:
                 _log(f"[limit] 请求体超限，拒绝请求 | limit_bytes={limit}")
@@ -2700,6 +2725,8 @@ async def chat_completions(request: Request,
     client_wants_stream = _client_wants_stream(payload)
     body = {k: payload[k] for k in PASSTHROUGH_BODY_KEYS if k in payload}
     body = await run_in_threadpool(_prepare_chat_body, body, session_payload=payload)
+    stream_policy = _snapshot_stream_policy("chat", body)
+    observe_stream_mode(stream_policy.mode)
 
     # Record request metadata.
     model_name = payload.get("model", "auto")
@@ -2718,14 +2745,15 @@ async def chat_completions(request: Request,
 
     if client_wants_stream:
         def attempt(routed, cred, headers, url):
-            return _stream_upstream(url, headers, routed, model_name, t0, rid, cred=cred)
+            return _stream_upstream(url, headers, _body_with_stream_policy(routed, stream_policy),
+                                    model_name, t0, rid, cred=cred)
         return _routed_stream(payload, prepared, model_name, rid, t0, attempt,
                               body, cred, headers, url)
 
     # Aggregate upstream SSE for non-streaming clients.
     async def fetch(routed, cred, headers, url):
         return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
-                                         filter_retry=True)
+                                         filter_retry=True, max_collect_bytes=stream_policy.max_collect_bytes)
     # Watch for disconnects across the entire failover sequence.
     try:
         collected = await await_or_hangup(
@@ -2808,39 +2836,94 @@ _TOOL_CALL_MAX_RETRY = 3
 
 
 def _tool_choice_satisfied(tool_calls, body):
+    calls = tool_calls or []
     choice = body.get("tool_choice")
     if choice == "none":
-        return not tool_calls
-    if choice != "required":
-        return True
-    names = {tool.get("function", {}).get("name") for tool in body.get("tools", [])
-             if isinstance(tool, dict) and isinstance(tool.get("function"), dict)}
-    return bool(tool_calls) and all(call.get("function", {}).get("name") in names for call in tool_calls)
+        return not calls
+    if choice == "required":
+        names = _declared_tool_names(body)
+        return bool(calls) and all(call.get("function", {}).get("name") in names for call in calls)
+    if isinstance(choice, dict):
+        name = (choice.get("function") or {}).get("name") if isinstance(choice.get("function"), dict) else None
+        return bool(calls) and all(call.get("function", {}).get("name") == name for call in calls)
+    return True
 
 
-def _tool_calls_healthy(tool_calls, body: dict | None = None) -> bool:
-    """Validate tool names and require arguments to encode a JSON object."""
-    if not tool_calls:
-        return True
-    names = {tool.get("function", {}).get("name") for tool in (body or {}).get("tools", [])
-             if isinstance(tool, dict) and isinstance(tool.get("function"), dict)} if body is not None else None
-    for tc in tool_calls:
-        if not isinstance(tc.get("id"), str) or not tc["id"].strip():
+def _declared_tool_names(body: dict) -> frozenset[str]:
+    """Extract declared function names for conservative realtime identity boundaries."""
+    names = set()
+    for tool in body.get("tools") or []:
+        if not isinstance(tool, dict):
+            continue
+        function = tool.get("function")
+        if isinstance(function, dict) and isinstance(function.get("name"), str):
+            names.add(function["name"])
+        elif isinstance(tool.get("name"), str):
+            names.add(tool["name"])
+    return frozenset(name for name in names if name)
+
+
+def _tool_calls_healthy(tool_calls, body: dict | None = None, *, require_declarations=False) -> bool:
+    """Validate unique calls, declared names and JSON-object arguments."""
+    calls = tool_calls or []
+    names = set(_declared_tool_names(body)) if body is not None else None
+    seen_ids = set()
+    for tc in calls:
+        if not isinstance(tc, dict):
             return False
+        call_id = tc.get("id")
+        if (not isinstance(call_id, str) or not call_id.strip()
+                or (require_declarations and call_id in seen_ids)
+                or (require_declarations and tc.get("type") != "function")):
+            return False
+        if not require_declarations:
+            seen_ids.add(call_id)
+        seen_ids.add(call_id)
         fn = tc.get("function") or {}
-        name = fn.get("name") or ""
-        if not name.strip() or not (fn.get("arguments") or "").strip():
+        if not isinstance(fn, dict):
             return False
-        # Valid JSON must still be an object; check names only when tools were declared.
-        if names and name not in names:
+        name = fn.get("name") or ""
+        arguments = fn.get("arguments") or ""
+        if not isinstance(name, str) or not name.strip() or not isinstance(arguments, str) or not arguments.strip():
+            return False
+        if names is not None and ((require_declarations or names) and name not in names):
             return False
         try:
-            arguments = json.loads(fn.get("arguments") or "")
-        except Exception:
+            decoded = json.loads(arguments)
+        except (TypeError, ValueError, UnicodeError, RecursionError):
             return False
-        if not isinstance(arguments, dict):
+        if not isinstance(decoded, dict):
             return False
+    if (require_declarations and body is not None
+            and body.get("parallel_tool_calls") is False and len(calls) > 1):
+        return False
     return True
+
+
+def _validate_realtime_tools(tool_calls, body: dict, finish_reason=None, *, filtered=False):
+    """Validate terminal state without regenerating or replaying the request.
+
+    Explicit refusal/filter and length results are incomplete upstream outcomes,
+    not malformed tool calls. Any tool bytes that are present still have to be
+    structurally healthy, but a required/named choice need not be satisfied when
+    the upstream legitimately stopped before producing a call.
+    """
+    if not _tool_calls_healthy(tool_calls, body, require_declarations=True):
+        healthy = False
+    elif finish_reason is None:
+        # Realtime success terminals require an explicit upstream completion
+        # marker; [DONE] alone remains compatible only on the legacy path.
+        healthy = False
+    elif filtered or finish_reason in ("length", "content_filter", "content-filter", "refusal"):
+        healthy = True
+    else:
+        healthy = (_tool_choice_satisfied(tool_calls, body)
+                   and (finish_reason == "tool_calls" if tool_calls else finish_reason != "tool_calls"))
+    if healthy:
+        return
+    raw = {"error": {"message": "Invalid upstream tool_calls", "type": "upstream_error",
+                     "code": "invalid_tool_calls"}}
+    raise UpstreamResponseError(502, json.dumps(raw).encode("utf-8"))
 
 
 def _merge_chat_sse_text(text: str) -> dict:
@@ -2935,7 +3018,7 @@ async def _backend_stream(url, headers, body, *, timeout=300, rid="", model_name
     try:
         resources = request_resources.get()
         clients = resources.clients if resources is not None and CONFIG.get("upstream_keepalive") else None
-        async with open_backend_stream(url, headers, body, read_timeout=timeout, on_retry=retry,
+        async with open_backend_stream(url, headers, _upstream_chat_body(body), read_timeout=timeout, on_retry=retry,
                                        retry_write_timeout=bool(CONFIG.get("retry_write_timeout")),
                                        clients=clients, headers_for_attempt=attempt_headers) as response:
             opened = True
@@ -2990,12 +3073,15 @@ def _hungup_response(rid, model_name, t0):
     return Response(status_code=204)
 
 
-async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *, filter_retry=False):
-    """Collect and validate replies with bounded tool repair and one eligible filter fallback."""
+async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *, filter_retry=False,
+                             max_collect_bytes=None):
+    """Collect with bounded repair and one eligible filter retry using a frozen request budget."""
     tool_attempt = 0
     filter_retried = False
+    collection_limit = (CONFIG.get("max_collect_bytes", 0) if max_collect_bytes is None
+                        else max_collect_bytes)
     while True:
-        accumulator = ChatSSEAccumulator(max_collect_bytes=CONFIG.get("max_collect_bytes", 0))
+        accumulator = ChatSSEAccumulator(max_collect_bytes=collection_limit)
         rejection = None
         async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
             if response.status_code != 200:
@@ -3052,37 +3138,62 @@ async def _fetch_checked_chat(url, headers, body, model_name, rid, cred=None, *,
                         total_tokens=discarded.get("total_tokens"))
         _log(f"[{rid}] tool_calls 损坏，重试 {tool_attempt}/{budget} | {model_name}")
 
-async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *, aggregate=False):
+async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
+                          policy=None, tracker=None, state=None):
     """Yield validated Chat SSE with bounded filter detection and no streaming filter retries."""
-    if aggregate:
-        result = await _fetch_checked_chat(url, headers, body, model_name, rid, cred)
+    policy = policy or _snapshot_stream_policy("chat", body)
+    if policy.aggregate:
+        result = await _fetch_checked_chat(
+            url, headers, body, model_name, rid, cred,
+            max_collect_bytes=policy.max_collect_bytes)
         for line in _chat_result_to_sse_lines(_completion_to_merged(result)):
             yield line
             yield ""
         _log_finish(model_name, t0, result, rid)
         return
-    tracker = ChatSSEAccumulator(collect=False)
+    if tracker is None:
+        tracker = ChatSSEAccumulator(
+            collect=False, retain_tools=policy.realtime,
+            budget=StreamOutputBudget(policy.max_collect_bytes))
+    if state is not None:
+        state["tracker"] = tracker
+
+    def completed():
+        merged = tracker.result(allow_empty_filter=policy.realtime)
+        if policy.realtime:
+            _validate_realtime_tools(
+                merged.get("tool_calls"), body, merged.get("finish_reason"),
+                filtered=tracker.filter_detector.detected)
+        if state is not None:
+            state["merged"] = merged
+        return merged
+
     preview = bytearray()
-    budget = CONFIG["log_body_limit"] if CONFIG.get("log_path") else 0
-    async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
-        if response.status_code != 200:
-            _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
-                                   headers=response.headers)
-        else:
-            _note_cred_model_ok(cred, body.get("model"))
-        async for line in response.aiter_lines():
-            tracker.feed_line(line)
-            if tracker.done or tracker.finish_reason:
-                tracker.result()  # Validate completion before emitting a success marker.
-            remaining = budget - len(preview)
-            if remaining > 0:
-                preview.extend((line[:remaining] + "\n").encode("utf-8")[:remaining])
-            yield line
-            if tracker.done:
-                yield ""
-                break
-    merged = tracker.result()
-    observe_usage(merged.get("usage") or {})
+    # Realtime output is never copied into the retired raw-text preview log.
+    budget = 0 if policy.realtime else (
+        CONFIG["log_body_limit"] if CONFIG.get("log_path") else 0)
+    try:
+        async with _backend_stream(url, headers, body, rid=rid, model_name=model_name) as response:
+            if response.status_code != 200:
+                _check_upstream_status(response.status_code, await read_bounded_error(response), cred, body.get("model"),
+                                       headers=response.headers)
+            else:
+                _note_cred_model_ok(cred, body.get("model"))
+            async for line in response.aiter_lines():
+                tracker.feed_line(line)
+                if tracker.done or tracker.finish_reason:
+                    completed()  # Never expose a success marker before terminal validation.
+                remaining = budget - len(preview)
+                if remaining > 0:
+                    preview.extend((line[:remaining] + "\n").encode("utf-8")[:remaining])
+                yield line
+                if tracker.done:
+                    yield ""
+                    break
+        merged = completed()
+    finally:
+        if tracker.usage:
+            observe_usage(tracker.usage)
     if tracker.filter_detector.detected:
         _note_content_filter(rid, model_name, final=True)
         return
@@ -3093,18 +3204,26 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
 
 async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
+    policy = body.pop(_REQUEST_POLICY_KEY, None) or _snapshot_stream_policy("chat", body)
+    if body.get("tools") and policy.mode == "compatible" and CONFIG.get("tool_stream_passthrough", True):
+        # Fork behavior: tool-bearing Chat streams forward frames by default; --tool-stream aggregate opts out.
+        policy = replace(policy, aggregate=False)
     sent = False
+    upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, policy=policy)
     try:
-        async for line in _chat_sse_lines(url, headers, body, model_name, t0, rid, cred,
-                                        aggregate=bool(body.get("tools"))
-                                        and not CONFIG.get("tool_stream_passthrough", True)):
-            sent = True
-            yield (_public_sse_line(line, model_name) + "\n").encode("utf-8")
-    except (httpx.HTTPError, UpstreamResponseError) as error:
-        if not sent:
-            raise      # Preserve the HTTP error while no response bytes have been sent.
-        status, raw = _upstream_failure(error, model_name, t0, rid)
-        yield _err_event(raw, status)
+        try:
+            async for line in upstream:
+                sent = True
+                yield (_public_sse_line(line, model_name) + "\n").encode("utf-8")
+        except (httpx.HTTPError, UpstreamResponseError) as error:
+            if not sent:
+                raise      # Preserve the HTTP error while no response bytes have been sent.
+            status, raw = _upstream_failure(error, model_name, t0, rid)
+            yield _err_event(raw, status)
+    finally:
+        # The inner generator may be suspended at a yielded line when its
+        # consumer reports an adapter error or a downstream disconnect.
+        await _close_stream(upstream)
 
 
 
@@ -3400,11 +3519,23 @@ async def create_response(request: Request,
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
     await run_in_threadpool(_bind_request_session, payload, chat_body)
-    chat_body, projection_stats = project_responses_chat_body(
-        chat_body, keep_tool_metadata=CONFIG.get("keep_tool_metadata", False))
+    projection_mode = CONFIG.get("responses_projection_mode", "balanced")
+    projection_max_bytes = int(CONFIG.get("responses_projection_max_bytes", 40000))
+    try:
+        chat_body, projection_stats = await run_in_threadpool(
+            project_responses_chat_body, chat_body, mode=projection_mode,
+            max_item_bytes=projection_max_bytes)
+    except UnicodeError:
+        raise HTTPException(status_code=400, detail={"error": {
+            "message": "request contains text that cannot be encoded as UTF-8",
+            "type": "invalid_request_error", "param": "input",
+            "code": "invalid_unicode"}}) from None
+    observe_responses_projection(projection_stats)
     chat_body = await run_in_threadpool(_prepare_chat_body, chat_body)
 
     client_wants_stream = _client_wants_stream(payload)
+    stream_policy = _snapshot_stream_policy("responses", chat_body)
+    observe_stream_mode(stream_policy.mode)
     model_name = payload.get("model", "auto")
     rid = _request_id()
     _log(f"[{rid}] ▶ RESPONSES {model_name} | stream={client_wants_stream} | input_items={len(payload.get('input', []))}")
@@ -3415,9 +3546,10 @@ async def create_response(request: Request,
         f"| chars {projection_stats.get('original_message_chars')}→{projection_stats.get('projected_message_chars')} "
         f"| tools {projection_stats.get('original_tools')}→{projection_stats.get('projected_tools')} "
         f"| tool_chars {projection_stats.get('original_tool_chars')}→{projection_stats.get('projected_tool_chars')} "
-        f"| summarized_history={projection_stats.get('summarized_history_messages', 0)} "
-        f"| dropped_harness={projection_stats.get('dropped_harness_messages', 0)} "
-        f"| anchor_user={projection_stats.get('anchor_user_preserved', False)}"
+        f"| harness_messages={projection_stats.get('harness_messages_projected', 0)} "
+        f"| truncated_items={projection_stats.get('truncated_items', 0)} "
+        f"| truncated_bytes={projection_stats.get('truncated_original_bytes', 0)}→"
+        f"{projection_stats.get('truncated_projected_bytes', 0)}"
     )
     # Keep blocking credential selection and refresh off the event loop.
     prepared = chat_body        # Preserve canonical input for routing policy checks.
@@ -3427,21 +3559,32 @@ async def create_response(request: Request,
 
     if client_wants_stream:
         def attempt(routed, cred, headers, url):
-            return _stream_responses(url, headers, routed, model_name, t0, rid, cred=cred)
-        return _routed_stream(payload, prepared, model_name, rid, t0, attempt,
-                              chat_body, cred, headers, url)
+            return _stream_responses(url, headers, _body_with_stream_policy(routed, stream_policy),
+                                     model_name, t0, rid, cred=cred)
+        response = _routed_stream(payload, prepared, model_name, rid, t0, attempt,
+                                    chat_body, cred, headers, url)
+        response.headers["X-CodeBuddy-Responses-Projection"] = projection_mode
+        return response
 
-    return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
-                                    payload=payload, canonical=prepared, request=request)
+    response = await _nonstream_adapted(
+        url, headers, chat_body, model_name, t0, rid, cred, payload=payload, canonical=prepared,
+        request=request, policy=stream_policy)
+    response.headers["X-CodeBuddy-Responses-Projection"] = projection_mode
+    return response
 
 
 async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, anthropic=False,
-                             payload=None, canonical=None, request=None):
-    converter = (AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name, parallel_tool_calls=body.get("parallel_tool_calls", True)))
+                             payload=None, canonical=None, request=None, policy=None):
+    policy = policy or _snapshot_stream_policy("messages" if anthropic else "responses", body)
+    tool_registry = body.get("_tool_registry")
+    converter = (AnthropicStreamConverter(model=model_name) if anthropic else
+                 ResponsesStreamConverter(model=model_name,
+                                          parallel_tool_calls=body.get("parallel_tool_calls", True),
+                                          tool_registry=tool_registry))
 
     async def fetch(routed, cred, headers, url):
         return await _fetch_checked_chat(url, headers, routed, model_name, rid, cred,
-                                         filter_retry=True)
+                                         filter_retry=True, max_collect_bytes=policy.max_collect_bytes)
     try:
         collected = await await_or_hangup(
             _routed_fetch(payload, body if canonical is None else canonical,
@@ -3462,35 +3605,84 @@ async def _nonstream_adapted(url, headers, body, model_name, t0, rid, cred, *, a
 
 async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *, anthropic=False):
     """Map protocol events while sharing connection, aggregation and failure handling."""
-    converter = (AnthropicStreamConverter(model=model_name) if anthropic else ResponsesStreamConverter(model=model_name, parallel_tool_calls=body.get("parallel_tool_calls", True)))
+    protocol = "messages" if anthropic else "responses"
+    policy = body.pop(_REQUEST_POLICY_KEY, None) or _snapshot_stream_policy(protocol, body)
+    tool_registry = body.get("_tool_registry")
+    state = {}
+    tracker = None
+    declared_names = _declared_tool_names(body)
+    if policy.realtime:
+        budget = StreamOutputBudget(policy.max_collect_bytes)
+        tracker = ChatSSEAccumulator(collect=False, retain_tools=True, budget=budget,
+                                     declared_names=declared_names)
+        converter = (AnthropicStreamConverter(model=model_name, realtime=True, budget=budget,
+                                              tool_states=tracker.tools, declared_names=declared_names)
+                     if anthropic else
+                     ResponsesStreamConverter(model=model_name,
+                                              parallel_tool_calls=body.get("parallel_tool_calls", True),
+                                              realtime=True, budget=budget, tool_states=tracker.tools,
+                                              declared_names=declared_names,
+                                              tool_registry=tool_registry))
+    else:
+        converter = (AnthropicStreamConverter(model=model_name) if anthropic else
+                     ResponsesStreamConverter(model=model_name,
+                                              parallel_tool_calls=body.get("parallel_tool_calls", True),
+                                              tool_registry=tool_registry))
     sent = False
+    upstream = _chat_sse_lines(
+        url, headers, body, model_name, t0, rid, cred,
+        policy=policy, tracker=tracker, state=state)
     try:
-        async for line in _chat_sse_lines(
-                url, headers, body, model_name, t0, rid, cred,
-                aggregate=not anthropic or bool(body.get("tools"))):
-            events = converter.feed_line(_public_sse_line(line, model_name))
+        try:
+            async for line in upstream:
+                events = converter.feed_line(_public_sse_line(line, model_name))
+                if events:
+                    sent = True
+                    yield events.encode("utf-8")
+            if policy.realtime:
+                converter.set_validated_tools((state.get("merged") or {}).get("tool_calls"))
+                if tracker.filter_detector.detected:
+                    converter.mark_content_filter()
+            events = converter.finish()
             if events:
                 sent = True
                 yield events.encode("utf-8")
-        events = converter.finish()
-        if events:
-            sent = True
-            yield events.encode("utf-8")
-    except (httpx.HTTPError, UpstreamResponseError) as error:
-        if not sent:
-            raise      # Preserve the HTTP error before any response bytes are sent.
-        status, raw = _upstream_failure(error, model_name, t0, rid)
-        event = {"type": "error", "error": {
-            "message": sanitize_log_text(raw.decode("utf-8", "replace"), 512),
-            "type": "api_error" if anthropic else "upstream_error", "code": status}}
-        prefix = "event: error\n" if anthropic else ""
-        yield (prefix + f"data: {json.dumps(event, ensure_ascii=False)}\n\n").encode("utf-8")
+        except (httpx.HTTPError, UpstreamResponseError) as error:
+            if not sent:
+                raise      # Preserve the HTTP error before any response bytes have been sent.
+            status, raw = _upstream_failure(error, model_name, t0, rid)
+            event = {"type": "error", "error": {
+                "message": sanitize_log_text(raw.decode("utf-8", "replace"), 512),
+                "type": "api_error" if anthropic else "upstream_error", "code": status}}
+            prefix = "event: error\n" if anthropic else ""
+            yield (prefix + f"data: {json.dumps(event, ensure_ascii=False)}\n\n").encode("utf-8")
+        except ValueError:
+            # Adapter metadata/append-only checks are protocol failures, not
+            # uncaught application errors after a response has opened.
+            failure = UpstreamResponseError(502, b'{"error":{"message":"Invalid upstream tool_calls",'
+                                                    b'"type":"upstream_error","code":"invalid_tool_calls"}}')
+            if not sent:
+                raise failure from None
+            status, raw = _upstream_failure(failure, model_name, t0, rid)
+            event = {"type": "error", "error": {
+                "message": sanitize_log_text(raw.decode("utf-8", "replace"), 512),
+                "type": "api_error" if anthropic else "upstream_error", "code": status}}
+            prefix = "event: error\n" if anthropic else ""
+            yield (prefix + f"data: {json.dumps(event, ensure_ascii=False)}\n\n").encode("utf-8")
+    finally:
+        # Close the nested Chat generator explicitly; do not wait for GC after
+        # an adapter error, disconnect or cancellation.
+        await _close_stream(upstream)
 
 
 async def _stream_responses(url: str, headers: dict, body: dict,
                             model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
-    async for chunk in _stream_adapted(url, headers, body, model_name, t0, rid, cred):
-        yield chunk
+    stream = _stream_adapted(url, headers, body, model_name, t0, rid, cred)
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await _close_stream(stream)
 
 
 # ---------------------------------------------------------------------------
@@ -3521,6 +3713,9 @@ async def create_message(request: Request,
         raise HTTPException(status_code=400, detail={"error": {"message": f"request conversion error: {e}", "type": "invalid_request_error"}})
 
     chat_body = await run_in_threadpool(_prepare_chat_body, chat_body, session_payload=payload)
+    client_wants_stream = _client_wants_stream(payload)
+    stream_policy = _snapshot_stream_policy("messages", chat_body)
+    observe_stream_mode(stream_policy.mode)
     model_name = payload.get("model", "auto")
     chat_messages = chat_body.get("messages", [])
     rid = _request_id()
@@ -3531,21 +3726,26 @@ async def create_message(request: Request,
     _log_json(f"[{rid}] ANTHROPIC → CHAT BODY (预览)", chat_body)
     t0 = time.time()
 
-    if not _client_wants_stream(payload):
+    if not client_wants_stream:
         return await _nonstream_adapted(url, headers, chat_body, model_name, t0, rid, cred,
                                         anthropic=True, payload=payload, canonical=prepared,
-                                        request=request)
+                                        request=request, policy=stream_policy)
 
     def attempt(routed, cred, headers, url):
-        return _stream_anthropic(url, headers, routed, model_name, t0, rid, cred=cred)
+        return _stream_anthropic(url, headers, _body_with_stream_policy(routed, stream_policy),
+                                 model_name, t0, rid, cred=cred)
     return _routed_stream(payload, prepared, model_name, rid, t0, attempt,
                           chat_body, cred, headers, url)
 
 
 async def _stream_anthropic(url: str, headers: dict, body: dict,
                             model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
-    async for chunk in _stream_adapted(url, headers, body, model_name, t0, rid, cred, anthropic=True):
-        yield chunk
+    stream = _stream_adapted(url, headers, body, model_name, t0, rid, cred, anthropic=True)
+    try:
+        async for chunk in stream:
+            yield chunk
+    finally:
+        await _close_stream(stream)
 
 
 @app.post("/v1/messages/count_tokens")
@@ -3673,6 +3873,14 @@ def _positive_int(value):
         raise argparse.ArgumentTypeError("必须为正整数")
     return number
 
+def _projection_bytes_arg(value):
+    number = _nonnegative_int(value)
+    if number != 0 and number < 256:
+        raise argparse.ArgumentTypeError("必须为 0 或至少 256")
+    if number > 33554432:
+        raise argparse.ArgumentTypeError("不能超过 33554432")
+    return number
+
 
 def _origins_arg(value):
     from app.settings import normalize_allowed_origins
@@ -3694,6 +3902,7 @@ def _boolean_arg(value):
 
 
 def main():
+    dotenv_keys = set() if any(arg in ("-h", "--help") for arg in sys.argv[1:]) else load_startup_env()
     ap = argparse.ArgumentParser(description="CodeBuddy -> OpenAI 兼容转换器（直连后端）")
     ap.add_argument("command", nargs="?", choices=("serve", "login"), default="serve",
                     help="serve 启动服务（默认）；login 扫码登录、自动轮询并保存账号")
@@ -3704,7 +3913,7 @@ def main():
     ap.add_argument("--host", default="127.0.0.1", help="监听地址；覆盖 CODEBUDDY2API_BIND")
     ap.add_argument("--port", type=int, default=8787, help="监听端口；覆盖 CODEBUDDY2API_PORT")
     ap.add_argument("--api-key", default=os.environ.get("CODEBUDDY2API_KEY", ""),
-                    help="可选：要求客户端携带的 API key（默认不校验）")
+                    help="管理与推理密钥；未配置时首次本地交互启动生成并保存")
     ap.add_argument("--admin-csrf", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_ADMIN_CSRF", "true"),
                     help="管理 Origin/CSRF 校验，默认 true；仅在受信任本地环境设为 false，鉴权仍启用")
@@ -3713,8 +3922,7 @@ def main():
                     help="额外信任的管理页来源（逗号分隔，支持域名或完整来源，裸域名按 https）；"
                          "反代 HTTPS 域名登录报 Origin 校验失败时设置，也可在 WebUI 配置")
     ap.add_argument("--log", default=None, metavar="PATH",
-                    help="额外写入兼容文本日志（如 --log converter.log 或 --log /tmp/cb.log）。"
-                         "不传仍记录 SQLite 审计，但不输出文本文件。")
+                    help="已停用：日志统一保存到数据目录中的 logs.sqlite3")
     ap.add_argument("--desensitize", action="store_true",
                     help="适配固定 CLI 模板、压缩运行时提示并零宽脱敏关键词。默认关闭。")
     ap.add_argument("--no-compact", action="store_true",
@@ -3723,6 +3931,12 @@ def main():
     ap.add_argument("--keep-tool-metadata", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_KEEP_TOOL_METADATA", "false"),
                     help="保留工具描述及参数 description/title；启用脱敏时仍处理描述文本，默认 false")
+    ap.add_argument("--responses-projection-mode", choices=PROJECTION_MODES,
+                    default=os.environ.get("CODEBUDDY2API_RESPONSES_PROJECTION_MODE", "balanced"),
+                    help="Responses 上下文：balanced 仅改写有固定摘要的已识别 harness，其余文本原样保留；passthrough 完全关闭投影；默认 balanced")
+    ap.add_argument("--responses-projection-max-bytes", type=_projection_bytes_arg, metavar="BYTES",
+                    default=os.environ.get("CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES", "40000"),
+                    help="Responses 单项 UTF-8 字节上限；0 禁用，非零范围 256..33554432，默认 40000")
     ap.add_argument("--skip-check", action="store_true", help="跳过启动预检")
     ap.add_argument("--auth-file", action="append", default=[], metavar="PATH",
                     help="凭据文件（可重复传入组成凭证池；默认自动扫描 auth 目录全部 *.info）")
@@ -3763,12 +3977,15 @@ def main():
     ap.add_argument("--request-context-mode", choices=("legacy", "scoped"),
                     default=os.environ.get("CODEBUDDY2API_REQUEST_CONTEXT_MODE", "legacy"),
                     help="请求上下文：legacy 保持旧会话头，scoped 启用显式会话与逐尝试追踪；默认 legacy")
+    ap.add_argument("--stream-mode", choices=_STREAM_MODES,
+                    default=os.environ.get("CODEBUDDY2API_STREAM_MODE", "compatible"),
+                    help="流式传输：compatible 保持兼容聚合策略，realtime 增量发送且不重生成工具参数；默认 compatible")
     ap.add_argument("--model-capability-guard", type=_boolean_arg, nargs="?", const=True,
                     default=os.environ.get("CODEBUDDY2API_MODEL_CAPABILITY_GUARD", "true"),
                     help="按账号模型声明预检图片、工具、思考和输出上限；false 仅关闭新增能力预检")
     ap.add_argument("--log-body-limit", type=_nonnegative_int, metavar="BYTES",
                     default=os.environ.get("CODEBUDDY2API_LOG_BODY_LIMIT", "65536"),
-                    help="每条正文日志的预览字节上限，默认 64 KiB；0 只记录摘要")
+                    help="旧文本预览兼容项；文本输出已停用，SQLite 诊断使用独立预算")
     ap.add_argument("--tool-call-max-retry", type=_nonnegative_int, metavar="N",
                     default=os.environ.get("CODEBUDDY2API_TOOL_CALL_MAX_RETRY", "3"),
                     help="工具参数损坏时的额外生成上限，默认 3；0 表示不重试（每次额外生成都消耗额度）")
@@ -3802,7 +4019,8 @@ def main():
     for key in ("max_images", "image_policy", "max_request_bytes", "log_body_limit",
                 "tool_call_max_retry", "max_inbound_bytes", "max_collect_bytes", "max_concurrent",
                 "failover_max", "retry_write_timeout", "upstream_keepalive", "max_inflight_per_account",
-                "request_context_mode", "model_capability_guard", "admin_allowed_origins"):
+                "request_context_mode", "stream_mode", "model_capability_guard", "admin_allowed_origins",
+                "responses_projection_mode", "responses_projection_max_bytes"):
         CONFIG[key] = getattr(args, key)
     CONFIG["api_key"] = args.api_key
     CONFIG["desensitize"] = args.desensitize
@@ -3811,30 +4029,28 @@ def main():
     CONFIG["usd_rate"] = args.usd_rate or None
     CONFIG["credit_price_usd"] = args.credit_price_usd or None
     CONFIG["model_guard"] = not args.no_model_guard
-    # File logging is enabled only when a path is configured.
-    CONFIG["log_path"] = args.log if args.log else os.environ.get("CODEBUDDY2API_LOG")
+    if args.log is not None or os.environ.get("CODEBUDDY2API_LOG"):
+        sys.stderr.write("[log] --log / CODEBUDDY2API_LOG 已停用；请在 WebUI 查看 SQLite 日志。\n")
+    CONFIG["log_path"] = None
     from app import runtime_management
-    runtime_management.initialize(sys.modules[__name__], args, parser=ap)
+    runtime_management.initialize(sys.modules[__name__], args, parser=ap, dotenv_keys=dotenv_keys)
     # Validate effective binding and authentication before credential scans or background work.
     if (args.host not in ("127.0.0.1", "::1", "localhost") and not CONFIG.get("api_key")
-            and os.environ.get("CODEBUDDY2API_ALLOW_OPEN_NOAUTH", "").lower() not in ("1", "true", "yes")):
+            and not allows_open_noauth()):
         runtime_management.close(CONFIG)
         ap.error("非回环绑定且未设置 API key 会匿名开放推理额度；"
                  "请设置 CODEBUDDY2API_KEY，或确知风险后以 CODEBUDDY2API_ALLOW_OPEN_NOAUTH=true 显式放行")
     files = [Path(p) for p in args.auth_file]
     if not files:
         seed_credentials()  # Seed missing desktop credentials into managed storage.
-    CONFIG["cred_pool"] = CredentialPool(files, scan=not files,
-                                         blocks_path=managed_auth_dir() / "model-site-blocks.json",
-                                         cooldowns_path=managed_auth_dir() / "credential-cooldowns.json")
-    CONFIG["usage_snapshots"] = UsageSnapshots(managed_auth_dir() / "usage-snapshots.json")
+    CONFIG["cred_pool"] = CredentialPool(files, scan=not files, state_store=CONFIG["state_store"])
+    CONFIG["usage_snapshots"] = UsageSnapshots(store=CONFIG["state_store"])
     CONFIG["cred"] = CONFIG["cred_pool"].first()
     CONFIG["account_catalogs"] = {}  # Disable static fallback before maintenance starts.
     if credits_mod is not None:
-        ledger = credits_mod.CreditLedger(managed_auth_dir() / "credits-ledger.json")
+        ledger = credits_mod.CreditLedger(store=CONFIG["state_store"])
         CONFIG["ledger"] = ledger
-        CONFIG["model_cache"] = credits_mod.ModelCatalogCache(
-            managed_auth_dir() / "model-catalog.json", ttl=args.model_catalog_ttl)
+        CONFIG["model_cache"] = credits_mod.ModelCatalogCache(ttl=args.model_catalog_ttl, store=CONFIG["state_store"])
         CONFIG["cred_pool"].set_ledger(ledger)  # Verify balance ownership before publishing catalogs.
     _publish_model_cache()
     # Publish cached usage before maintenance threads start, so the dashboard is populated from
@@ -3890,7 +4106,7 @@ def main():
     _log(f"==== converter 启动 ====")
 
     try:
-        uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+        run_server(app, CONFIG, host=args.host, port=args.port)
     finally:
         runtime_management.close(CONFIG)
 

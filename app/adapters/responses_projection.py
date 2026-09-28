@@ -1,709 +1,394 @@
-"""Compact trusted harness context, history and tools while preserving user text and images."""
+"""Apply optional Responses context projection without changing real user text."""
 
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from app.harness_context import parse_harness_text
+from app.output_truncation import TruncationResult, count_text_lines, truncate_middle_bytes
 
 
-AGENTIC_TOOL_NAMES = {
-    "exec_command",
-    "write_stdin",
-    "update_plan",
-    "request_user_input",
-    "view_image",
-    "get_goal",
-    "create_goal",
-    "update_goal",
-    "apply_patch",
-    "tool_search_tool",
-}
+PROJECTION_MODES = ("balanced", "passthrough")
+_TEXT_TYPES = {"text", "input_text", "output_text"}
 
-HARNESS_USER_MARKERS = (
-    "# AGENTS.md instructions",
-    "<environment_context>",
-    "<permissions instructions>",
-    "<collaboration_mode>",
-    "<skills_instructions>",
-    "<system-reminder>",
-    "# claudeMd",
-)
-
-HARNESS_SYSTEM_MARKERS = (
-    "You are a coding agent running in the Codex CLI",
-    "Within this context, Codex refers to",
-    "# AGENTS.md spec",
-    "<permissions instructions>",
-    "<collaboration_mode>",
-    "<skills_instructions>",
-    "The following deferred tools are now available via ToolSearch.",
-    "### Available skills",
-    "## request_user_input availability",
-    "You are Claude Code",
-)
-
-BASE_SYSTEM_PROMPT = (
-    "You are a coding assistant serving an OpenAI-compatible CLI. "
-    "Be precise, concise, safe, and action-oriented. "
-    "Use available tools when needed, follow repository instructions and durable user context, "
-    "and continue from the preserved recent context. "
-    "If earlier history was condensed, rely on the preserved recent messages and rerun tools when exact old details are required."
-)
-
-HISTORY_PREFIX = "Earlier conversation summary (condensed):"
-
-MAX_SYSTEM_GUIDANCE_CHARS = 1200
-MAX_USER_CONTEXT_CHARS = 3200
-MAX_ASSISTANT_CHARS = 1800
-MAX_TOOL_OUTPUT_CHARS = 1600
-MAX_TOOL_ARGS_CHARS = 900
-MAX_HISTORY_SUMMARY_CHARS = 2200
-MAX_HISTORY_ITEMS = 10
-MAX_TAIL_MESSAGES = 8
-MAX_TAIL_CHARS = 7000
-
-SCHEMA_KEEP_KEYS = {
-    "type",
-    "properties",
-    "required",
-    "items",
-    "enum",
-    "oneOf",
-    "anyOf",
-    "allOf",
-    "additionalProperties",
-    "format",
-    "minimum",
-    "maximum",
-    "minItems",
-    "maxItems",
-    "minLength",
-    "maxLength",
-    "nullable",
-}
+_JSON_OVERHEAD_RESERVE = 256
+_MAX_TOOL_ARGUMENTS_PARSE_BYTES = 1024 * 1024
+_MAX_WRAPPER_EDGE_BYTES = 8192
+_JSON_QUOTE_OR_NONSTANDARD = re.compile(r'"|NaN|-?Infinity')
 
 
-def project_responses_chat_body(body: dict, *, keep_tool_metadata: bool = False) -> tuple[dict, dict]:
-    """Project a Responses-derived Chat body into bounded upstream context."""
-    projected = dict(body)
+class _InvalidJsonConstant(ValueError):
+    pass
+
+
+def _reject_json_constant(value: str) -> None:
+    raise _InvalidJsonConstant(f"unsupported JSON constant: {value}")
+
+
+def _find_unescaped_quote(text: str, start: int) -> int:
+    """Find the next unescaped quote without copying the string."""
+    cursor = start
+    while True:
+        quote = text.find('"', cursor)
+        if quote < 0:
+            return -1
+        slash = quote - 1
+        backslashes = 0
+        while slash >= start and text[slash] == "\\":
+            backslashes += 1
+            slash -= 1
+        if backslashes % 2 == 0:
+            return quote
+        cursor = quote + 1
+
+
+def _contains_nonstandard_json_constant(text: str) -> bool:
+    """Detect bare non-standard JSON constants without materializing parsed data."""
+    cursor = 0
+    while True:
+        match = _JSON_QUOTE_OR_NONSTANDARD.search(text, cursor)
+        if match is None:
+            return False
+        if text[match.start()] != '"':
+            return True
+        quote = _find_unescaped_quote(text, match.end())
+        if quote < 0:
+            return False
+        cursor = quote + 1
+
+
+def project_responses_chat_body(
+    body: dict,
+    *,
+    mode: str = "balanced",
+    max_item_bytes: int = 40000,
+) -> tuple[dict, dict]:
+    """Project a Responses-derived Chat body or return it unchanged."""
+    if mode not in PROJECTION_MODES:
+        raise ValueError("invalid Responses projection mode")
+    if isinstance(max_item_bytes, bool) or not isinstance(max_item_bytes, int) or max_item_bytes < 0:
+        raise ValueError("max_item_bytes must be a non-negative integer")
+    if 0 < max_item_bytes < 256:
+        raise ValueError("max_item_bytes must be 0 or at least 256")
+
     messages = list(body.get("messages") or [])
     tools = list(body.get("tools") or [])
-
-    projected_tools, tool_stats = _project_tools(tools, keep_tool_metadata=keep_tool_metadata)
-    if projected_tools:
-        projected["tools"] = projected_tools
-    elif "tools" in projected:
-        projected["tools"] = []
-
-    # Image history must not disappear into a text-only summary or harness filter.
-    has_images = any(isinstance(msg, dict) and _has_image_content(msg.get("content"))
-                     for msg in messages)
-    aggressive = _looks_like_agentic_cli(messages, tools) and not has_images
-    if not aggressive:
-        projected["messages"] = _project_messages_conservative(messages)
-        return projected, {
-            "mode": "conservative",
-            "aggressive": False,
-            "original_messages": len(messages),
-            "projected_messages": len(projected["messages"]),
-            "original_message_chars": _messages_size(messages),
-            "projected_message_chars": _messages_size(projected["messages"]),
-            **tool_stats,
-        }
-
-    tool_name_by_call_id = _build_tool_call_name_map(messages)
-    preserved_guidance: list[dict] = []
-    conversation: list[dict] = []
-    # Provenance stays outside the wire messages; summaries are not new user turns.
-    context_only_indices: set[int] = set()
-    dropped_harness_messages = 0
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        role = msg.get("role")
-        if role in {"system", "user"}:
-            limit = MAX_SYSTEM_GUIDANCE_CHARS if role == "system" else MAX_USER_CONTEXT_CHARS
-            content, matched, has_user_text = _project_harness_content(msg.get("content", ""), limit)
-            dropped_harness_messages += int(matched)
-            projected_msg = {**msg, "content": content}
-            if role == "system":
-                # Custom guidance has no shared metadata budget or message-count cap.
-                preserved_guidance.append(projected_msg)
-                continue
-            if matched and not has_user_text:
-                context_only_indices.add(len(conversation))
-        else:
-            projected_msg = _project_conversation_message(msg)
-        if projected_msg is not None:
-            conversation.append(projected_msg)
-
-    tail_start = _choose_tail_start(conversation)
-    tail_start = _expand_tail_for_tool_context(conversation, tail_start)
-    latest_user_idx = _latest_user_index(conversation, context_only_indices)
-
-    anchor_user = None
-    if latest_user_idx is not None and latest_user_idx < tail_start:
-        anchor_user = dict(conversation[latest_user_idx])
-
-    omitted: list[dict] = []
-    omitted_context_indices: set[int] = set()
-    for idx, msg in enumerate(conversation):
-        if idx >= tail_start:
-            break
-        if latest_user_idx is not None and idx == latest_user_idx and anchor_user is not None:
-            continue
-        if idx in context_only_indices:
-            omitted_context_indices.add(len(omitted))
-        omitted.append(msg)
-
-    final_messages: list[dict] = [{"role": "system", "content": BASE_SYSTEM_PROMPT}]
-    final_messages.extend(preserved_guidance)
-
-    history_summary = _build_history_summary(omitted, tool_name_by_call_id, omitted_context_indices)
-    if history_summary:
-        final_messages.append({"role": "system", "content": history_summary})
-
-    if anchor_user is not None:
-        final_messages.append(anchor_user)
-
-    final_messages.extend(conversation[tail_start:])
-    projected["messages"] = final_messages
-
-    return projected, {
-        "mode": "aggressive",
-        "aggressive": True,
-        "dropped_harness_messages": dropped_harness_messages,
-        "preserved_guidance_messages": len(preserved_guidance),
-        "summarized_history_messages": len(omitted),
-        "anchor_user_preserved": anchor_user is not None,
-        "tail_messages": len(conversation[tail_start:]),
-        "original_messages": len(messages),
-        "projected_messages": len(final_messages),
-        "original_message_chars": _messages_size(messages),
-        "projected_message_chars": _messages_size(final_messages),
-        **tool_stats,
+    counters = {
+        "harness_messages_projected": 0,
+        "truncated_items": 0,
+        "truncated_original_bytes": 0,
+        "truncated_projected_bytes": 0,
     }
-
-
-def _looks_like_agentic_cli(messages: list[dict], tools: list[dict]) -> bool:
-    tool_names = {
-        _tool_name(tool)
-        for tool in tools
-        if _tool_name(tool)
-    }
-    if tool_names & AGENTIC_TOOL_NAMES:
-        return True
-
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        text = _content_to_text(msg.get("content", ""))
-        if _looks_like_harness_user(text) or _looks_like_harness_system(text):
-            return True
-    return False
-
-
-def _project_messages_conservative(messages: list[dict]) -> list[dict]:
-    out: list[dict] = []
-    for msg in messages:
-        projected = _project_conversation_message(msg, conservative=True)
-        if projected is not None:
-            out.append(projected)
-    return out
-
-
-def _project_conversation_message(msg: dict, conservative: bool = False) -> dict | None:
-    if not isinstance(msg, dict):
-        return None
-
-    role = msg.get("role")
-    out = dict(msg)
-
-    if role in {"system", "user"}:
-        limit = MAX_SYSTEM_GUIDANCE_CHARS if role == "system" else MAX_USER_CONTEXT_CHARS
-        out["content"], _, _ = _project_harness_content(msg.get("content", ""), limit)
-        return out
-
-    if role == "assistant":
-        out["content"] = _project_content(msg.get("content", ""),
-                                          lambda text: _summarize_free_text(text, MAX_ASSISTANT_CHARS))
-        tool_calls = []
-        for tool_call in msg.get("tool_calls") or []:
-            projected_call = _project_tool_call(tool_call)
-            if projected_call is not None:
-                tool_calls.append(projected_call)
-        if tool_calls:
-            out["tool_calls"] = tool_calls
-        elif "tool_calls" in out:
-            out.pop("tool_calls", None)
-        return out
-
-    if role == "tool":
-        out["content"] = _project_content(msg.get("content", ""), _summarize_tool_output)
-        return out
-
-    if conservative:
-        out["content"] = _project_content(msg.get("content", ""),
-                                          lambda text: _truncate_text(text, MAX_ASSISTANT_CHARS))
-        return out
-
-    return None
-
-
-def _has_image_content(content: Any) -> bool:
-    return isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("type") == "image_url" for block in content
-    )
-
-
-def _project_content(content: Any, transform) -> Any:
-    """Keep content blocks and their order, including text-only block lists."""
-    if not isinstance(content, list):
-        return transform(_content_to_text(content))
-    return [
-        {**block, "text": transform(block.get("text", ""))}
-        if isinstance(block, dict) and block.get("type") == "text"
-        else transform(block) if isinstance(block, str) else block
-        for block in content
-    ]
-
-
-def _project_harness_content(content: Any, context_limit: int) -> tuple[Any, bool, bool]:
-    """Budget recognized context within each block; preserve real text, images and unknown blocks."""
-    matched = False
-    has_user_text = isinstance(content, list) and any(
-        isinstance(block, dict) and block.get("type") != "text" for block in content
-    )
-    remaining = context_limit
-
-    def budget_context(text: str) -> str:
-        nonlocal remaining
-        if remaining <= 0:
-            return ""
-        if len(text) <= remaining:
-            result = text
-        else:
-            suffix = f" ... [{len(text)} context chars condensed]"
-            result = text[:max(0, remaining - len(suffix))] + suffix[:remaining]
-        remaining -= len(result)
-        return result
-
-    def project_text(text: str) -> str:
-        nonlocal matched, has_user_text
-        parsed = parse_harness_text(text)
-        matched = matched or parsed.matched
-        has_user_text = has_user_text or bool(parsed.user_text.strip())
-        return parsed.render(context_transform=budget_context)
-
-    projected = _project_content(content, project_text)
-    return projected, matched, has_user_text
-
-
-def _project_tool_call(tool_call: dict) -> dict | None:
-    if not isinstance(tool_call, dict):
-        return None
-
-    function = tool_call.get("function") or {}
-    name = function.get("name", "")
-    arguments = function.get("arguments", "")
-
-    return {
-        "id": tool_call.get("id"),
-        "type": tool_call.get("type", "function"),
-        "function": {
-            "name": name,
-            "arguments": _summarize_tool_arguments(name, arguments),
-        },
-    }
-
-
-def _summarize_tool_arguments(name: str, arguments: Any) -> str:
-    if not isinstance(arguments, str):
-        try:
-            return json.dumps(arguments, ensure_ascii=False)
-        except Exception:
-            return json.dumps({"summary": _truncate_text(str(arguments), 240)}, ensure_ascii=False)
-
-    if len(arguments) <= MAX_TOOL_ARGS_CHARS:
-        return arguments
-
-    if name == "apply_patch":
-        return json.dumps(
-            {"summary": "Large apply_patch payload omitted; a patch was prepared or applied in a previous step."},
-            ensure_ascii=False,
-        )
-
-    try:
-        parsed = json.loads(arguments)
-    except Exception:
-        return json.dumps({"summary": _truncate_text(arguments, 320)}, ensure_ascii=False)
-
-    return json.dumps(_shrink_json_value(parsed), ensure_ascii=False)
-
-
-def _shrink_json_value(value: Any, depth: int = 0, key: str = "") -> Any:
-    if depth >= 4:
-        return "<omitted>"
-
-    if isinstance(value, dict):
-        out = {}
-        items = list(value.items())
-        for idx, (item_key, item_value) in enumerate(items):
-            if idx >= 12:
-                out["_omitted_keys"] = len(items) - idx
-                break
-            out[item_key] = _shrink_json_value(item_value, depth + 1, item_key)
-        return out
-
-    if isinstance(value, list):
-        trimmed = [_shrink_json_value(item, depth + 1, key) for item in value[:6]]
-        if len(value) > 6:
-            trimmed.append(f"<omitted {len(value) - 6} items>")
-        return trimmed
-
-    if isinstance(value, str):
-        limit = 240 if key in {"cmd", "chars", "patch", "content", "text", "question"} else 120
-        return _truncate_text(value, limit)
-
-    return value
-
-
-def _project_tools(tools: list[dict], *, keep_tool_metadata: bool = False) -> tuple[list[dict], dict]:
-    projected = []
-    original_chars = _tools_size(tools)
-
-    for tool in tools:
-        if not isinstance(tool, dict):
-            continue
-
-        if tool.get("type") != "function":
-            continue
-
-        function = tool.get("function") or tool
-        name = function.get("name")
-        if not name:
-            continue
-
-        projected_function: dict[str, Any] = {"name": name}
-        if keep_tool_metadata:
-            for key in ("description", "title"):
-                if isinstance(function.get(key), str):
-                    projected_function[key] = function[key]
-        if "parameters" in function:
-            projected_function["parameters"] = _project_schema(
-                function.get("parameters"), keep_tool_metadata=keep_tool_metadata)
-        if "strict" in function:
-            projected_function["strict"] = function.get("strict")
-
-        projected.append({"type": "function", "function": projected_function})
-
-    return projected, {
-        "original_tools": len(tools),
-        "projected_tools": len(projected),
-        "original_tool_chars": original_chars,
-        "projected_tool_chars": _tools_size(projected),
-    }
-
-
-def _project_schema(schema: Any, depth: int = 0, *, keep_tool_metadata: bool = False) -> Any:
-    if depth >= 6:
-        return {"type": "object"}
-
-    if isinstance(schema, dict):
-        out: dict[str, Any] = {}
-        for key, value in schema.items():
-            if key not in SCHEMA_KEEP_KEYS:
-                if keep_tool_metadata and key in ("description", "title") and isinstance(value, str):
-                    out[key] = value
-                continue
-            if key == "properties" and isinstance(value, dict):
-                out["properties"] = {
-                    prop: _project_schema(prop_schema, depth + 1, keep_tool_metadata=keep_tool_metadata)
-                    for prop, prop_schema in value.items()
-                }
-            elif key == "items":
-                out["items"] = _project_schema(value, depth + 1, keep_tool_metadata=keep_tool_metadata)
-            elif key in {"oneOf", "anyOf", "allOf"} and isinstance(value, list):
-                out[key] = [_project_schema(item, depth + 1, keep_tool_metadata=keep_tool_metadata) for item in value[:6]]
-            elif key == "additionalProperties" and isinstance(value, dict):
-                out[key] = _project_schema(value, depth + 1, keep_tool_metadata=keep_tool_metadata)
-            else:
-                out[key] = value
-        # Annotations must not change the historical empty-schema object fallback.
-        return out if any(key in SCHEMA_KEEP_KEYS for key in out) else {"type": "object", **out}
-
-    if isinstance(schema, list):
-        return [_project_schema(item, depth + 1, keep_tool_metadata=keep_tool_metadata) for item in schema[:6]]
-
-    return schema
-
-
-def _choose_tail_start(messages: list[dict]) -> int:
-    if not messages:
-        return 0
-
-    start = len(messages) - 1
-    total_chars = 0
-    kept = 0
-
-    for idx in range(len(messages) - 1, -1, -1):
-        cost = _message_cost(messages[idx])
-        if kept > 0 and (kept >= MAX_TAIL_MESSAGES or total_chars + cost > MAX_TAIL_CHARS):
-            break
-        start = idx
-        total_chars += cost
-        kept += 1
-    return start
-
-
-def _expand_tail_for_tool_context(messages: list[dict], start: int) -> int:
-    if start <= 0 or not messages:
-        return start
-
-    needed_call_ids = {
-        msg.get("tool_call_id")
-        for msg in messages[start:]
-        if isinstance(msg, dict) and msg.get("role") == "tool" and msg.get("tool_call_id")
-    }
-    if not needed_call_ids:
-        return start
-
-    expanded = start
-    for idx in range(start - 1, -1, -1):
-        msg = messages[idx]
-        if msg.get("role") != "assistant":
-            continue
-        call_ids = {
-            tool_call.get("id")
-            for tool_call in msg.get("tool_calls") or []
-            if isinstance(tool_call, dict)
-        }
-        if call_ids & needed_call_ids:
-            expanded = idx
-            needed_call_ids -= call_ids
-            if not needed_call_ids:
-                break
-    return expanded
-
-
-def _latest_user_index(messages: list[dict], context_only_indices: set[int]) -> int | None:
-    for idx in range(len(messages) - 1, -1, -1):
-        if messages[idx].get("role") == "user" and idx not in context_only_indices:
-            return idx
-    return None
-
-
-def _build_history_summary(messages: list[dict], tool_name_by_call_id: dict[str, str],
-                           context_only_indices: set[int]) -> str:
-    lines: list[str] = []
-    total_chars = 0
-    summarized = 0
-
-    for idx, msg in enumerate(messages):
-        line = _history_line(msg, tool_name_by_call_id, idx in context_only_indices)
-        if not line:
-            continue
-        if summarized >= MAX_HISTORY_ITEMS or total_chars + len(line) > MAX_HISTORY_SUMMARY_CHARS:
-            break
-        lines.append(f"- {line}")
-        total_chars += len(line)
-        summarized += 1
-
-    remaining = len(messages) - summarized
-    if remaining > 0:
-        lines.append(f"- {remaining} earlier messages or tool results were further condensed.")
-
-    if not lines:
-        return ""
-    return HISTORY_PREFIX + "\n" + "\n".join(lines)
-
-
-def _history_line(msg: dict, tool_name_by_call_id: dict[str, str], context_only: bool = False) -> str:
-    role = msg.get("role")
-    text = _content_to_text(msg.get("content", ""))
-
-    if role == "user":
-        label = "Harness context" if context_only else "User asked"
-        return f"{label}: {_truncate_text(text, 220)}"
-
-    if role == "assistant":
-        tool_names = [
-            (tool_call.get("function") or {}).get("name")
-            for tool_call in msg.get("tool_calls") or []
-            if isinstance(tool_call, dict)
+    projected = dict(body)
+
+    if mode == "passthrough":
+        projected_messages = messages
+    else:
+        projected_messages = [
+            _project_message(message, max_item_bytes, counters) for message in messages
         ]
-        tool_names = [name for name in tool_names if name]
-        if text and tool_names:
-            return f"Assistant replied: {_truncate_text(text, 160)} Then called tools: {', '.join(tool_names[:4])}."
-        if tool_names:
-            return f"Assistant called tools: {', '.join(tool_names[:4])}."
-        if text:
-            return f"Assistant replied: {_truncate_text(text, 180)}"
+
+    if "messages" in body:
+        projected["messages"] = projected_messages
+    if "tools" in body:
+        projected["tools"] = tools
+
+    return projected, {
+        "mode": mode,
+        "max_item_bytes": max_item_bytes,
+        "original_messages": len(messages),
+        "projected_messages": len(projected_messages),
+        "original_message_chars": _messages_size(messages),
+        "projected_message_chars": _messages_size(projected_messages),
+        "original_tools": len(tools),
+        "projected_tools": len(tools),
+        "original_tool_chars": _tools_size(tools),
+        "projected_tool_chars": _tools_size(tools),
+        **counters,
+    }
+
+
+def _project_message(message: Any, max_item_bytes: int, counters: dict[str, int]) -> Any:
+    if not isinstance(message, dict):
+        return message
+
+    role = message.get("role")
+    projected = dict(message)
+    if role in {"system", "user"}:
+        content, changed = _map_text_content(
+            message.get("content", ""),
+            lambda text: _project_instruction_text(text),
+        )
+        projected["content"] = content
+        counters["harness_messages_projected"] += int(changed)
+    elif role == "assistant":
+        projected["content"] = _project_generated_content(
+            message.get("content", ""), max_item_bytes, counters
+        )
+        if "tool_calls" in message:
+            projected["tool_calls"] = [
+                _project_tool_call(call, max_item_bytes, counters)
+                for call in message.get("tool_calls") or []
+            ]
+    elif role == "tool":
+        projected["content"] = _project_generated_content(
+            message.get("content", ""), max_item_bytes, counters
+        )
+    return projected
+
+
+def _project_instruction_text(text: str) -> str:
+    parsed = parse_harness_text(text)
+    return parsed.render() if parsed.matched else text
+
+
+def _project_generated_content(content: Any, max_item_bytes: int, counters: dict[str, int]) -> Any:
+    transformed, _ = _map_text_content(
+        content,
+        lambda text: _truncate_generated_text(text, max_item_bytes, counters),
+    )
+    return transformed
+
+
+def _truncate_generated_text(text: str, max_item_bytes: int, counters: dict[str, int]) -> str:
+    result = truncate_middle_bytes(text, max_item_bytes)
+    if result.truncated:
+        _record_truncation(result, counters)
+    return result.text
+
+
+def _map_text_content(content: Any, transform) -> tuple[Any, bool]:
+    if isinstance(content, str):
+        projected = transform(content)
+        return projected, projected != content
+    if not isinstance(content, list):
+        return content, False
+
+    projected = []
+    changed = False
+    for block in content:
+        replacement = block
+        if isinstance(block, str):
+            replacement = transform(block)
+        elif isinstance(block, dict) and block.get("type") in _TEXT_TYPES and isinstance(block.get("text"), str):
+            replacement = {**block, "text": transform(block["text"])}
+        changed = changed or replacement is not block and replacement != block
+        projected.append(replacement)
+    return (projected if changed else content), changed
+
+
+def _project_tool_call(tool_call: Any, max_item_bytes: int, counters: dict[str, int]) -> Any:
+    if not isinstance(tool_call, dict) or not isinstance(tool_call.get("function"), dict):
+        return tool_call
+
+    projected = dict(tool_call)
+    function = dict(tool_call["function"])
+    arguments = function.get("arguments")
+    if not isinstance(arguments, str):
+        raise ValueError("tool call arguments must be a JSON string")
+    if max_item_bytes == 0:
+        return projected
+    argument_bytes = len(arguments.encode("utf-8"))
+    if argument_bytes > _MAX_TOOL_ARGUMENTS_PARSE_BYTES:
+        if (argument_bytes <= max_item_bytes
+                and not _contains_nonstandard_json_constant(arguments)):
+            return projected
+        function["arguments"] = _truncate_json_argument_text(arguments, max_item_bytes, counters)
+        projected["function"] = function
+        return projected
+    try:
+        decoded = json.loads(arguments, parse_constant=_reject_json_constant)
+    except _InvalidJsonConstant:
+        function["arguments"] = _truncate_json_argument_text(arguments, max_item_bytes, counters)
+        projected["function"] = function
+        return projected
+    except (TypeError, ValueError, RecursionError):
+        if argument_bytes <= max_item_bytes:
+            return projected
+        function["arguments"] = _truncate_json_argument_text(arguments, max_item_bytes, counters)
+        projected["function"] = function
+        return projected
+    if _compact_json(decoded) is None:
+        function["arguments"] = _truncate_json_argument_text(arguments, max_item_bytes, counters)
+        projected["function"] = function
+        return projected
+    if argument_bytes <= max_item_bytes:
+        return projected
+    string_limit = max(256, max_item_bytes - _JSON_OVERHEAD_RESERVE)
+    trial_counters = {
+        "truncated_items": 0,
+        "truncated_original_bytes": 0,
+        "truncated_projected_bytes": 0,
+    }
+    projected_value, changed = _truncate_json_strings(decoded, string_limit, trial_counters)
+    serialized = _compact_json(projected_value)
+    if serialized is not None and len(serialized.encode("utf-8")) <= max_item_bytes:
+        if changed or serialized != arguments:
+            function["arguments"] = serialized
+            projected["function"] = function
+            _merge_counters(trial_counters, counters)
+        return projected
+
+    function["arguments"] = _truncate_json_argument_text(arguments, max_item_bytes, counters)
+    projected["function"] = function
+    return projected
+
+
+def _truncate_json_argument_text(text: str, max_bytes: int, counters: dict[str, int]) -> str:
+    """Return bounded valid JSON with the original head, tail and size metadata."""
+    raw = text.encode("utf-8")
+    original_bytes = len(raw)
+    original_tokens = (original_bytes + 3) // 4
+    total_lines = count_text_lines(text)
+    wrapper = {
+        "_truncated": {
+            "warning": "middle omitted; head and tail retained",
+            "original_bytes": original_bytes,
+            "estimated_tokens": original_tokens,
+            "total_lines": total_lines,
+        },
+        "head": "",
+        "tail": "",
+    }
+    empty = _compact_json(wrapper) or "{}"
+    remaining = max(0, max_bytes - len(empty.encode("utf-8")))
+    edge_limit = min(remaining // 2, _MAX_WRAPPER_EDGE_BYTES)
+    wrapper["head"] = _fit_json_prefix(raw, edge_limit)
+    wrapper["tail"] = _fit_json_suffix(raw, min(remaining - edge_limit, _MAX_WRAPPER_EDGE_BYTES))
+    payload = _compact_json(wrapper) or empty
+    if len(payload.encode("utf-8")) > max_bytes:
+        payload = _compact_json({"truncated": True, "original_bytes": original_bytes}) or "{}"
+    projected_bytes = len(payload.encode("utf-8"))
+    projected_tokens = (projected_bytes + 3) // 4
+    result = TruncationResult(
+        text=payload,
+        truncated=True,
+        original_bytes=original_bytes,
+        projected_bytes=projected_bytes,
+        original_estimated_tokens=original_tokens,
+        projected_estimated_tokens=projected_tokens,
+        total_lines=total_lines,
+        omitted_estimated_tokens=max(0, original_tokens - projected_tokens),
+    )
+    _record_truncation(result, counters)
+    return payload
+
+
+def _compact_json(value: Any) -> str | None:
+    try:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return None
+
+
+def _json_escape_size(value: str) -> int:
+    encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    return len(encoded[1:-1].encode("utf-8"))
+
+
+def _fit_json_prefix(raw: bytes, limit: int) -> str:
+    return _fit_json_edge(raw, limit, from_end=False)
+
+
+def _fit_json_suffix(raw: bytes, limit: int) -> str:
+    return _fit_json_edge(raw, limit, from_end=True)
+
+
+def _fit_json_edge(raw: bytes, limit: int, *, from_end: bool) -> str:
+    if limit <= 0:
         return ""
-
-    if role == "tool":
-        tool_name = tool_name_by_call_id.get(msg.get("tool_call_id", ""), "tool")
-        summary = _tool_output_inline_summary(text)
-        return f"Tool {tool_name} returned: {summary}"
-
-    if role == "system":
-        return f"System guidance: {_truncate_text(text, 180)}"
-
-    return ""
-
-
-def _build_tool_call_name_map(messages: list[dict]) -> dict[str, str]:
-    mapping: dict[str, str] = {}
-    for msg in messages:
-        if not isinstance(msg, dict) or msg.get("role") != "assistant":
-            continue
-        for tool_call in msg.get("tool_calls") or []:
-            if not isinstance(tool_call, dict):
-                continue
-            call_id = tool_call.get("id")
-            name = (tool_call.get("function") or {}).get("name")
-            if call_id and name:
-                mapping[call_id] = name
-    return mapping
+    low = 0
+    high = min(len(raw), max(limit, limit * 6))
+    while low < high:
+        middle = (low + high + 1) // 2
+        candidate = raw[-middle:] if from_end else raw[:middle]
+        value = candidate.decode("utf-8", "ignore")
+        if _json_escape_size(value) <= limit:
+            low = middle
+        else:
+            high = middle - 1
+    candidate = raw[-low:] if from_end else raw[:low]
+    return candidate.decode("utf-8", "ignore") if low else ""
 
 
+def _merge_counters(source: dict[str, int], target: dict[str, int]) -> None:
+    for key in ("truncated_items", "truncated_original_bytes", "truncated_projected_bytes"):
+        target[key] += source.get(key, 0)
 
 
-def _summarize_tool_output(text: str) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    if len(text) <= MAX_TOOL_OUTPUT_CHARS and text.count("\n") <= 24:
-        return text
-
-    lines = text.splitlines()
-    exit_line = next((line.strip() for line in lines if "Process exited with code" in line), "")
-    useful_lines = []
-    saw_output = False
-    for line in lines:
-        stripped = line.rstrip()
-        if stripped == "Output:":
-            saw_output = True
-            continue
-        if (
-            stripped.startswith("Chunk ID:")
-            or stripped.startswith("Wall time:")
-            or stripped.startswith("Original token count:")
-            or stripped.startswith("Process exited with code")
-        ):
-            continue
-        useful_lines.append(stripped)
-
-    body_lines = useful_lines
-
-    head = body_lines[:10]
-    tail = body_lines[-6:] if len(body_lines) > 16 else []
-    omitted = max(len(body_lines) - len(head) - len(tail), 0)
-
-    parts: list[str] = []
-    if exit_line:
-        parts.append(exit_line)
-    if head:
-        parts.append("Key output:")
-        parts.extend(head)
-    if omitted:
-        parts.append(f"... [omitted {omitted} lines] ...")
-    if tail:
-        parts.append("Recent tail:")
-        parts.extend(tail)
-
-    summary = "\n".join(part for part in parts if part).strip()
-    return _truncate_text(summary or text, MAX_TOOL_OUTPUT_CHARS)
+def _truncate_json_strings(value: Any, max_item_bytes: int, counters: dict[str, int], depth: int = 0) -> tuple[Any, bool]:
+    if depth > 64:
+        return value, False
+    if isinstance(value, str):
+        projected = _truncate_generated_text(value, max_item_bytes, counters)
+        return projected, projected != value
+    if isinstance(value, list):
+        projected = []
+        changed = False
+        for item in value:
+            projected_item, item_changed = _truncate_json_strings(
+                item, max_item_bytes, counters, depth + 1
+            )
+            projected.append(projected_item)
+            changed = changed or item_changed
+        return projected, changed
+    if isinstance(value, dict):
+        projected = {}
+        changed = False
+        for key, item in value.items():
+            projected_item, item_changed = _truncate_json_strings(
+                item, max_item_bytes, counters, depth + 1
+            )
+            projected[key] = projected_item
+            changed = changed or item_changed
+        return projected, changed
+    return value, False
 
 
-def _tool_output_inline_summary(text: str) -> str:
-    summarized = _summarize_tool_output(text)
-    summarized = summarized.replace("\n", " | ")
-    return _truncate_text(summarized, 220)
-
-
-def _summarize_free_text(text: str, limit: int) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    if len(text) <= limit:
-        return text
-
-    head = text[: limit // 2].rstrip()
-    tail = text[-(limit // 3):].lstrip()
-    omitted = len(text) - len(head) - len(tail)
-    return f"{head}\n... [{omitted} chars omitted] ...\n{tail}"
-
-
-def _truncate_text(text: str, limit: int) -> str:
-    text = (text or "").strip()
-    if not text:
-        return ""
-    if len(text) <= limit:
-        return text
-    return text[: max(limit - 24, 0)].rstrip() + f" ... [truncated {len(text) - max(limit - 24, 0)} chars]"
+def _record_truncation(result, counters: dict[str, int]) -> None:
+    counters["truncated_items"] += 1
+    counters["truncated_original_bytes"] += result.original_bytes
+    counters["truncated_projected_bytes"] += result.projected_bytes
 
 
 def _content_to_text(content: Any) -> str:
-    if content is None:
-        return ""
     if isinstance(content, str):
         return content
-    if isinstance(content, list):
-        parts = []
-        for block in content:
-            if isinstance(block, dict):
-                if "text" in block:
-                    parts.append(str(block.get("text", "")))
-                elif "output" in block:
-                    parts.append(str(block.get("output", "")))
-            elif isinstance(block, str):
-                parts.append(block)
-        return "".join(parts)
-    return str(content)
+    if not isinstance(content, list):
+        return ""
+    parts = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict):
+            for key in ("text", "output"):
+                if key in block:
+                    parts.append(str(block.get(key) or ""))
+                    break
+    return "".join(parts)
 
 
-def _looks_like_harness_user(text: str) -> bool:
-    return any(marker in text for marker in HARNESS_USER_MARKERS)
-
-
-def _looks_like_harness_system(text: str) -> bool:
-    return any(marker in text for marker in HARNESS_SYSTEM_MARKERS)
-
-
-def _message_cost(msg: dict) -> int:
-    cost = len(_content_to_text(msg.get("content", "")))
-    for tool_call in msg.get("tool_calls") or []:
+def _message_cost(message: Any) -> int:
+    if not isinstance(message, dict):
+        return 0
+    cost = len(_content_to_text(message.get("content", "")))
+    for tool_call in message.get("tool_calls") or []:
         if not isinstance(tool_call, dict):
             continue
         function = tool_call.get("function") or {}
-        cost += len(function.get("name", ""))
-        cost += len(function.get("arguments", ""))
+        cost += len(str(function.get("name") or ""))
+        cost += len(str(function.get("arguments") or ""))
     return cost
 
 
-def _messages_size(messages: list[dict]) -> int:
-    total = 0
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        total += _message_cost(msg)
-        total += len(msg.get("role", ""))
-    return total
+def _messages_size(messages: list[Any]) -> int:
+    return sum(_message_cost(message) + len(message.get("role", "")) for message in messages if isinstance(message, dict))
 
 
-def _tool_name(tool: dict) -> str:
-    if not isinstance(tool, dict):
-        return ""
-    function = tool.get("function") or tool
-    return str(function.get("name", "") or "")
-
-
-def _tools_size(tools: list[dict]) -> int:
+def _tools_size(tools: list[Any]) -> int:
     try:
         return len(json.dumps(tools, ensure_ascii=False))
-    except Exception:
+    except (TypeError, ValueError, UnicodeError, RecursionError):
         return 0

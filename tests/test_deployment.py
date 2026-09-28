@@ -21,6 +21,7 @@ RUNTIME_DEFAULTS = {
     "max_images": 16, "image_policy": "truncate",
     "max_request_bytes": 33554432, "log_body_limit": 65536,
     "admin_csrf": True, "keep_tool_metadata": False,
+    "responses_projection_mode": "balanced", "responses_projection_max_bytes": 40000,
 }
 API_ENDPOINTS = {
     "chat/completions": "POST", "responses": "POST", "messages": "POST",
@@ -83,6 +84,8 @@ class DeploymentTests(unittest.TestCase):
         self.assertEqual(values["CODEBUDDY2API_ADMIN_CSRF"], str(RUNTIME_DEFAULTS["admin_csrf"]).lower())
         self.assertNotIn("CODEBUDDY2API_ADMIN_ORIGINS", values)
         self.assertNotIn("CODEBUDDY2API_KEEP_TOOL_METADATA", values)
+        self.assertNotIn("CODEBUDDY2API_RESPONSES_PROJECTION_MODE", values)
+        self.assertNotIn("CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES", values)
 
     def test_tool_metadata_compose_environment_is_optional(self):
         key = "CODEBUDDY2API_KEEP_TOOL_METADATA"
@@ -91,6 +94,15 @@ class DeploymentTests(unittest.TestCase):
         origins = "CODEBUDDY2API_ADMIN_ORIGINS"
         self.assertRegex((ROOT / "docker-compose.yml").read_text(), rf"(?m)^ +{origins}: *$")
         self.assertRegex((ROOT / ".env.example").read_text(), rf"(?m)^# {origins}=https://")
+
+    def test_responses_projection_compose_environment_is_optional(self):
+        compose = (ROOT / "docker-compose.yml").read_text()
+        example = (ROOT / ".env.example").read_text()
+        for key in ("CODEBUDDY2API_RESPONSES_PROJECTION_MODE",
+                    "CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES"):
+            self.assertRegex(compose, rf"(?m)^ +{key}: *$")
+            self.assertRegex(example, rf"(?m)^# {key}=")
+
     def test_docker_copies_and_allows_all_local_runtime_imports(self):
         files = docker_sources()
         self.assertTrue({"app/client_profiles.py", "app/site_routing.py", "app/trial_rewards.py"} <= files)

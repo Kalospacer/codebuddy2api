@@ -21,7 +21,7 @@ _CLEANUP_SECONDS = 0.05
 METRICS = ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens",
            "reasoning_tokens", "total_tokens", "credit")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9_.:/@-]{1,160}$")
-_SECRET = re.compile(r"(?i)(bearer|sk-|access[_-]?token|refresh[_-]?token|api[_-]?key|eyJ|://)")
+_SECRET = re.compile(r"(?i)(bearer|sk-|cb-|access[_-]?token|refresh[_-]?token|api[_-]?key|eyJ|://)")
 
 
 def safe_label(value: Any, limit: int = 160) -> str | None:
@@ -265,6 +265,13 @@ class AuditStore:
     def _sanitize_record(self, source):
         result = {key: safe_label(source.get(key)) for key in
                   ("upstream_model", "profile", "credential", "protocol", "error_code", "usage_source")}
+        result["stream_mode"] = (source.get("stream_mode")
+                                 if source.get("stream_mode") in ("compatible", "realtime") else None)
+        projection_mode = source.get("responses_projection_mode")
+        if projection_mode in ("balanced", "passthrough"):
+            result["responses_projection_mode"] = projection_mode
+            result["responses_projection_max_bytes"] = number(source.get("responses_projection_max_bytes"))
+            result["responses_truncated_items"] = number(source.get("responses_truncated_items"))
         result["public_model"] = safe_label(source.get("public_model", source.get("model")))
         result["model"] = result["public_model"]
         result["id"] = safe_label(source.get("id", source.get("event_id"))) or uuid.uuid4().hex

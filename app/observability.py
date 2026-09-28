@@ -130,6 +130,25 @@ class _Observation:
                     self.output()
 
 
+def observe_stream_mode(mode):
+    """Attach one allowlisted request marker without consuming bounded attempt diagnostics."""
+    observation = _current.get()
+    if observation is not None and mode in ("compatible", "realtime"):
+        observation.record["stream_mode"] = mode
+
+
+def observe_responses_projection(stats):
+    """Record non-sensitive Responses projection counters for audit details."""
+    observation = _current.get()
+    if observation is None or not isinstance(stats, dict):
+        return
+    mode = stats.get("mode")
+    if mode in ("balanced", "passthrough"):
+        observation.record["responses_projection_mode"] = mode
+    observation.record["responses_projection_max_bytes"] = number(stats.get("max_item_bytes"))
+    observation.record["responses_truncated_items"] = number(stats.get("truncated_items"))
+
+
 def observe_route(public_model, upstream_model, profile, credential):
     observation = _current.get()
     if observation is not None:

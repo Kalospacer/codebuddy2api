@@ -273,6 +273,20 @@ class ManagedRoutingTests(fixtures.RegionRoutingTests):
             self.assertNotIn(b"synthetic-access", path.read_bytes())
             self.assertNotIn(b"synthetic-management-key", path.read_bytes())
 
+    def test_managed_stream_mode_is_an_unlocked_hot_enum(self):
+        revision = self.control.snapshot()['revision']
+        response = self.client.patch('/admin/settings', json={
+            'revision': revision, 'values': {'stream_mode': 'realtime'}})
+        self.assertEqual(response.status_code, 200, response.text)
+        item = next(value for value in response.json()['items'] if value['key'] == 'stream_mode')
+        self.assertEqual((item['value'], item['source'], item['mode'], item['locked']), (
+            'realtime', 'management', 'hot', False))
+        self.assertEqual(item['choices'], ['compatible', 'realtime'])
+        self.assertIn('不重生成工具参数', item['label'])
+        invalid = self.client.patch('/admin/settings', json={
+            'revision': self.control.snapshot()['revision'], 'values': {'stream_mode': 'invalid'}})
+        self.assertEqual(invalid.status_code, 400, invalid.text)
+
     def test_managed_zero_price_setting_is_not_replaced_by_default(self):
         response = self.client.patch("/admin/settings", json={"revision": self.control.snapshot()["revision"],
                                                              "values": {"credit_price_cny": 0, "credit_price_usd": 0}})

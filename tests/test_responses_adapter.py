@@ -59,6 +59,17 @@ def test_array_input_request():
     assert msgs[4] == {"role": "user", "content": "Now fix it"}
     print("✅ test_array_input_request")
 
+def test_function_call_arguments_must_be_string():
+    """Reject non-standard object arguments before Chat adaptation."""
+    try:
+        responses_request_to_chat({"model": "auto", "input": [
+            {"type": "function_call", "name": "tool", "arguments": {"x": 1}},
+        ]})
+    except ValueError as error:
+        assert "JSON string" in str(error)
+    else:
+        raise AssertionError("non-string function call arguments were accepted")
+
 
 def test_tools_conversion():
     """Convert flat Responses tools to nested Chat definitions."""
@@ -227,224 +238,171 @@ def test_no_compact_still_prunes_codex_runtime_metadata():
     print("✅ test_no_compact_still_prunes_codex_runtime_metadata")
 
 
-def test_responses_projection_compacts_codex_harness_and_tools():
-    """Project Codex requests into short system context and minimal tool schemas."""
-    body = {
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are a coding agent running in the Codex CLI.\n"
-                    "# AGENTS.md spec\nVery long harness instructions."
-                ),
-            },
-            {
-                "role": "system",
-                "content": "Additional repo rule: always run tests after editing.",
-            },
-            {
-                "role": "user",
-                "content": "# AGENTS.md instructions\n<environment_context>\nlong context\n</environment_context>",
-            },
-            {"role": "user", "content": "实现该方案"},
-        ],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "exec_command",
-                    "description": "Run a command with a long dangerous description",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "cmd": {"type": "string", "description": "Shell command to execute."},
-                            "yield_time_ms": {"type": "number", "description": "Wait time"},
-                        },
-                        "required": ["cmd"],
-                        "additionalProperties": False,
-                    },
-                    "strict": False,
-                },
-            }
-        ],
-    }
-    out, stats = project_responses_chat_body(body)
-    assert stats["mode"] == "aggressive"
-    assert out["messages"][0]["role"] == "system"
-    assert "OpenAI-compatible CLI" in out["messages"][0]["content"]
-    assert all("# AGENTS.md instructions" not in msg.get("content", "") for msg in out["messages"])
-    assert any("Additional repo rule" in msg.get("content", "") for msg in out["messages"])
-    assert out["messages"][-1] == {"role": "user", "content": "实现该方案"}
-    tool = out["tools"][0]["function"]
-    assert tool["name"] == "exec_command"
-    assert "description" not in tool
-    assert "description" not in tool["parameters"]["properties"]["cmd"]
-    assert stats["projected_tool_chars"] < stats["original_tool_chars"]
-    print("✅ test_responses_projection_compacts_codex_harness_and_tools")
-
-
-def test_responses_projection_preserves_recent_tool_chain_and_summarizes_history():
-    """Summarize older turns while retaining the recent tool chain."""
-    big_output = "Chunk ID: a1\nWall time: 0.0\nProcess exited with code 0\nOutput:\n" + "\n".join(
-        f"line {i}" for i in range(40)
-    )
-    body = {
-        "messages": [
-            {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
-            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context>ctx</environment_context>"},
-            {"role": "user", "content": "先看 README"},
-            {
-                "role": "assistant",
-                "content": "I will inspect the repository.",
-                "tool_calls": [
-                    {
-                        "id": "call_old",
-                        "type": "function",
-                        "function": {"name": "exec_command", "arguments": "{\"cmd\":\"ls -la\"}"},
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_old", "content": "Output:\nREADME.md\nsrc\n"},
-            {"role": "assistant", "content": "README is present."},
-            {"role": "user", "content": "现在修复 converter 的 responses 链路"},
-            {
-                "role": "assistant",
-                "content": "I will patch the proxy and then run tests.",
-                "tool_calls": [
-                    {
-                        "id": "call_recent",
-                        "type": "function",
-                        "function": {
-                            "name": "exec_command",
-                            "arguments": json.dumps({"cmd": "sed -n '1,200p' converter.py", "yield_time_ms": 1000}),
-                        },
-                    }
-                ],
-            },
-            {"role": "tool", "tool_call_id": "call_recent", "content": big_output},
-            {"role": "assistant", "content": "I found the endpoint and will implement projection now."},
-            {"role": "user", "content": "继续，别依赖 fallback retry"},
-        ],
-        "tools": [
-            {
-                "type": "function",
-                "function": {
-                    "name": "exec_command",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "cmd": {"type": "string"},
-                            "yield_time_ms": {"type": "number"},
-                        },
-                        "required": ["cmd"],
-                    },
-                },
-            }
-        ],
-    }
-    out, stats = project_responses_chat_body(body)
-    system_messages = [m["content"] for m in out["messages"] if m["role"] == "system"]
-    assert system_messages[0].startswith("You are a coding assistant serving an OpenAI-compatible CLI.")
-    assert any("Earlier conversation summary" in text for text in system_messages)
-    assert any("先看 README" in text for text in system_messages)
-
-    recent_assistant = next(
-        msg for msg in out["messages"]
-        if msg.get("role") == "assistant" and any(tc.get("id") == "call_recent" for tc in msg.get("tool_calls", []))
-    )
-    recent_tool = next(msg for msg in out["messages"] if msg.get("role") == "tool" and msg.get("tool_call_id") == "call_recent")
-    assert recent_assistant["tool_calls"][0]["function"]["name"] == "exec_command"
-    assert "Process exited with code 0" in recent_tool["content"]
-    assert "line 39" in recent_tool["content"]
-    assert len(recent_tool["content"]) < len(big_output)
-    assert out["messages"][-1] == {"role": "user", "content": "继续，别依赖 fallback retry"}
-    assert stats["summarized_history_messages"] >= 1
-    print("✅ test_responses_projection_preserves_recent_tool_chain_and_summarizes_history")
-
-
-def test_responses_projection_shrinks_large_tool_arguments():
-    """Compact oversized tool arguments into structured JSON summaries."""
-    long_cmd = "echo " + ("x" * 1600)
-    body = {
-        "messages": [
-            {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
-            {"role": "user", "content": "执行一个很长的命令"},
-            {
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [
-                    {
-                        "id": "call_long",
-                        "type": "function",
-                        "function": {
-                            "name": "exec_command",
-                            "arguments": json.dumps({"cmd": long_cmd, "yield_time_ms": 1000, "workdir": "/tmp"}),
-                        },
-                    }
-                ],
-            },
-        ],
-        "tools": [],
-    }
-    out, _ = project_responses_chat_body(body)
-    args = out["messages"][-1]["tool_calls"][0]["function"]["arguments"]
-    parsed = json.loads(args)
-    assert parsed["cmd"].startswith("echo ")
-    assert "truncated" in parsed["cmd"]
-    print("✅ test_responses_projection_shrinks_large_tool_arguments")
-
-
-def _agentic_tool():
-    return [{
+def test_responses_projection_balanced_preserves_real_text_tools_and_structure():
+    """Balanced mode replaces recognized harness blocks without changing tools or real text."""
+    tool = {
         "type": "function",
         "function": {
             "name": "exec_command",
-            "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+            "description": "Run a command",
+            "parameters": {
+                "type": "object",
+                "properties": {"cmd": {"type": "string", "description": "Command"}},
+                "required": ["cmd"],
+                "additionalProperties": False,
+                "x-vendor-detail": {"deep": {"schema": "kept"}},
+            },
+            "strict": False,
         },
-    }]
-
-
-def test_responses_projection_keeps_user_text_sharing_harness_message():
-    """Preserve user and reminder text embedded in messages containing harness context."""
+    }
     body = {
         "model": "auto",
-        "tools": _agentic_tool(),
         "messages": [
-            {"role": "system", "content": "You are a coding agent running in the Codex CLI. # How you work"},
-            {"role": "user", "content": "# AGENTS.md instructions\n<INSTRUCTIONS>\nUse tabs\n</INSTRUCTIONS>"},
-            {"role": "user", "content": "<system-reminder>\n剩余任务：改看板\n</system-reminder>\n\n继续之前的前端改造工程，把登录页也改了"},
-            {"role": "assistant", "content": "好的，我来改登录页"},
-            {"role": "user", "content": "另外把看板的按钮也加上"},
+            {"role": "system", "content": "Repository policy: run tests."},
+            {"role": "user", "content": "# AGENTS.md instructions\n<environment_context>\nvolatile context\n</environment_context>"},
+            {"role": "user", "content": "实现该方案"},
         ],
+        "tools": [tool],
     }
+    before = json.loads(json.dumps(body, ensure_ascii=False))
     out, stats = project_responses_chat_body(body)
-    assert stats["mode"] == "aggressive"
-    blob = "\n".join(str(m.get("content", "")) for m in out["messages"])
-    assert "继续之前的前端改造工程" in blob, "与 harness 同条的用户原话被丢弃"
-    assert "剩余任务：改看板" in blob, "system-reminder 正文被丢弃"
-    assert "另外把看板的按钮也加上" in blob
-    assert "# AGENTS.md instructions" not in blob, "纯 harness 载荷应以摘要出现"
-    assert stats["anchor_user_preserved"] or "继续之前的前端改造工程" in blob
-    print("✅ test_responses_projection_keeps_user_text_sharing_harness_message")
+    assert body == before
+    assert out["tools"] == body["tools"]
+    assert out["messages"][0] == body["messages"][0]
+    assert out["messages"][1]["content"] != body["messages"][1]["content"]
+    assert "# AGENTS.md instructions" not in out["messages"][1]["content"]
+    assert "Environment context is provided by the harness." in out["messages"][1]["content"]
+    assert out["messages"][2] == body["messages"][2]
+    assert stats["mode"] == "balanced"
+    assert stats["original_tools"] == stats["projected_tools"] == 1
+    assert stats["original_tool_chars"] == stats["projected_tool_chars"]
+    assert stats["harness_messages_projected"] == 1
+    print("✅ test_responses_projection_balanced_preserves_real_text_tools_and_structure")
 
 
-def test_responses_projection_keeps_last_user_when_it_carries_harness():
-    """Preserve real text when the final user message also contains harness context."""
+def test_responses_projection_preserves_history_and_tool_chain():
+    """Balanced mode does not summarize history or drop tool-call relationships."""
     body = {
-        "model": "auto",
-        "tools": _agentic_tool(),
         "messages": [
-            {"role": "system", "content": "You are a coding agent running in the Codex CLI."},
-            {"role": "assistant", "content": "上一轮的答复"},
-            {"role": "user", "content": "<system-reminder>\n剩余任务：改看板\n</system-reminder>\n\n继续之前的前端改造工程，把登录页也改了"},
+            {"role": "user", "content": "old task"},
+            {"role": "assistant", "content": "old answer", "tool_calls": [{
+                "id": "call_old", "type": "function",
+                "function": {"name": "exec_command", "arguments": '{"cmd":"ls"}'},
+            }]},
+            {"role": "tool", "tool_call_id": "call_old", "content": "old output"},
+            {"role": "user", "content": "new task"},
         ],
+        "tools": [{"type": "function", "function": {"name": "exec_command", "parameters": {"type": "object"}}}],
     }
-    out, stats = project_responses_chat_body(body)
-    blob = "\n".join(str(m.get("content", "")) for m in out["messages"])
-    assert "继续之前的前端改造工程" in blob, "最后一轮用户真话丢失"
-    assert "剩余任务：改看板" in blob, "reminder 正文丢失"
-    print("✅ test_responses_projection_keeps_last_user_when_it_carries_harness")
+    before = json.loads(json.dumps(body))
+    out, stats = project_responses_chat_body(body, max_item_bytes=40000)
+    assert body == before
+    assert out["messages"] == body["messages"]
+    assert stats["original_messages"] == stats["projected_messages"] == 4
+    assert "anchor_user_preserved" not in stats
+    print("✅ test_responses_projection_preserves_history_and_tool_chain")
 
+
+def test_responses_projection_truncates_generated_content_and_json_arguments():
+    """Oversized assistant, tool output, and JSON values retain UTF-8 head and tail."""
+    long_text = "HEAD\n" + ("中" * 180) + "\nTAIL"
+    long_output = "OUTPUT\n" + ("输出" * 180) + "\nEND"
+    arguments = json.dumps({"cmd": "echo " + ("x" * 500), "workdir": "/tmp"})
+    apply_patch = json.dumps({"patch": "*** Begin Patch\n" + ("+" * 500) + "*** End Patch"})
+    body = {"messages": [
+        {"role": "assistant", "content": long_text, "tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "exec_command", "arguments": arguments},
+        }]},
+        {"role": "tool", "tool_call_id": "call_1", "content": long_output},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call_patch", "type": "function",
+            "function": {"name": "apply_patch", "arguments": apply_patch},
+        }]},
+    ]}
+    before = json.loads(json.dumps(body, ensure_ascii=False))
+    out, stats = project_responses_chat_body(body, max_item_bytes=256)
+    assert body == before
+    assistant = out["messages"][0]["content"]
+    assert assistant.startswith("HEAD")
+    assert assistant.endswith("TAIL")
+    assert "middle omitted" in assistant
+    assert "original bytes:" in assistant
+    assert "estimated tokens:" in assistant
+    assert "total lines:" in assistant
+    tool_output = out["messages"][1]["content"]
+    assert tool_output.startswith("OUTPUT")
+    assert tool_output.endswith("END")
+    args_wire = out["messages"][0]["tool_calls"][0]["function"]["arguments"]
+    args = json.loads(args_wire)
+    assert len(args_wire.encode("utf-8")) <= 256
+    assert "middle omitted" in args["_truncated"]["warning"]
+    assert '"cmd"' in args["head"] and "echo" in args["head"]
+    assert "workdir" in args["tail"] and args["tail"].endswith("}")
+    patch_wire = out["messages"][2]["tool_calls"][0]["function"]["arguments"]
+    patch_args = json.loads(patch_wire)
+    assert len(patch_wire.encode("utf-8")) <= 256
+    assert '"patch"' in patch_args["head"] and "*** Begin Patch" in patch_args["head"]
+    assert patch_args["tail"].endswith('*** End Patch"}')
+    assert stats["truncated_items"] == 4
+    assert stats["truncated_original_bytes"] > stats["truncated_projected_bytes"]
+    print("✅ test_responses_projection_truncates_generated_content_and_json_arguments")
+
+
+def test_responses_projection_passthrough_and_zero_limit_are_lossless():
+    """Passthrough and max_item_bytes=0 preserve the request payload."""
+    body = {"messages": [
+        {"role": "user", "content": "# AGENTS.md instructions\n<environment_context>volatile</environment_context>\nreal task"},
+        {"role": "assistant", "content": "assistant " + "x" * 500},
+        {"role": "tool", "tool_call_id": "c", "content": "output " + "y" * 500},
+    ], "tools": [{"type": "function", "function": {"name": "tool", "parameters": {"type": "object", "x": 1}}}]}
+    before = json.loads(json.dumps(body, ensure_ascii=False))
+    for kwargs in ({"mode": "passthrough"}, {"max_item_bytes": 0}):
+        out, stats = project_responses_chat_body(body, **kwargs)
+        if "mode" in kwargs:
+            assert out == before
+        else:
+            assert out["messages"][1:] == before["messages"][1:]
+            assert out["tools"] == before["tools"]
+        assert body == before
+        assert stats["mode"] == ("passthrough" if "mode" in kwargs else "balanced")
+        assert stats["truncated_items"] == 0
+    print("✅ test_responses_projection_passthrough_and_zero_limit_are_lossless")
+
+
+def test_responses_projection_rejects_invalid_mode_and_limit():
+    """Projection validates its public mode and byte-limit arguments."""
+    for mode in ("aggressive", "conservative", "", None, True):
+        try:
+            project_responses_chat_body({"messages": []}, mode=mode)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid mode accepted: {mode!r}")
+    for limit in (-1, 1, 128, 255, True, 1.5, "256", None, [], {}):
+        try:
+            project_responses_chat_body({"messages": []}, max_item_bytes=limit)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid max_item_bytes accepted: {limit!r}")
+    assert project_responses_chat_body({"messages": []}, mode="balanced", max_item_bytes=256)[1]["max_item_bytes"] == 256
+    print("✅ test_responses_projection_rejects_invalid_mode_and_limit")
+
+
+def test_responses_projection_stats_have_official_shape():
+    """Stats expose current projection counters without legacy mode fields."""
+    body = {"messages": [{"role": "user", "content": "hello"}], "tools": [{"type": "function", "function": {"name": "t"}}]}
+    _, stats = project_responses_chat_body(body, mode="balanced", max_item_bytes=0)
+    assert stats == {
+        "mode": "balanced", "max_item_bytes": 0, "original_messages": 1,
+        "projected_messages": 1, "original_message_chars": stats["original_message_chars"],
+        "projected_message_chars": stats["projected_message_chars"], "original_tools": 1,
+        "projected_tools": 1, "original_tool_chars": stats["original_tool_chars"],
+        "projected_tool_chars": stats["projected_tool_chars"], "harness_messages_projected": 0,
+        "truncated_items": 0, "truncated_original_bytes": 0, "truncated_projected_bytes": 0,
+    }
+    print("✅ test_responses_projection_stats_have_official_shape")
 
 
 def test_stream_converter_text():
@@ -665,6 +623,193 @@ def test_parallel_tool_calls_roundtrip():
     print("✅ test_parallel_tool_calls_roundtrip")
 
 
+def test_tool_registry_and_identity_mapping():
+    """Verify ToolRegistry handles plain tools, namespaced tools, collision avoidance, and reversible lookup."""
+    from app.adapters.responses_adapter import ToolRegistry
+
+    registry = ToolRegistry()
+    # 1. Plain tool: must keep original name
+    name1 = registry.register(None, "collaboration__spawn_agent")
+    assert name1 == "collaboration__spawn_agent"
+    assert registry.get_identity("collaboration__spawn_agent") == (None, "collaboration__spawn_agent")
+
+    # 2. Namespaced tool colliding with existing plain tool: must disambiguate safely
+    name2 = registry.register("collaboration", "spawn_agent")
+    assert name2 == "collaboration__spawn_agent_1"
+    assert registry.get_identity("collaboration__spawn_agent_1") == ("collaboration", "spawn_agent")
+    # Plain tool lookup still returns original identity
+    assert registry.get_identity("collaboration__spawn_agent") == (None, "collaboration__spawn_agent")
+
+    # 3. Tool with __ in name inside namespace
+    name3 = registry.register("custom_ns", "exec__command")
+    assert name3 == "custom_ns__exec__command"
+    assert registry.get_identity("custom_ns__exec__command") == ("custom_ns", "exec__command")
+
+    # 4. Tools with same name in different namespaces
+    name_ns1 = registry.register("ns1", "search")
+    name_ns2 = registry.register("ns2", "search")
+    assert name_ns1 == "ns1__search"
+    assert name_ns2 == "ns2__search"
+    assert registry.get_identity("ns1__search") == ("ns1", "search")
+    assert registry.get_identity("ns2__search") == ("ns2", "search")
+
+    # 5. Serialization and round-trip
+    dumped = registry.to_dict()
+    restored = ToolRegistry.from_dict(dumped)
+    assert restored.get_identity("custom_ns__exec__command") == ("custom_ns", "exec__command")
+    assert restored.get_identity("collaboration__spawn_agent") == (None, "collaboration__spawn_agent")
+    assert restored.get_identity("collaboration__spawn_agent_1") == ("collaboration", "spawn_agent")
+    print("✅ test_tool_registry_and_identity_mapping")
+
+
+def test_responses_multiagent_request_conversion_and_schema_sanitization():
+    """Verify responses_request_to_chat converts tools, strips encrypted markers, and maps tool_choice and history."""
+    req = {
+        "model": "gpt-4o",
+        "tools": [
+            {
+                "type": "function",
+                "name": "collaboration__spawn_agent",
+                "description": "Standard unnamespaced tool",
+                "parameters": {"type": "object", "properties": {"prompt": {"type": "string"}}},
+            },
+            {
+                "type": "namespace",
+                "name": "collaboration",
+                "tools": [
+                    {
+                        "type": "function",
+                        "name": "spawn_agent",
+                        "description": "Spawn an agent",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "message": {"type": "string", "encrypted": True},
+                                "task_name": {"type": "string"},
+                                "meta": {
+                                    "type": "object",
+                                    "properties": {
+                                        "secret": {"type": "string", "encrypted": True},
+                                        "public": {"type": "string"},
+                                    },
+                                },
+                            },
+                        },
+                    }
+                ],
+            },
+            {
+                "type": "namespace",
+                "name": "ns1",
+                "tools": [{"type": "function", "name": "search", "parameters": {"type": "object"}}],
+            },
+            {
+                "type": "namespace",
+                "name": "ns2",
+                "tools": [{"type": "function", "name": "search", "parameters": {"type": "object"}}],
+            },
+            {
+                "type": "namespace",
+                "name": "custom_ns",
+                "tools": [{"type": "function", "name": "exec__command", "parameters": {"type": "object"}}],
+            },
+        ],
+        "tool_choice": {"type": "function", "name": "spawn_agent", "namespace": "collaboration"},
+        "input": [
+            {
+                "type": "additional_tools",
+                "tools": [
+                    {
+                        "type": "namespace",
+                        "name": "extra",
+                        "tools": [{"type": "function", "name": "ping", "parameters": {"type": "object"}}],
+                    }
+                ],
+            },
+            {
+                "type": "agent_message",
+                "author": "/root",
+                "recipient": "/root/worker",
+                "content": [
+                    {"type": "input_text", "text": "Task header\n"},
+                    {"type": "encrypted_content", "encrypted_content": "Sensitive payload text"},
+                ],
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_hist_1",
+                "name": "spawn_agent",
+                "namespace": "collaboration",
+                "arguments": '{"task_name": "t1"}',
+            },
+            {
+                "type": "function_call_output",
+                "call_id": "call_hist_1",
+                "output": "ok",
+            },
+        ],
+    }
+
+    chat = responses_request_to_chat(req)
+    chat_tools = chat.get("tools", [])
+    tool_names = [t["function"]["name"] for t in chat_tools]
+
+    # 1. Verify plain tool preserved original name
+    assert "collaboration__spawn_agent" in tool_names
+    # 2. Verify namespaced tool disambiguated
+    assert "collaboration__spawn_agent_1" in tool_names
+    # 3. Verify same name under different namespaces preserved
+    assert "ns1__search" in tool_names
+    assert "ns2__search" in tool_names
+    # 4. Verify tool with __ in name inside namespace
+    assert "custom_ns__exec__command" in tool_names
+    # 5. Verify additional_tools registered
+    assert "extra__ping" in tool_names
+
+    # 6. Verify parameter schema cleaning (no 'encrypted' key anywhere)
+    collab_tool = next(t for t in chat_tools if t["function"]["name"] == "collaboration__spawn_agent_1")
+    props = collab_tool["function"]["parameters"]["properties"]
+    assert "encrypted" not in props["message"]
+    assert "encrypted" not in props["meta"]["properties"]["secret"]
+
+    # 7. Verify tool_choice mapped
+    assert chat.get("tool_choice") == {"type": "function", "function": {"name": "collaboration__spawn_agent_1"}}
+
+    # 8. Verify messages conversion
+    messages = chat.get("messages", [])
+    # User message from agent_message with encrypted_content
+    user_msg = next(m for m in messages if m["role"] == "user")
+    assert "Task header\n" in user_msg["content"]
+    assert "Sensitive payload text" in user_msg["content"]
+
+    # Assistant message from function_call
+    asst_msg = next(m for m in messages if m["role"] == "assistant")
+    assert asst_msg["tool_calls"][0]["function"]["name"] == "collaboration__spawn_agent_1"
+
+    # 9. Verify stream converter output reconstruction
+    conv = ResponsesStreamConverter(model="test", tool_registry=chat.get("_tool_registry"))
+
+    # Namespaced tool call
+    slot_collab = {"id": "c1", "name": "collaboration__spawn_agent_1", "args": "{}", "fc_id": "fc_1", "output_idx": 0, "emitted": False, "emitted_args_length": 0}
+    item_collab = conv._fc_item(slot_collab, "completed")
+    assert item_collab["name"] == "spawn_agent"
+    assert item_collab["namespace"] == "collaboration"
+
+    # Plain tool call
+    slot_plain = {"id": "c2", "name": "collaboration__spawn_agent", "args": "{}", "fc_id": "fc_2", "output_idx": 1, "emitted": False, "emitted_args_length": 0}
+    item_plain = conv._fc_item(slot_plain, "completed")
+    assert item_plain["name"] == "collaboration__spawn_agent"
+    assert "namespace" not in item_plain
+
+    # Custom namespace with __ in name
+    slot_custom = {"id": "c3", "name": "custom_ns__exec__command", "args": "{}", "fc_id": "fc_3", "output_idx": 2, "emitted": False, "emitted_args_length": 0}
+    item_custom = conv._fc_item(slot_custom, "completed")
+    assert item_custom["name"] == "exec__command"
+    assert item_custom["namespace"] == "custom_ns"
+
+    print("✅ test_responses_multiagent_request_conversion_and_schema_sanitization")
+
+
 if __name__ == "__main__":
     test_simple_text_request()
     test_array_input_request()
@@ -675,11 +820,12 @@ if __name__ == "__main__":
     test_desensitize_harness_user_and_tools()
     test_compact_harness_messages_and_strip_tool_metadata()
     test_no_compact_still_prunes_codex_runtime_metadata()
-    test_responses_projection_compacts_codex_harness_and_tools()
-    test_responses_projection_preserves_recent_tool_chain_and_summarizes_history()
-    test_responses_projection_shrinks_large_tool_arguments()
-    test_responses_projection_keeps_user_text_sharing_harness_message()
-    test_responses_projection_keeps_last_user_when_it_carries_harness()
+    test_responses_projection_balanced_preserves_real_text_tools_and_structure()
+    test_responses_projection_preserves_history_and_tool_chain()
+    test_responses_projection_truncates_generated_content_and_json_arguments()
+    test_responses_projection_passthrough_and_zero_limit_are_lossless()
+    test_responses_projection_rejects_invalid_mode_and_limit()
+    test_responses_projection_stats_have_official_shape()
     test_stream_converter_text()
     test_stream_converter_function_call()
     test_nonstream_response()
@@ -688,4 +834,6 @@ if __name__ == "__main__":
     test_usage_maps_cached_tokens_and_omits_when_unknown()
     test_reasoning_effort_and_text_format_are_mapped()
     test_parallel_tool_calls_roundtrip()
+    test_tool_registry_and_identity_mapping()
+    test_responses_multiagent_request_conversion_and_schema_sanitization()
     print(f"\n🎉 All {22} tests passed!")

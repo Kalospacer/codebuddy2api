@@ -244,7 +244,7 @@ class EndpointTests(unittest.TestCase):
                 converter.CONFIG["tool_call_max_retry"] = 3
 
     def test_credential_selection_runs_off_the_event_loop(self):
-        """Offload blocking credential routing to the thread pool for all protocols."""
+        """Offload blocking Responses projection and credential routing."""
         import inspect
         import re
         src = inspect.getsource(converter)
@@ -253,6 +253,7 @@ class EndpointTests(unittest.TestCase):
         self.assertEqual(direct, [])
         # All initial and failover routing must run outside the event-loop thread.
         self.assertGreaterEqual(len(pooled), 3)
+        self.assertRegex(src, r"await run_in_threadpool\(\s*project_responses_chat_body")
 
     def test_tool_metadata_policy_reaches_all_protocols(self):
         description = "Read sandbox data without destructive changes."
@@ -275,7 +276,7 @@ class EndpointTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 200, response.text)
                 self.assertEqual(len(self.requests), 1)
                 sent = json.loads(self.requests[0].content)["tools"][0]["function"]
-                retained = keep or (not desensitize and route != "/v1/responses")
+                retained = keep or not desensitize
                 self.assertEqual("description" in sent, retained)
                 self.assertEqual("title" in sent["parameters"], retained)
                 prop = sent["parameters"]["properties"]["path"]
@@ -383,6 +384,25 @@ class EndpointTests(unittest.TestCase):
         with self.assertRaises(converter.HTTPException) as caught:
             converter._guard_request_size(body)
         self.assertEqual(caught.exception.status_code, 413)
+
+    def test_request_byte_budget_excludes_only_top_level_local_metadata(self):
+        public = {"messages": [{"role": "user", "content": "汉字"}],
+                  "tools": [{"type": "function", "function": {"name": "echo", "parameters": {
+                      "type": "object", "properties": {"_tool_registry": {"type": "string", "default": "汉字" * 200}}}}}]}
+        registry = {"internal": "x" * 10000}
+        local_policy = object()
+        body = {**public, "_tool_registry": registry, "_runtime_note": object(),
+                converter._REQUEST_POLICY_KEY: local_policy}
+        size = len(json.dumps(public, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8"))
+        converter.CONFIG["max_request_bytes"] = size
+        self.assertEqual(converter._guard_request_size(body), size)
+        self.assertIs(body["_tool_registry"], registry)
+        self.assertIs(body[converter._REQUEST_POLICY_KEY], local_policy)
+        converter.CONFIG["max_request_bytes"] = size - 1
+        with self.assertRaises(converter.HTTPException) as caught:
+            converter._guard_request_size(body)
+        self.assertEqual(caught.exception.status_code, 413)
+
 
     def test_bad_payloads_and_auth_fail_without_upstream(self):
         for route in ROUTES:
@@ -788,7 +808,8 @@ class StartupUsageHydrationTests(unittest.TestCase):
 
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
-        self.enterContext(patch.dict(os.environ, {"CODEBUDDY_AUTH_DIR": str(self.root)}, clear=False))
+        self.enterContext(patch.dict(os.environ, {"CODEBUDDY_AUTH_DIR": str(self.root), "CODEBUDDY2API_KEY": "synthetic-key"}, clear=True))
+        self.enterContext(patch.object(converter, "load_startup_env", return_value=set()))
         self.path = self.root / "usage-snapshots.json"
 
     def credential(self, uid="synthetic-uid"):
@@ -821,9 +842,6 @@ class StartupUsageHydrationTests(unittest.TestCase):
             stack.enter_context(patch.object(converter, "credits_mod", None))      # No network.
             stack.enter_context(patch.object(converter, "seed_credentials"))
             stack.enter_context(patch.object(converter, "preflight", return_value=True))
-            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
-            # handle is left open on Windows.
-            stack.enter_context(patch.object(runtime_management, "initialize"))
             stack.enter_context(patch.object(runtime_management, "install"))
 
             def capture(*args, **kwargs):
@@ -852,9 +870,6 @@ class StartupUsageHydrationTests(unittest.TestCase):
             stack.enter_context(patch.object(converter, "credits_mod", None))
             stack.enter_context(patch.object(converter, "seed_credentials"))
             stack.enter_context(patch.object(converter, "preflight", return_value=True))
-            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
-            # handle is left open on Windows.
-            stack.enter_context(patch.object(runtime_management, "initialize"))
             stack.enter_context(patch.object(runtime_management, "install"))
             stack.enter_context(patch.object(converter.uvicorn, "run",
                                             side_effect=lambda *a, **k: observed.setdefault("usage",
@@ -880,9 +895,6 @@ class StartupUsageHydrationTests(unittest.TestCase):
             stack.enter_context(patch.object(converter, "credits_mod", None))
             stack.enter_context(patch.object(converter, "seed_credentials"))
             stack.enter_context(patch.object(converter, "preflight", return_value=True))
-            # Keep this test on startup ordering: skip the SQLite-backed stores so no file
-            # handle is left open on Windows.
-            stack.enter_context(patch.object(runtime_management, "initialize"))
             stack.enter_context(patch.object(runtime_management, "install"))
             real_thread = converter.threading.Thread
 
@@ -910,7 +922,8 @@ class ConfigurationTests(unittest.TestCase):
                     store.close()
             stack.enter_context(patch.object(converter, "managed_auth_dir", return_value=Path(directory)))
             stack.enter_context(patch.object(converter, "app", FastAPI()))
-            stack.enter_context(patch.dict(os.environ, env or {}, clear=True))
+            stack.enter_context(patch.dict(os.environ, {"CODEBUDDY2API_KEY": "", **(env or {})}, clear=True))
+            stack.enter_context(patch.object(converter, "load_startup_env", return_value=set()))
             stack.enter_context(patch.dict(converter.CONFIG))
             stack.enter_context(patch("sys.argv", ["converter.py", "--skip-check", *flags]))
             stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
@@ -936,12 +949,15 @@ class ConfigurationTests(unittest.TestCase):
                 self.assertEqual(server.call_args.kwargs["host"], expected_host)
             return {key: converter.CONFIG[key] for key in (
                 "max_images", "image_policy", "max_request_bytes", "log_body_limit", "admin_csrf",
-                "keep_tool_metadata", "admin_allowed_origins")}
+                "keep_tool_metadata", "admin_allowed_origins", "responses_projection_mode",
+                "responses_projection_max_bytes")}
 
     def test_defaults(self):
-        self.assertEqual(self.configure(), {"max_images": 16, "image_policy": "truncate",
-                                           "max_request_bytes": 33554432, "log_body_limit": 65536,
-                                           "admin_csrf": True, "keep_tool_metadata": False, "admin_allowed_origins": ""})
+        self.assertEqual(self.configure(), {
+            "max_images": 16, "image_policy": "truncate", "max_request_bytes": 33554432,
+            "log_body_limit": 65536, "admin_csrf": True, "keep_tool_metadata": False,
+            "admin_allowed_origins": "", "responses_projection_mode": "balanced",
+            "responses_projection_max_bytes": 40000})
 
     def test_open_binding_without_key_requires_explicit_opt_in(self):
         # Reject unauthenticated public binding by default.
@@ -967,9 +983,11 @@ class ConfigurationTests(unittest.TestCase):
     def test_environment_and_explicit_cli_precedence(self):
         env = {"CODEBUDDY2API_MAX_IMAGES": "8", "CODEBUDDY2API_IMAGE_POLICY": "error",
                "CODEBUDDY2API_MAX_REQUEST_BYTES": "100000", "CODEBUDDY2API_LOG_BODY_LIMIT": "0"}
-        self.assertEqual(self.configure(env), {"max_images": 8, "image_policy": "error",
-                                               "max_request_bytes": 100000, "log_body_limit": 0,
-                                               "admin_csrf": True, "keep_tool_metadata": False, "admin_allowed_origins": ""})
+        self.assertEqual(self.configure(env), {
+            "max_images": 8, "image_policy": "error", "max_request_bytes": 100000,
+            "log_body_limit": 0, "admin_csrf": True, "keep_tool_metadata": False,
+            "admin_allowed_origins": "", "responses_projection_mode": "balanced",
+            "responses_projection_max_bytes": 40000})
         env["CODEBUDDY2API_IMAGE_POLICY"] = "invalid-overridden"
         self.assertEqual(self.configure(env, ("--max-images", "0", "--image-policy", "truncate"))["max_images"], 0)
 
@@ -1032,41 +1050,41 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class LogIntegrationTests(unittest.TestCase):
-    def test_log_rotation_is_bounded_and_thread_safe(self):
+    def test_runtime_events_use_sqlite_audit_not_text_files(self):
+        from app.audit_store import AuditStore
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.log"
-            with patch.dict(converter.CONFIG, {"log_path": str(path), "log_body_limit": 256}), \
-                    patch.object(converter, "LOG_MAX_BYTES", 2048):
-                with ThreadPoolExecutor(max_workers=8) as executor:
-                    list(executor.map(converter._log, [f"event={i} " + "汉字" * 1000 for i in range(30)]))
-            files = list(Path(directory).glob("test.log*"))
-            self.assertLessEqual(len(files), 3)
-            self.assertTrue(all(file.stat().st_size <= 2048 for file in files))
-            for file in files:
-                file.read_text(encoding="utf-8", errors="strict")
+            with contextlib.closing(AuditStore(Path(directory) / "logs.sqlite3")) as audit:
+                with patch.dict(converter.CONFIG, {"log_path": str(path), "audit_store": audit}):
+                    with ThreadPoolExecutor(max_workers=8) as executor:
+                        list(executor.map(converter._log, ["[cred] updated" for _ in range(30)]))
+                self.assertEqual(len(audit.list_records("runtime", limit=100)["items"]), 30)
+            self.assertFalse(path.exists())
 
-    def test_body_previews_do_not_log_image_data_or_tokens(self):
+    def test_body_previews_and_secret_hints_never_reach_persistent_logs(self):
+        from app.audit_store import AuditStore
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.log"
-            with patch.dict(converter.CONFIG, {"log_path": str(path), "log_body_limit": 1024}):
-                converter._log_json("body", {"accessToken": "synthetic-private", "image": "data:image/png;base64," + "Z" * 10000})
-                converter._log("ReadTimeout: Authorization: Bearer synthetic-secret")
-            text = path.read_text()
-            self.assertNotIn("synthetic-private", text)
-            self.assertNotIn("synthetic-secret", text)
-            self.assertNotIn("Z" * 20, text)
-            self.assertIn("ReadTimeout", text)
-            self.assertLess(path.stat().st_size, 1500)
+            database = Path(directory) / "logs.sqlite3"
+            key = "cb-" + "a" * 32
+            with contextlib.closing(AuditStore(database)) as audit:
+                with patch.dict(converter.CONFIG, {"log_path": str(path), "log_body_limit": 1024, "audit_store": audit}):
+                    converter._log_json("body", {"accessToken": "synthetic-private", "image": "data:image/png;base64," + "Z" * 10000})
+                    converter._log("[cred] failure " + key)
+                    converter._log("ReadTimeout: Authorization: Bearer synthetic-secret")
+            self.assertFalse(path.exists())
+            raw = b"".join(file.read_bytes() for file in Path(directory).glob("logs.sqlite3*"))
+            for secret in (key.encode(), b"synthetic-private", b"synthetic-secret", b"Z" * 20):
+                self.assertNotIn(secret, raw)
 
-    def test_zero_body_budget_keeps_summary_only(self):
+    def test_retired_text_setting_cannot_reenable_file_output(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "test.log"
-            with patch.dict(converter.CONFIG, {"log_path": str(path), "log_body_limit": 0}):
+            with patch.dict(converter.CONFIG, {"log_path": str(path), "log_body_limit": 0, "audit_store": None}):
                 converter._log_json("body", {"text": "must-not-be-logged"})
                 converter._log_text_body("raw", "must-not-be-logged")
                 converter._log("request summary")
-            self.assertIn("request summary", path.read_text())
-            self.assertNotIn("must-not-be-logged", path.read_text())
+            self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":

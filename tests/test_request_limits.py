@@ -319,15 +319,15 @@ class ImageAdapterTests(unittest.TestCase):
             "parameters": {"type": "object", "properties": {}}}}]}
         before = deepcopy(body)
         out, stats = project_responses_chat_body(body)
-        self.assertEqual(stats["mode"], "conservative")
+        self.assertEqual(stats["mode"], "balanced")
         self.assertEqual(len(out["messages"]), len(body["messages"]))
         for index in (0, 1, 2, 3, 16):
             self.assertEqual(out["messages"][index]["content"][-1], body["messages"][index]["content"][-1])
-        self.assertLess(len(out["messages"][3]["content"][0]["text"]), 5000)
+        self.assertEqual(out["messages"][3]["content"][0]["text"], "x" * 5000)
         self.assertEqual(out["messages"][2]["tool_calls"], [call])
         self.assertEqual(out["messages"][2]["reasoning_content"], "unchanged reasoning")
         self.assertEqual(out["messages"][3]["tool_call_id"], "call_old")
-        self.assertNotIn("description", out["tools"][0]["function"])
+        self.assertEqual(out["tools"], body["tools"])
         self.assertEqual(body, before)
 
 

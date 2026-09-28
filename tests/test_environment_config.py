@@ -36,6 +36,7 @@ class EnvironmentConfigTests(unittest.TestCase):
         env.update(environ or {})
         with patch.dict(os.environ, env, clear=True), patch.dict(converter.CONFIG, dict(converter.CONFIG), clear=True), \
              patch.object(sys, 'argv', ['converter.py', '--skip-check', *cli]), \
+             patch.object(converter, 'load_startup_env', return_value=set()), \
              patch.object(converter, 'seed_credentials') as seed, patch.object(converter, 'CredentialPool') as pool, \
              patch.object(converter, '_publish_model_cache'), patch.object(runtime_management, 'install'), \
              patch.object(converter.threading, 'Thread'), patch.object(converter, '_log'), \
@@ -135,6 +136,23 @@ class EnvironmentConfigTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             self.start({'CODEBUDDY2API_MODEL_CAPABILITY_GUARD': 'invalid'})
 
+    def test_stream_mode_precedence_validation_and_hot_schema(self):
+        _, items, config = self.start(saved={'stream_mode': 'realtime'})
+        self.assertEqual(config['stream_mode'], 'realtime')
+        self.assertEqual(items['stream_mode']['source'], 'management')
+        self.assertEqual(items['stream_mode']['choices'], ['compatible', 'realtime'])
+        self.assertFalse(items['stream_mode']['locked'])
+        _, items, config = self.start({'CODEBUDDY2API_STREAM_MODE': 'compatible'})
+        self.assertEqual(config['stream_mode'], 'compatible')
+        self.assertEqual(items['stream_mode']['source'], 'environment')
+        self.assertTrue(items['stream_mode']['locked'])
+        _, items, config = self.start({'CODEBUDDY2API_STREAM_MODE': 'invalid'},
+                                      cli=('--stream-mode=realtime',), saved={'stream_mode': 'compatible'})
+        self.assertEqual(config['stream_mode'], 'realtime')
+        self.assertEqual(items['stream_mode']['source'], 'cli')
+        with self.assertRaises(ValueError):
+            self.start({'CODEBUDDY2API_STREAM_MODE': 'invalid'})
+
     def test_admin_allowed_origins_precedence_normalization_and_locking(self):
         key = 'CODEBUDDY2API_ADMIN_ORIGINS'
         self.assertEqual(self.start()[2]['admin_allowed_origins'], '')
@@ -155,6 +173,64 @@ class EnvironmentConfigTests(unittest.TestCase):
             self.start({key: 'ftp://example.com'})
 
 
+    def test_responses_projection_settings_default_and_environment(self):
+        _, items, config = self.start()
+        self.assertEqual((config['responses_projection_mode'], config['responses_projection_max_bytes']),
+                         ('balanced', 40000))
+        self.assertEqual(items['responses_projection_mode']['choices'], ['balanced', 'passthrough'])
+        self.assertEqual((items['responses_projection_max_bytes']['min'],
+                          items['responses_projection_max_bytes']['max']), (0, 33554432))
+        _, items, config = self.start({
+            'CODEBUDDY2API_RESPONSES_PROJECTION_MODE': 'passthrough',
+            'CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES': '0'})
+        self.assertEqual((config['responses_projection_mode'], config['responses_projection_max_bytes']),
+                         ('passthrough', 0))
+        self.assertTrue(all(items[key]['locked'] for key in (
+            'responses_projection_mode', 'responses_projection_max_bytes')))
+        with self.assertRaises(ValueError):
+            self.start({'CODEBUDDY2API_RESPONSES_PROJECTION_MODE': 'invalid'})
+        for value in ('1', '128', '255', '33554433'):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                self.start({'CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES': value})
+        for value in ('1', '128', '255', '33554433'):
+            with self.subTest(value=value), self.assertRaises(SystemExit):
+                self.start(cli=(f'--responses-projection-max-bytes={value}',))
+        with self.assertRaises(SystemExit):
+            self.start(cli=('--responses-projection-mode=legacy',))
+
+    def test_responses_projection_settings_management_precedence_and_schema(self):
+        _, items, config = self.start(saved={
+            'responses_projection_mode': 'passthrough', 'responses_projection_max_bytes': 0})
+        self.assertEqual((config['responses_projection_mode'], config['responses_projection_max_bytes']),
+                         ('passthrough', 0))
+        self.assertEqual(items['responses_projection_mode'], {
+            'key': 'responses_projection_mode', 'value': 'passthrough', 'stored': 'passthrough',
+            'source': 'management', 'mode': 'hot', 'type': 'string',
+            'label': 'Responses 投影模式', 'locked': False,
+            'choices': ['balanced', 'passthrough']})
+        self.assertEqual(items['responses_projection_max_bytes'], {
+            'key': 'responses_projection_max_bytes', 'value': 0, 'stored': 0,
+            'source': 'management', 'mode': 'hot', 'type': 'integer',
+            'label': 'Responses 单项字节上限（0 或 ≥256）', 'locked': False,
+            'min': 0, 'max': 33554432})
+        _, items, config = self.start({
+            'CODEBUDDY2API_RESPONSES_PROJECTION_MODE': 'balanced',
+            'CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES': '33554432'}, saved={
+            'responses_projection_mode': 'passthrough', 'responses_projection_max_bytes': 0})
+        self.assertEqual((config['responses_projection_mode'], config['responses_projection_max_bytes']),
+                         ('balanced', 33554432))
+        self.assertTrue(all(items[key]['source'] == 'environment' and items[key]['locked']
+                            for key in ('responses_projection_mode', 'responses_projection_max_bytes')))
+
+        _, items, config = self.start({
+            'CODEBUDDY2API_RESPONSES_PROJECTION_MODE': 'balanced',
+            'CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES': '33554432'},
+            cli=('--responses-projection-mode=passthrough', '--responses-projection-max-bytes=0'),
+            saved={'responses_projection_mode': 'balanced', 'responses_projection_max_bytes': 256})
+        self.assertEqual((config['responses_projection_mode'], config['responses_projection_max_bytes']),
+                         ('passthrough', 0))
+        self.assertTrue(all(items[key]['source'] == 'cli' and items[key]['locked']
+                            for key in ('responses_projection_mode', 'responses_projection_max_bytes')))
     def test_request_context_mode_precedence_and_validation(self):
         _, items, config = self.start(saved={'request_context_mode': 'scoped'})
         self.assertEqual(config['request_context_mode'], 'scoped')
@@ -204,6 +280,9 @@ class EnvironmentConfigTests(unittest.TestCase):
                   'CODEBUDDY2API_FAILOVER_MAX': '1', 'CODEBUDDY2API_RETRY_WRITE_TIMEOUT': 'true',
                   'CODEBUDDY2API_UPSTREAM_KEEPALIVE': 'true', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT': '2',
                   'CODEBUDDY2API_REQUEST_CONTEXT_MODE': 'scoped',
+                  'CODEBUDDY2API_RESPONSES_PROJECTION_MODE': 'passthrough',
+                  'CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES': '0',
+                  'CODEBUDDY2API_STREAM_MODE': 'realtime',
                   'CODEBUDDY2API_MODEL_CAPABILITY_GUARD': 'false',
                   'CODEBUDDY2API_ADMIN_ORIGINS': 'https://chat.example.com',
                   'CODEBUDDY2API_KEEP_TOOL_METADATA': 'false', 'CODEBUDDY_IMPORT_DIR': '/data/auth/incoming'}
@@ -220,7 +299,10 @@ class EnvironmentConfigTests(unittest.TestCase):
         service = self.compose({})
         for name in ('CODEBUDDY2API_KEEP_TOOL_METADATA', 'CODEBUDDY2API_FAILOVER_MAX', 'CODEBUDDY2API_RETRY_WRITE_TIMEOUT',
                      'CODEBUDDY2API_UPSTREAM_KEEPALIVE', 'CODEBUDDY2API_MAX_INFLIGHT_PER_ACCOUNT',
-                     'CODEBUDDY2API_REQUEST_CONTEXT_MODE', 'CODEBUDDY2API_MODEL_CAPABILITY_GUARD',
+                     'CODEBUDDY2API_REQUEST_CONTEXT_MODE',
+                     'CODEBUDDY2API_RESPONSES_PROJECTION_MODE',
+                     'CODEBUDDY2API_RESPONSES_PROJECTION_MAX_BYTES', 'CODEBUDDY2API_STREAM_MODE',
+                     'CODEBUDDY2API_MODEL_CAPABILITY_GUARD',
                      'CODEBUDDY2API_ADMIN_ORIGINS'):
             self.assertIsNone(service['environment'].get(name))
         self.assertEqual(service['ports'][0]['host_ip'], '127.0.0.1')
