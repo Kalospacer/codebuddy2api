@@ -97,6 +97,11 @@ def validate_cred_data(data) -> tuple[str | None, str | None]:
     token = auth.get("accessToken") or auth.get("access_token") or auth.get("token")
     if not isinstance(token, str) or not token:
         return None, "缺少有效的 accessToken"
+    # Envelope objects must be rejected before persistence, including token aliases.
+    for field in ("accessToken", "access_token", "token", "refreshToken", "refresh_token"):
+        value = auth.get(field)
+        if value is not None and not isinstance(value, str):
+            return None, f"{field} 不是明文字符串（可能为加密信封格式）"
     for field in ("expiresAt", "lastRefreshTime"):
         value = auth.get(field)
         if value is None:
