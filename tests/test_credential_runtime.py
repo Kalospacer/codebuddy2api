@@ -294,6 +294,26 @@ class CredentialRuntimeTests(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
         self.assertIn("refreshToken", rejected[0].args[0])
 
+
+    def test_replaced_envelope_file_at_same_path_logs_again(self):
+        envelope = self.root / "churn.info"
+        def write_envelope(uid):
+            envelope.write_text(json.dumps({"account": {"uid": uid}, "auth": {
+                "accessToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+                "domain": "www.workbuddy.ai", "expiresAt": (time.time() + 86400) * 1000}}),
+                encoding="utf-8")
+        def rejections():
+            return len([c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]])
+        write_envelope("churn")
+        pool = converter.CredentialPool([envelope], scan=True)
+        self.assertEqual(rejections(), 1)
+        envelope.unlink()
+        write_envelope("other-account")  # A different credential, no scan ran while missing.
+        pool._rescan()
+        self.assertEqual(pool.entries(), [])
+        self.assertEqual(rejections(), 2)
+        pool._rescan()  # Identical content on the next scan stays silent.
+        self.assertEqual(rejections(), 2)
     def test_recreated_envelope_file_at_same_path_logs_again(self):
         envelope = self.root / "reuse.info"
         def write_envelope():
