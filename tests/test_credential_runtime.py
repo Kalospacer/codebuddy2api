@@ -264,6 +264,48 @@ class CredentialRuntimeTests(unittest.TestCase):
         pool._rescan()
         self.assertEqual([e["id"] for e in pool.entries()], [str(second)])
 
+    def test_encrypted_envelope_tokens_fail_fast_and_stay_out_of_pool(self):
+        valid = self.credential("valid.info", uid="valid", age=0)
+        envelope = self.root / "envelope.info"
+        envelope.write_text(json.dumps({"account": {"uid": "envelope"}, "auth": {
+            "accessToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+            "refreshToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+            "domain": "www.workbuddy.ai", "expiresAt": (time.time() + 86400) * 1000}}),
+            encoding="utf-8")
+        pool = converter.CredentialPool([valid, envelope])
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["valid.info"])
+        rejected = [c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("accessToken", rejected[0].args[0])
+        pool.reload([valid, envelope], reset=False)  # Repeat reloads neither re-log nor admit.
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["valid.info"])
+        self.assertEqual(len([c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]), 1)
+        with self.assertRaises(converter.auth_oauth.AuthTokenTypeError):  # Direct use fails fast.
+            converter.CredentialManager(envelope).get_headers()
+
+    def test_envelope_refresh_token_alone_is_rejected(self):
+        path = self.credential("rt.info", uid="rt", age=0)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["refreshToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool = converter.CredentialPool([path])
+        self.assertEqual(pool.entries(), [])
+        rejected = [c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("refreshToken", rejected[0].args[0])
+
+    def test_swapped_envelope_file_fails_fast_on_next_use(self):
+        path = self.credential(age=0)
+        pool = converter.CredentialPool([path])
+        self.assertEqual(len(pool.entries()), 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["accessToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool.reload([path], reset=True)  # A damaged file must not block other credentials.
+        entry = pool.entries()[0]
+        with self.assertRaises(converter.auth_oauth.AuthTokenTypeError):
+            entry["cm"].get_headers()
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

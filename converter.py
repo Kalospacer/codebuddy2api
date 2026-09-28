@@ -268,7 +268,12 @@ class CredentialManager:
         self._load_if_stale()
         if self._cached is None:
             raise RuntimeError(f"无法读取 auth 文件：{self.path}")
-        return self._cached
+        s = self._cached
+        auth = s.get("auth")
+        if isinstance(auth, dict):
+            # Encrypted envelope tokens must fail fast instead of leaking into upstream headers.
+            auth_oauth.ensure_plaintext_tokens(auth)
+        return s
 
     def _is_expired(self) -> bool:
         s = self._session()
@@ -518,6 +523,7 @@ class CredentialPool:
         self._capacity = AccountCapacity()
         self._scan = scan                # Rescan credentials before selection.
         self._ignored_duplicates: set[str] = set()
+        self._ignored_invalid: set[str] = set()
         self._sync_pending: set[str] = set()
         self._syncing: set[str] = set()
         self._sync_event = threading.Event()
@@ -576,6 +582,12 @@ class CredentialPool:
                 manager = CredentialManager(Path(cid))
                 try:
                     summary = manager.summary()
+                except auth_oauth.AuthTokenTypeError as error:
+                    # Envelope tokens cannot be refreshed or used; keep such files out of the pool.
+                    if cid not in self._ignored_invalid:
+                        _log(f"[cred] 拒绝入池（入库校验失败：{error}）: {Path(cid).name}")
+                        self._ignored_invalid.add(cid)
+                    continue
                 except Exception:
                     summary = {}
                 uid = summary.get("uid")
@@ -594,6 +606,7 @@ class CredentialPool:
                 self._entries.append(entry)
                 by_id[cid] = entry
                 self._ignored_duplicates.discard(cid)
+                self._ignored_invalid.discard(cid)
                 if uid:
                     have_uids[identity_key] = cid
                 self._queue_sync(cid)
