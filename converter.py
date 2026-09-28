@@ -2091,14 +2091,16 @@ def admin_del_credential(name: str,
     """Delete the named .info file, unbinding model rules only after removal succeeds."""
     _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
-    unbind_identity = None
+    rollback = {}
     if CONFIG.get("management") is not None:
-        unbind_identity = CONFIG["management"].admin_delete_guard(os.path.basename(name), unbind=unbind)
+        identity = CONFIG["management"].admin_delete_guard(os.path.basename(name), unbind=unbind)
+        if identity is not None:
+            rollback = CONFIG["management"].admin_unbind_credential(identity)
     if pool is None or not pool.remove_file(os.path.basename(name)):
-        # Bindings stay untouched so a failed removal never widens routing to automatic.
+        # A failed removal rolls the unbind back so routing never widens silently.
+        if CONFIG.get("management") is not None and rollback:
+            CONFIG["management"].admin_restore_bindings(rollback)
         raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
-    if unbind_identity is not None and CONFIG.get("management") is not None:
-        CONFIG["management"].admin_unbind_credential(unbind_identity)
     return {"removed": os.path.basename(name)}
 
 

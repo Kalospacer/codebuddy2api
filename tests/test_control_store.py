@@ -86,13 +86,20 @@ class ControlStoreTests(unittest.TestCase):
         self.store.update_model("real", {"public_id": "public", "credential_ids": ["fingerprint", "other"]}, 0)
         self.store.update_model("second", {"credential_ids": ["fingerprint"]}, 1)
         self.store.update_model("third", {"credential_ids": ["other"]}, 2)
-        state = self.store.unbind_credential("fingerprint")
-        self.assertEqual(state["revision"], 4)  # Three setup bumps, then one for the unbind.
-        self.assertEqual(state["models"]["real"]["credential_ids"], ["other"])
-        self.assertEqual(state["models"]["second"]["credential_ids"], [])
-        self.assertEqual(state["models"]["third"]["credential_ids"], ["other"])
-        self.store.unbind_credential("unknown-identity")  # Unknown identities are a no-op.
+        affected = self.store.unbind_credential("fingerprint")
+        self.assertEqual(affected, {"real": ["fingerprint", "other"], "second": ["fingerprint"]})
+        self.assertEqual(self.store.snapshot()["revision"], 4)  # Three setup bumps, then one for the unbind.
+        self.assertEqual(self.store.snapshot()["models"]["real"]["credential_ids"], ["other"])
+        self.assertEqual(self.store.snapshot()["models"]["second"]["credential_ids"], [])
+        self.assertEqual(self.store.snapshot()["models"]["third"]["credential_ids"], ["other"])
+        self.assertEqual(self.store.unbind_credential("unknown-identity"), {})  # No-op keeps the revision.
         self.assertEqual(self.store.snapshot()["revision"], 4)
+        self.store.restore_bindings(affected)  # Rollback restores both rules in one bump.
+        self.assertEqual(self.store.snapshot()["models"]["real"]["credential_ids"], ["fingerprint", "other"])
+        self.assertEqual(self.store.snapshot()["models"]["second"]["credential_ids"], ["fingerprint"])
+        self.assertEqual(self.store.snapshot()["revision"], 5)
+        self.store.restore_bindings(affected)  # An already-restored state bumps nothing.
+        self.assertEqual(self.store.snapshot()["revision"], 5)
         with self.assertRaises(ValueError):
             self.store.unbind_credential("not a fingerprint")
 

@@ -121,10 +121,17 @@ class Management:
         return row["id"]
 
     def admin_unbind_credential(self, identity):
-        """Drop the deleted credential's bindings; run only after its file is gone."""
+        """Unbind now and return the rollback map used when file removal fails."""
+        control = self.CONFIG.get("control_store")
+        if control is None:
+            return {}
+        return control.unbind_credential(identity)
+
+    def admin_restore_bindings(self, affected):
+        """Put bindings back after a failed removal so routing never widens silently."""
         control = self.CONFIG.get("control_store")
         if control is not None:
-            control.unbind_credential(identity)
+            control.restore_bindings(affected)
 
     def admin_model_inventory(self):
         pool = self.CONFIG.get("cred_pool")

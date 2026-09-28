@@ -194,17 +194,32 @@ class ControlStore:
         return self._update(None, lambda state: state["credentials"].setdefault(account_key, {}).update(enabled=enabled))
 
     def unbind_credential(self, account_key):
-        """Drop an account key from every model rule binding in one revision bump."""
+        """Drop an account key from every rule, returning {source: old_ids} for rollback."""
         _identifier(account_key, "账号指纹")
-        snapshot = self.snapshot()
         if not any(account_key in (rule.get("credential_ids") or [])
-                   for rule in snapshot["models"].values()):
-            return snapshot  # Nothing references the identity; keep the revision stable.
+                   for rule in self.snapshot()["models"].values()):
+            return {}  # Nothing references the identity; keep the revision stable.
+        affected = {}
         def change(state):
-            for rule in state["models"].values():
+            for source, rule in state["models"].items():
                 ids = rule.get("credential_ids") or []
                 if account_key in ids:
+                    affected[source] = list(ids)
                     rule["credential_ids"] = [identity for identity in ids if identity != account_key]
+        self._update(None, change)
+        return affected
+
+    def restore_bindings(self, affected):
+        """Put back the bindings captured by unbind_credential in one revision bump."""
+        pending = {source: ids for source, ids in dict(affected or {}).items() if isinstance(ids, list)}
+        current = self.snapshot()["models"]
+        if not any(current.get(source, {}).get("credential_ids") != ids for source, ids in pending.items()):
+            return self.snapshot()  # Already restored; keep the revision stable.
+        def change(state):
+            for source, ids in pending.items():
+                rule = state["models"].get(source)
+                if rule is not None and rule.get("credential_ids") != ids:
+                    rule["credential_ids"] = list(ids)
         return self._update(None, change)
 
     def set_auto_checkin(self, account_key, enabled):

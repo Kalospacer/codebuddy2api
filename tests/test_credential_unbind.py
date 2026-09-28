@@ -48,18 +48,18 @@ class UnbindDeleteTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertEqual(ctx.exception.detail["models"], ["glm-4-flash"])
 
-    def test_confirmed_delete_unbinds_only_after_removal_succeeds(self):
+    def test_confirmed_unbind_rolls_back_when_removal_fails(self):
         self.store.update_model("glm-4-flash", {"public_id": "glm4", "credential_ids": [self.identity, "other"]}, 0)
         identity = self.management.admin_delete_guard("account.info", unbind=True)
         self.assertEqual(identity, self.identity)
-        self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"],
-                         [self.identity, "other"])  # The guard itself must not unbind.
-        self.assertTrue(self.pool.remove_file("account.info"))
-        self.management.admin_unbind_credential(identity)
+        rollback = self.management.admin_unbind_credential(identity)
+        self.assertEqual(rollback, {"glm-4-flash": [self.identity, "other"]})
+        self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"], ["other"])
+        self.management.admin_restore_bindings(rollback)  # A failed removal undoes the unbind.
         rule = self.store.snapshot()["models"]["glm-4-flash"]
-        self.assertEqual(rule["credential_ids"], ["other"])
+        self.assertEqual(rule["credential_ids"], [self.identity, "other"])
         self.assertEqual(rule["public_id"], "glm4")
-        self.assertFalse(self.path.exists())
+        self.assertTrue(self.path.exists())
 
     def test_route_keeps_bindings_when_removal_fails(self):
         self.bind()
