@@ -522,6 +522,8 @@ class CredentialPool:
         self._ledger = None              # Prefer credits expiring sooner.
         self._capacity = AccountCapacity()
         self._scan = scan                # Rescan credentials before selection.
+        # Explicit paths must survive rejection or eviction so a repaired file re-enters.
+        self._configured: list[str] = []
         self._ignored_duplicates: set[str] = set()
         self._ignored_invalid: dict[str, str | None] = {}
         self._sync_pending: set[str] = set()
@@ -541,6 +543,8 @@ class CredentialPool:
                          for entry in self._entries if entry.get("uid")}
             for path in paths:
                 cid = str(Path(path).resolve())
+                if cid not in self._configured:
+                    self._configured.append(cid)
                 if not os.path.exists(cid):
                     continue
                 entry = by_id.get(cid)
@@ -904,7 +908,8 @@ class CredentialPool:
         return (exp is None, exp or 0.0)
     def _rescan(self):
         self.prune()
-        paths = find_auth_files() if self._scan else [Path(entry["id"]) for entry in self.entries()]
+        # Explicit mode retries configured paths, including rejected or evicted ones.
+        paths = find_auth_files() if self._scan else [Path(cid) for cid in self._configured]
         self.reload(paths, reset=False)
 
     def _healthy(self, e: dict) -> bool:

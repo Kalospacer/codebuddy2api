@@ -350,6 +350,30 @@ class CredentialRuntimeTests(unittest.TestCase):
         rejected = [c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]
         self.assertEqual(len(rejected), 1)
 
+    def test_rejected_explicit_path_recovers_when_repaired(self):
+        path = self.credential("explicit.info", uid="explicit", age=0)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["accessToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool = converter.CredentialPool([path])  # Explicit mode (scan=False).
+        self.assertEqual(pool.entries(), [])
+        self.credential("explicit.info", uid="explicit", age=0)  # Repair the same file.
+        pool._rescan()
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["explicit.info"])
+
+    def test_evicted_explicit_path_recovers_when_repaired(self):
+        path = self.credential("evicted.info", uid="evicted", age=0)
+        pool = converter.CredentialPool([path])
+        self.assertEqual(len(pool.entries()), 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["refreshToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool.reload([path], reset=True)  # The envelope replacement evicts the entry.
+        self.assertEqual(pool.entries(), [])
+        self.credential("evicted.info", uid="evicted", age=0)  # Repair the same file.
+        pool._rescan()
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["evicted.info"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
