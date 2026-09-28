@@ -294,6 +294,26 @@ class CredentialRuntimeTests(unittest.TestCase):
         self.assertEqual(len(rejected), 1)
         self.assertIn("refreshToken", rejected[0].args[0])
 
+    def test_recreated_envelope_file_at_same_path_logs_again(self):
+        envelope = self.root / "reuse.info"
+        def write_envelope():
+            envelope.write_text(json.dumps({"account": {"uid": "reuse"}, "auth": {
+                "accessToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+                "domain": "www.workbuddy.ai", "expiresAt": (time.time() + 86400) * 1000}}),
+                encoding="utf-8")
+        def rejections():
+            return len([c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]])
+        write_envelope()
+        pool = converter.CredentialPool([envelope], scan=True)
+        self.assertEqual(pool.entries(), [])
+        self.assertEqual(rejections(), 1)
+        envelope.unlink()
+        pool._rescan()  # Prune drops the suppressed path once the file is gone.
+        write_envelope()
+        pool._rescan()  # A new invalid file at the same path must warn again.
+        self.assertEqual(pool.entries(), [])
+        self.assertEqual(rejections(), 2)
+
     def test_swapped_envelope_file_fails_fast_on_next_use(self):
         path = self.credential(age=0)
         pool = converter.CredentialPool([path])

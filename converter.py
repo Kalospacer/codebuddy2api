@@ -681,6 +681,8 @@ class CredentialPool:
         """Remove missing credential files and their session bindings."""
         with self._lock:
             self._ignored_duplicates = {p for p in self._ignored_duplicates if os.path.exists(p)}
+            # A path whose invalid file vanished must warn again when a new file reuses it.
+            self._ignored_invalid = {p for p in self._ignored_invalid if os.path.exists(p)}
             before = len(self._entries)
             removed = [e for e in self._entries if not os.path.exists(e["id"])]
             for entry in removed:
