@@ -53,13 +53,23 @@ class UnbindDeleteTests(unittest.TestCase):
         identity = self.management.admin_delete_guard("account.info", unbind=True)
         self.assertEqual(identity, self.identity)
         rollback = self.management.admin_unbind_credential(identity)
-        self.assertEqual(rollback, {"glm-4-flash": [self.identity, "other"]})
+        self.assertEqual(rollback, {"identity": self.identity, "rules": {"glm-4-flash": [self.identity, "other"]}})
         self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"], ["other"])
         self.management.admin_restore_bindings(rollback)  # A failed removal undoes the unbind.
         rule = self.store.snapshot()["models"]["glm-4-flash"]
         self.assertEqual(rule["credential_ids"], [self.identity, "other"])
         self.assertEqual(rule["public_id"], "glm4")
         self.assertTrue(self.path.exists())
+
+    def test_rollback_preserves_concurrent_binding_edits(self):
+        self.store.update_model("glm-4-flash", {"credential_ids": [self.identity, "other"]}, 0)
+        identity = self.management.admin_delete_guard("account.info", unbind=True)
+        rollback = self.management.admin_unbind_credential(identity)
+        # Another administrator rebinds the rule between the unbind and the rollback.
+        revision = self.store.snapshot()["revision"]
+        self.store.update_model("glm-4-flash", {"credential_ids": ["fresh"]}, revision)
+        self.management.admin_restore_bindings(rollback)
+        self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"], ["fresh"])
 
     def test_route_keeps_bindings_when_removal_fails(self):
         self.bind()

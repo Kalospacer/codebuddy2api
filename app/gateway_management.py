@@ -121,17 +121,17 @@ class Management:
         return row["id"]
 
     def admin_unbind_credential(self, identity):
-        """Unbind now and return the rollback map used when file removal fails."""
+        """Unbind now and return the rollback record used when removal fails."""
         control = self.CONFIG.get("control_store")
         if control is None:
             return {}
-        return control.unbind_credential(identity)
+        return {"identity": identity, "rules": control.unbind_credential(identity)}
 
-    def admin_restore_bindings(self, affected):
+    def admin_restore_bindings(self, rollback):
         """Put bindings back after a failed removal so routing never widens silently."""
         control = self.CONFIG.get("control_store")
         if control is not None:
-            control.restore_bindings(affected)
+            control.restore_bindings(rollback["identity"], rollback["rules"])
 
     def admin_model_inventory(self):
         pool = self.CONFIG.get("cred_pool")

@@ -94,12 +94,24 @@ class ControlStoreTests(unittest.TestCase):
         self.assertEqual(self.store.snapshot()["models"]["third"]["credential_ids"], ["other"])
         self.assertEqual(self.store.unbind_credential("unknown-identity"), {})  # No-op keeps the revision.
         self.assertEqual(self.store.snapshot()["revision"], 4)
-        self.store.restore_bindings(affected)  # Rollback restores both rules in one bump.
+        self.store.restore_bindings("fingerprint", affected)  # Rollback restores both rules in one bump.
         self.assertEqual(self.store.snapshot()["models"]["real"]["credential_ids"], ["fingerprint", "other"])
         self.assertEqual(self.store.snapshot()["models"]["second"]["credential_ids"], ["fingerprint"])
         self.assertEqual(self.store.snapshot()["revision"], 5)
-        self.store.restore_bindings(affected)  # An already-restored state bumps nothing.
+        self.store.restore_bindings("fingerprint", affected)  # An already-restored state bumps nothing.
         self.assertEqual(self.store.snapshot()["revision"], 5)
+
+    def test_rollback_keeps_concurrent_edits_and_deleted_rules(self):
+        self.store.update_model("real", {"credential_ids": ["fingerprint", "other"]}, 0)
+        self.store.update_model("gone", {"custom": True, "public_id": "gone-public", "credential_ids": ["fingerprint"]}, 1)
+        affected = self.store.unbind_credential("fingerprint")
+        revision = self.store.snapshot()["revision"]
+        # Concurrent edits: one rule rebound elsewhere, another deleted outright.
+        self.store.update_model("real", {"credential_ids": ["fresh"]}, revision)
+        self.store.delete_model("gone", self.store.snapshot()["revision"])
+        self.store.restore_bindings("fingerprint", affected)
+        self.assertEqual(self.store.snapshot()["models"]["real"]["credential_ids"], ["fresh"])
+        self.assertNotIn("gone", self.store.snapshot()["models"])
         with self.assertRaises(ValueError):
             self.store.unbind_credential("not a fingerprint")
 

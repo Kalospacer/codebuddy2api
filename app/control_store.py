@@ -209,17 +209,25 @@ class ControlStore:
         self._update(None, change)
         return affected
 
-    def restore_bindings(self, affected):
-        """Put back the bindings captured by unbind_credential in one revision bump."""
+    def restore_bindings(self, account_key, affected):
+        """Re-add the identity where a rule still matches its post-unbind state.
+
+        Concurrent edits that changed a rule's binding list are preserved.
+        """
+        _identifier(account_key, "账号指纹")
         pending = {source: ids for source, ids in dict(affected or {}).items() if isinstance(ids, list)}
-        current = self.snapshot()["models"]
-        if not any(current.get(source, {}).get("credential_ids") != ids for source, ids in pending.items()):
-            return self.snapshot()  # Already restored; keep the revision stable.
+        def restorable(rule, ids):
+            if rule is None:
+                return False  # A rule deleted meanwhile stays deleted.
+            current = rule.get("credential_ids") or []
+            return current == [identity for identity in ids if identity != account_key]
+        snapshot = self.snapshot()
+        if not any(restorable(snapshot["models"].get(source), ids) for source, ids in pending.items()):
+            return snapshot  # Nothing to restore; concurrent edits win.
         def change(state):
             for source, ids in pending.items():
-                rule = state["models"].get(source)
-                if rule is not None and rule.get("credential_ids") != ids:
-                    rule["credential_ids"] = list(ids)
+                if restorable(state["models"].get(source), ids):
+                    state["models"][source]["credential_ids"] = list(ids)
         return self._update(None, change)
 
     def set_auto_checkin(self, account_key, enabled):
