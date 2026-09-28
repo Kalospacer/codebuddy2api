@@ -11,7 +11,9 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 
 import converter
 from app.control_store import ControlStore
@@ -46,19 +48,38 @@ class UnbindDeleteTests(unittest.TestCase):
         self.assertEqual(ctx.exception.status_code, 409)
         self.assertEqual(ctx.exception.detail["models"], ["glm-4-flash"])
 
-    def test_confirmed_delete_unbinds_rules_then_removes_the_file(self):
+    def test_confirmed_delete_unbinds_only_after_removal_succeeds(self):
         self.store.update_model("glm-4-flash", {"public_id": "glm4", "credential_ids": [self.identity, "other"]}, 0)
-        self.management.admin_delete_guard("account.info", unbind=True)
+        identity = self.management.admin_delete_guard("account.info", unbind=True)
+        self.assertEqual(identity, self.identity)
+        self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"],
+                         [self.identity, "other"])  # The guard itself must not unbind.
+        self.assertTrue(self.pool.remove_file("account.info"))
+        self.management.admin_unbind_credential(identity)
         rule = self.store.snapshot()["models"]["glm-4-flash"]
         self.assertEqual(rule["credential_ids"], ["other"])
         self.assertEqual(rule["public_id"], "glm4")
-        self.assertTrue(self.pool.remove_file("account.info"))
+        self.assertFalse(self.path.exists())
+
+    def test_route_keeps_bindings_when_removal_fails(self):
+        self.bind()
+        config = dict(self.config, api_key="secret", management=self.management)
+        self.enterContext(patch.dict(converter.CONFIG, config))
+        client = TestClient(converter.app)
+        headers = {"X-Api-Key": "secret"}
+        with patch.object(self.pool, "remove_file", return_value=False):
+            response = client.delete("/admin/credentials/account.info?unbind=1", headers=headers)
+            self.assertEqual(response.status_code, 404, response.text)
+        self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"],
+                         [self.identity])  # A failed removal never widens routing to automatic.
+        response = client.delete("/admin/credentials/account.info?unbind=1", headers=headers)
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(self.store.snapshot()["models"]["glm-4-flash"]["credential_ids"], [])
         self.assertFalse(self.path.exists())
 
     def test_unbound_and_unknown_credentials_stay_on_the_fast_path(self):
-        self.management.admin_delete_guard("account.info")  # No bindings: nothing to unbind.
-        self.assertEqual(self.store.snapshot()["revision"], 0)
-        self.management.admin_delete_guard("missing.info", unbind=True)  # Unknown name: pool reports 404.
+        self.assertIsNone(self.management.admin_delete_guard("account.info"))  # No bindings.
+        self.assertIsNone(self.management.admin_delete_guard("missing.info", unbind=True))  # Pool reports 404.
         self.assertEqual(self.store.snapshot()["revision"], 0)
 
 

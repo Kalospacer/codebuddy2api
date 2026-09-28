@@ -110,18 +110,21 @@ class Management:
             self.CONFIG["control_store"].set_auto_travel(identity, enabled)
 
     def admin_delete_guard(self, name, *, unbind=False):
-        """Block deleting a bound credential unless the caller confirms auto-unbinding."""
+        """Block a still-bound delete, or return the identity to unbind after removal."""
         rows = self.admin_credential_inventory()
         row = next((row for row in rows if row["name"] == name or row["id"] == name), None)
         if row is None or not row["bindings"]:
-            return
+            return None
         if not unbind:
             raise HTTPException(status_code=409, detail={"message": "凭证仍被模型规则引用，请先移除绑定",
                                                         "models": row["bindings"]})
+        return row["id"]
+
+    def admin_unbind_credential(self, identity):
+        """Drop the deleted credential's bindings; run only after its file is gone."""
         control = self.CONFIG.get("control_store")
-        if control is None:
-            raise HTTPException(status_code=500, detail="控制库不可用，无法解除绑定")
-        control.unbind_credential(row["id"])
+        if control is not None:
+            control.unbind_credential(identity)
 
     def admin_model_inventory(self):
         pool = self.CONFIG.get("cred_pool")
