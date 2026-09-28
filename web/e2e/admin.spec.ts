@@ -279,8 +279,7 @@ test("deleting a bound credential confirms the automatic unbind", async ({ page 
     .poll(() =>
       mock.calls.some(
         (call) =>
-          call.method === "DELETE" &&
-          call.path === "/admin/credentials/mock-account.info?unbind=1",
+          call.method === "DELETE" && call.path === "/admin/credentials/mock-account.info?unbind=1",
       ),
     )
     .toBe(true);
