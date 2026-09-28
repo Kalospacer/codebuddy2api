@@ -109,12 +109,19 @@ class Management:
                 raise HTTPException(400, "旅行仅适用于国内账号")
             self.CONFIG["control_store"].set_auto_travel(identity, enabled)
 
-    def admin_delete_guard(self, name):
+    def admin_delete_guard(self, name, *, unbind=False):
+        """Block deleting a bound credential unless the caller confirms auto-unbinding."""
         rows = self.admin_credential_inventory()
         row = next((row for row in rows if row["name"] == name or row["id"] == name), None)
-        if row and row["bindings"]:
+        if row is None or not row["bindings"]:
+            return
+        if not unbind:
             raise HTTPException(status_code=409, detail={"message": "凭证仍被模型规则引用，请先移除绑定",
                                                         "models": row["bindings"]})
+        control = self.CONFIG.get("control_store")
+        if control is None:
+            raise HTTPException(status_code=500, detail="控制库不可用，无法解除绑定")
+        control.unbind_credential(row["id"])
 
     def admin_model_inventory(self):
         pool = self.CONFIG.get("cred_pool")

@@ -1,0 +1,67 @@
+"""Deleting credentials that are still bound by model rules must auto-unbind on confirmation."""
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct execution.
+
+import json
+import os
+import tempfile
+import time
+import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
+
+from fastapi import HTTPException
+
+import converter
+from app.control_store import ControlStore
+from app.gateway_management import Management
+
+
+class UnbindDeleteTests(unittest.TestCase):
+    def setUp(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.enterContext(patch.dict(os.environ, {"CODEBUDDY_AUTH_DIR": str(root)}))
+        self.enterContext(patch.dict(converter.CONFIG, {"log_path": None, "cred_pool": None, "cred": None}))
+        self.path = root / "account.info"
+        self.path.write_text(json.dumps({"account": {"uid": "synthetic"}, "auth": {
+            "accessToken": "old-synthetic-token", "refreshToken": "synthetic-refresh",
+            "domain": "www.codebuddy.cn", "expiresAt": (time.time() + 86400) * 1000,
+            "lastRefreshTime": time.time() * 1000}}), encoding="utf-8")
+        self.pool = converter.CredentialPool([self.path])
+        self.store = ControlStore(root / "control.sqlite3")
+        self.addCleanup(self.store.close)
+        self.config = {"cred_pool": self.pool, "control_store": self.store,
+                       "ledger": None, "trial_ledger": None}
+        self.management = Management(SimpleNamespace(CONFIG=self.config))
+        self.identity = self.pool.entries()[0]["account_key"]
+
+    def bind(self):
+        self.store.update_model("glm-4-flash", {"credential_ids": [self.identity]}, 0)
+
+    def test_bound_delete_is_blocked_without_the_confirmation_flag(self):
+        self.bind()
+        with self.assertRaises(HTTPException) as ctx:
+            self.management.admin_delete_guard("account.info")
+        self.assertEqual(ctx.exception.status_code, 409)
+        self.assertEqual(ctx.exception.detail["models"], ["glm-4-flash"])
+
+    def test_confirmed_delete_unbinds_rules_then_removes_the_file(self):
+        self.store.update_model("glm-4-flash", {"public_id": "glm4", "credential_ids": [self.identity, "other"]}, 0)
+        self.management.admin_delete_guard("account.info", unbind=True)
+        rule = self.store.snapshot()["models"]["glm-4-flash"]
+        self.assertEqual(rule["credential_ids"], ["other"])
+        self.assertEqual(rule["public_id"], "glm4")
+        self.assertTrue(self.pool.remove_file("account.info"))
+        self.assertFalse(self.path.exists())
+
+    def test_unbound_and_unknown_credentials_stay_on_the_fast_path(self):
+        self.management.admin_delete_guard("account.info")  # No bindings: nothing to unbind.
+        self.assertEqual(self.store.snapshot()["revision"], 0)
+        self.management.admin_delete_guard("missing.info", unbind=True)  # Unknown name: pool reports 404.
+        self.assertEqual(self.store.snapshot()["revision"], 0)
+
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

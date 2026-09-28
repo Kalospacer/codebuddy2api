@@ -82,6 +82,21 @@ class ControlStoreTests(unittest.TestCase):
         self.assertEqual(reopened.snapshot()["revision"], 1)
 
 
+    def test_unbind_credential_removes_only_the_target_identity(self):
+        self.store.update_model("real", {"public_id": "public", "credential_ids": ["fingerprint", "other"]}, 0)
+        self.store.update_model("second", {"credential_ids": ["fingerprint"]}, 1)
+        self.store.update_model("third", {"credential_ids": ["other"]}, 2)
+        state = self.store.unbind_credential("fingerprint")
+        self.assertEqual(state["revision"], 4)  # Three setup bumps, then one for the unbind.
+        self.assertEqual(state["models"]["real"]["credential_ids"], ["other"])
+        self.assertEqual(state["models"]["second"]["credential_ids"], [])
+        self.assertEqual(state["models"]["third"]["credential_ids"], ["other"])
+        self.store.unbind_credential("unknown-identity")  # Unknown identities are a no-op.
+        self.assertEqual(self.store.snapshot()["revision"], 4)
+        with self.assertRaises(ValueError):
+            self.store.unbind_credential("not a fingerprint")
+
+
     def test_credential_metadata_and_no_secret_settings(self):
         self.store.set_credential("account-fingerprint", False)
         self.assertEqual(self.store.snapshot()["credentials"], {"account-fingerprint": {"enabled": False}})

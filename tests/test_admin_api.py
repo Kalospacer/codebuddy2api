@@ -511,6 +511,13 @@ class AdminApiTests(unittest.TestCase):
         self.gateway.admin_set_credential_enabled.assert_called_once_with("fingerprint", False)
         self.gateway.admin_delete_guard.side_effect = ValueError("referenced")
         self.assertEqual(self.client.delete("/admin/credentials/first.info", headers=self.headers).status_code, 409)
+        # The confirmed unbind flow bypasses the middleware guard; the delete route owns it.
+        self.gateway.admin_delete_guard.reset_mock()
+        self.gateway.admin_delete_guard.side_effect = None
+        self.assertEqual(
+            self.client.delete("/admin/credentials/first.info?unbind=1", headers=self.headers).status_code,
+            200)
+        self.gateway.admin_delete_guard.assert_not_called()
 
     def test_upload_limits_paths_and_secret_errors(self):
         for files in ([{"name": "../first.info", "content": "{}"}], [{"name": "db.sqlite3", "content": "{}"}],

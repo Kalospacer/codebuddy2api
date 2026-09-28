@@ -2085,13 +2085,14 @@ async def admin_add_credential(request: Request,
 
 @app.delete("/admin/credentials/{name}")
 def admin_del_credential(name: str,
+                         unbind: bool = False,
                          authorization: Optional[str] = Header(default=None),
                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """Delete the named .info file and remove its credential from the pool."""
+    """Delete the named .info file, first unbinding model rules when confirmed."""
     _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
     if CONFIG.get("management") is not None:
-        CONFIG["management"].admin_delete_guard(os.path.basename(name))
+        CONFIG["management"].admin_delete_guard(os.path.basename(name), unbind=unbind)
     if pool is None or not pool.remove_file(os.path.basename(name)):
         raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
     return {"removed": os.path.basename(name)}

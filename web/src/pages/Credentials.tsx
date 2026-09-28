@@ -38,6 +38,12 @@ function expiry(value: unknown, milliseconds = false) {
     : text(value);
 }
 export { safeOAuthUrl } from "../OAuth";
+function boundModels(credential: Credential): string[] {
+  return Array.isArray(credential.bindings)
+    ? credential.bindings.filter((id): id is string => typeof id === "string")
+    : [];
+}
+
 function ImportDrawer({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
   const [results, setResults] = useState<ImportResult[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -590,17 +596,33 @@ export function Credentials() {
         {deleting && (
           <Drawer title="删除凭证" onClose={() => setDeleting(null)} dismissDisabled={busy}>
             <div className={s.warning}>
-              将永久删除 {deleting.name}，不可撤销。如已绑定模型规则，请先解除绑定。
+              将永久删除 {deleting.name}，不可撤销。
+              {deleting.bindings === undefined ? (
+                "如已绑定模型规则，请先解除绑定。"
+              ) : boundModels(deleting).length ? (
+                <>
+                  该凭证仍被模型规则引用：{boundModels(deleting).join("、")}。
+                  确认后将自动解除这些绑定，规则回退为自动选择账号。
+                </>
+              ) : (
+                "该凭证未被模型规则引用。"
+              )}
             </div>
             <ErrorNotice message={error} />
             <button
               className={s.danger}
               disabled={busy}
               onClick={() =>
-                run(() => api.delete(`/credentials/${encodeURIComponent(deleting.name!)}`))
+                run(() =>
+                  api.delete(
+                    `/credentials/${encodeURIComponent(deleting.name!)}${
+                      boundModels(deleting).length ? "?unbind=1" : ""
+                    }`,
+                  ),
+                )
               }
             >
-              确认删除凭证
+              {boundModels(deleting).length ? "解除绑定并删除凭证" : "确认删除凭证"}
             </button>
           </Drawer>
         )}

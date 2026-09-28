@@ -193,6 +193,20 @@ class ControlStore:
             raise ValueError("enabled 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(account_key, {}).update(enabled=enabled))
 
+    def unbind_credential(self, account_key):
+        """Drop an account key from every model rule binding in one revision bump."""
+        _identifier(account_key, "账号指纹")
+        snapshot = self.snapshot()
+        if not any(account_key in (rule.get("credential_ids") or [])
+                   for rule in snapshot["models"].values()):
+            return snapshot  # Nothing references the identity; keep the revision stable.
+        def change(state):
+            for rule in state["models"].values():
+                ids = rule.get("credential_ids") or []
+                if account_key in ids:
+                    rule["credential_ids"] = [identity for identity in ids if identity != account_key]
+        return self._update(None, change)
+
     def set_auto_checkin(self, account_key, enabled):
         _identifier(account_key, "账号指纹")
         if type(enabled) is not bool:
