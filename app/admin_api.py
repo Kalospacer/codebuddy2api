@@ -42,6 +42,15 @@ async def _body(request, maximum=65536, *, allow_empty=False):
     return value
 
 
+def _unbind_requested(query: str) -> bool:
+    """Mirror the delete route's Boolean query parsing for the unbind confirmation flag."""
+    for pair in (query or "").split("&"):
+        key, _, value = pair.partition("=")
+        if key == "unbind" and value.lower() in ("1", "true", "on", "yes"):
+            return True
+    return False
+
+
 def _public_credential(item):
     # Never pass arbitrary credential manager fields through to the browser.
     fields = {"id", "account_key", "name", "filename", "enabled", "label", "profile", "region", "site",
@@ -73,6 +82,8 @@ def install_admin(app, config, gateway):
     # otherwise never clear a snapshot belonging to a superseded key.
     auth.reconcile()
     mutation_lock = threading.RLock()
+    # The confirmed credential delete shares this lock so rule edits cannot interleave.
+    config["admin_mutation_lock"] = mutation_lock
     oauth_lock = threading.RLock()
     oauth_tasks = OrderedDict()
 
@@ -173,10 +184,11 @@ def install_admin(app, config, gateway):
             name = path.removeprefix("/admin/credentials/")
             if not _valid_name(name):
                 return error_response(400, "凭证文件名无效")
-            try:
-                await run_in_threadpool(gateway.admin_delete_guard, name)
-            except (ValueError, HTTPException):
-                return error_response(409, "凭证仍被模型策略引用，请先移除绑定")
+            if not _unbind_requested(request.url.query):
+                try:
+                    await run_in_threadpool(gateway.admin_delete_guard, name)
+                except (ValueError, HTTPException):
+                    return error_response(409, "凭证仍被模型策略引用，请先移除绑定")
         return None
 
     # Middleware is deliberately installed only here, never on module import.

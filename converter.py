@@ -2085,15 +2085,29 @@ async def admin_add_credential(request: Request,
 
 @app.delete("/admin/credentials/{name}")
 def admin_del_credential(name: str,
+                         unbind: bool = False,
                          authorization: Optional[str] = Header(default=None),
                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """Delete the named .info file and remove its credential from the pool."""
+    """Delete the named .info file, unbinding model rules only after removal succeeds."""
     _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
-    if CONFIG.get("management") is not None:
-        CONFIG["management"].admin_delete_guard(os.path.basename(name))
-    if pool is None or not pool.remove_file(os.path.basename(name)):
-        raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
+    rollback = {}
+    identity = None
+    management = CONFIG.get("management")
+    # Serialize with model-rule edits so a rebind cannot slip between unbind and removal.
+    with CONFIG.get("admin_mutation_lock") or nullcontext():
+        if management is not None:
+            identity = management.admin_delete_guard(os.path.basename(name), unbind=unbind)
+            if identity is not None:
+                rollback = management.admin_unbind_credential(identity)
+        if pool is None or not pool.remove_file(os.path.basename(name)):
+            # A failed removal rolls the unbind back so routing never widens silently.
+            if management is not None and rollback:
+                management.admin_restore_bindings(rollback)
+            raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
+        if identity is not None and management is not None:
+            # Sweep any rebind that raced the removal from outside the shared lock.
+            management.admin_unbind_credential(identity)
     return {"removed": os.path.basename(name)}
 
 

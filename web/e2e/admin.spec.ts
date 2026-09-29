@@ -264,6 +264,26 @@ test("credential OAuth terminates, upload/export and safe-name deletion are wire
     )
     .toBe(true);
 });
+test("deleting a bound credential confirms the automatic unbind", async ({ page }) => {
+  const mock = await mockAPI(page);
+  await page.route("**/admin/credentials", async (route) => {
+    if (route.request().method() !== "GET") return route.fallback();
+    return route.fulfill({ json: { credentials: [{ ...credential, bindings: ["mock-model"] }] } });
+  });
+  await page.goto("/dashboard/credentials");
+  await page.getByRole("button", { name: "删除", exact: true }).click();
+  await expect(page.getByText("该凭证仍被模型规则引用：mock-model。")).toBeVisible();
+  await expect(page.getByText("确认后将自动解除这些绑定，规则回退为自动选择账号。")).toBeVisible();
+  await page.getByRole("button", { name: "解除绑定并删除凭证" }).click();
+  await expect
+    .poll(() =>
+      mock.calls.some(
+        (call) =>
+          call.method === "DELETE" && call.path === "/admin/credentials/mock-account.info?unbind=1",
+      ),
+    )
+    .toBe(true);
+});
 test("international OAuth choices send distinct sites and show the selected official host", async ({
   page,
 }) => {

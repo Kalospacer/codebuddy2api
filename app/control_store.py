@@ -193,6 +193,43 @@ class ControlStore:
             raise ValueError("enabled 必须为布尔值")
         return self._update(None, lambda state: state["credentials"].setdefault(account_key, {}).update(enabled=enabled))
 
+    def unbind_credential(self, account_key):
+        """Drop an account key from every rule, returning {source: old_ids} for rollback."""
+        _identifier(account_key, "账号指纹")
+        if not any(account_key in (rule.get("credential_ids") or [])
+                   for rule in self.snapshot()["models"].values()):
+            return {}  # Nothing references the identity; keep the revision stable.
+        affected = {}
+        def change(state):
+            for source, rule in state["models"].items():
+                ids = rule.get("credential_ids") or []
+                if account_key in ids:
+                    affected[source] = list(ids)
+                    rule["credential_ids"] = [identity for identity in ids if identity != account_key]
+        self._update(None, change)
+        return affected
+
+    def restore_bindings(self, account_key, affected):
+        """Re-add the identity where a rule still matches its post-unbind state.
+
+        Concurrent edits that changed a rule's binding list are preserved.
+        """
+        _identifier(account_key, "账号指纹")
+        pending = {source: ids for source, ids in dict(affected or {}).items() if isinstance(ids, list)}
+        def restorable(rule, ids):
+            if rule is None:
+                return False  # A rule deleted meanwhile stays deleted.
+            current = rule.get("credential_ids") or []
+            return current == [identity for identity in ids if identity != account_key]
+        snapshot = self.snapshot()
+        if not any(restorable(snapshot["models"].get(source), ids) for source, ids in pending.items()):
+            return snapshot  # Nothing to restore; concurrent edits win.
+        def change(state):
+            for source, ids in pending.items():
+                if restorable(state["models"].get(source), ids):
+                    state["models"][source]["credential_ids"] = list(ids)
+        return self._update(None, change)
+
     def set_auto_checkin(self, account_key, enabled):
         _identifier(account_key, "账号指纹")
         if type(enabled) is not bool:

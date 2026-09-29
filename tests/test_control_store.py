@@ -82,6 +82,40 @@ class ControlStoreTests(unittest.TestCase):
         self.assertEqual(reopened.snapshot()["revision"], 1)
 
 
+    def test_unbind_credential_removes_only_the_target_identity(self):
+        self.store.update_model("real", {"public_id": "public", "credential_ids": ["fingerprint", "other"]}, 0)
+        self.store.update_model("second", {"credential_ids": ["fingerprint"]}, 1)
+        self.store.update_model("third", {"credential_ids": ["other"]}, 2)
+        affected = self.store.unbind_credential("fingerprint")
+        self.assertEqual(affected, {"real": ["fingerprint", "other"], "second": ["fingerprint"]})
+        self.assertEqual(self.store.snapshot()["revision"], 4)  # Three setup bumps, then one for the unbind.
+        self.assertEqual(self.store.snapshot()["models"]["real"]["credential_ids"], ["other"])
+        self.assertEqual(self.store.snapshot()["models"]["second"]["credential_ids"], [])
+        self.assertEqual(self.store.snapshot()["models"]["third"]["credential_ids"], ["other"])
+        self.assertEqual(self.store.unbind_credential("unknown-identity"), {})  # No-op keeps the revision.
+        self.assertEqual(self.store.snapshot()["revision"], 4)
+        self.store.restore_bindings("fingerprint", affected)  # Rollback restores both rules in one bump.
+        self.assertEqual(self.store.snapshot()["models"]["real"]["credential_ids"], ["fingerprint", "other"])
+        self.assertEqual(self.store.snapshot()["models"]["second"]["credential_ids"], ["fingerprint"])
+        self.assertEqual(self.store.snapshot()["revision"], 5)
+        self.store.restore_bindings("fingerprint", affected)  # An already-restored state bumps nothing.
+        self.assertEqual(self.store.snapshot()["revision"], 5)
+
+    def test_rollback_keeps_concurrent_edits_and_deleted_rules(self):
+        self.store.update_model("real", {"credential_ids": ["fingerprint", "other"]}, 0)
+        self.store.update_model("gone", {"custom": True, "public_id": "gone-public", "credential_ids": ["fingerprint"]}, 1)
+        affected = self.store.unbind_credential("fingerprint")
+        revision = self.store.snapshot()["revision"]
+        # Concurrent edits: one rule rebound elsewhere, another deleted outright.
+        self.store.update_model("real", {"credential_ids": ["fresh"]}, revision)
+        self.store.delete_model("gone", self.store.snapshot()["revision"])
+        self.store.restore_bindings("fingerprint", affected)
+        self.assertEqual(self.store.snapshot()["models"]["real"]["credential_ids"], ["fresh"])
+        self.assertNotIn("gone", self.store.snapshot()["models"])
+        with self.assertRaises(ValueError):
+            self.store.unbind_credential("not a fingerprint")
+
+
     def test_credential_metadata_and_no_secret_settings(self):
         self.store.set_credential("account-fingerprint", False)
         self.assertEqual(self.store.snapshot()["credentials"], {"account-fingerprint": {"enabled": False}})
