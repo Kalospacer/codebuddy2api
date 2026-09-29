@@ -268,7 +268,12 @@ class CredentialManager:
         self._load_if_stale()
         if self._cached is None:
             raise RuntimeError(f"无法读取 auth 文件：{self.path}")
-        return self._cached
+        s = self._cached
+        auth = s.get("auth")
+        if isinstance(auth, dict):
+            # Encrypted envelope tokens must fail fast instead of leaking into upstream headers.
+            auth_oauth.ensure_plaintext_tokens(auth)
+        return s
 
     def _is_expired(self) -> bool:
         s = self._session()
@@ -517,7 +522,10 @@ class CredentialPool:
         self._ledger = None              # Prefer credits expiring sooner.
         self._capacity = AccountCapacity()
         self._scan = scan                # Rescan credentials before selection.
+        # Explicit paths must survive rejection or eviction so a repaired file re-enters.
+        self._configured: list[str] = []
         self._ignored_duplicates: set[str] = set()
+        self._ignored_invalid: dict[str, str | None] = {}
         self._sync_pending: set[str] = set()
         self._syncing: set[str] = set()
         self._sync_event = threading.Event()
@@ -535,6 +543,8 @@ class CredentialPool:
                          for entry in self._entries if entry.get("uid")}
             for path in paths:
                 cid = str(Path(path).resolve())
+                if cid not in self._configured:
+                    self._configured.append(cid)
                 if not os.path.exists(cid):
                     continue
                 entry = by_id.get(cid)
@@ -543,6 +553,13 @@ class CredentialPool:
                         entry["cm"].invalidate()
                     try:
                         summary = entry["cm"].summary()
+                    except auth_oauth.AuthTokenTypeError:
+                        # An envelope replacement must not keep serving the stale identity.
+                        by_id.pop(cid, None)
+                        if entry.get("uid"):
+                            have_uids.pop(entry.get("account_key"), None)
+                        self._drop_entry(entry)
+                        continue
                     except Exception:
                         continue  # A damaged file must not block other credentials.
                     generation = entry["cm"]._generation
@@ -576,6 +593,18 @@ class CredentialPool:
                 manager = CredentialManager(Path(cid))
                 try:
                     summary = manager.summary()
+                except auth_oauth.AuthTokenTypeError as error:
+                    # Envelope tokens cannot be refreshed or used; keep such files out of the pool.
+                    try:
+                        digest = hashlib.sha256(Path(cid).read_bytes()).hexdigest()
+                    except OSError:
+                        digest = None
+                    if self._ignored_invalid.get(cid) != digest:
+                        # Suppression is content-keyed so a different invalid credential
+                        # reusing the path warns again even without a scan while missing.
+                        _log(f"[cred] 拒绝入池（入库校验失败：{error}）: {Path(cid).name}")
+                        self._ignored_invalid[cid] = digest
+                    continue
                 except Exception:
                     summary = {}
                 uid = summary.get("uid")
@@ -594,6 +623,7 @@ class CredentialPool:
                 self._entries.append(entry)
                 by_id[cid] = entry
                 self._ignored_duplicates.discard(cid)
+                self._ignored_invalid.pop(cid, None)
                 if uid:
                     have_uids[identity_key] = cid
                 self._queue_sync(cid)
@@ -664,10 +694,27 @@ class CredentialPool:
             update()
             return True
 
+
+    def _drop_entry(self, entry):
+        """Purge one entry whose file became unusable, mirroring prune()'s cleanup."""
+        cid = entry["id"]
+        if self._ledger is not None:
+            self._ledger.remove(cid)
+        self.forget_credential_state(entry)
+        self._entries = [e for e in self._entries if e is not entry]
+        self._model_fail = {key: until for key, until in self._model_fail.items() if key[0] != cid}
+        self._sticky = OrderedDict((key, value) for key, value in self._sticky.items() if value[0] != cid)
+        self._sync_pending.discard(cid)
+        self._syncing.discard(cid)
+        self._sync_retry.pop(cid, None)
+        self._sync_attempts.pop(cid, None)
+        invalidate_model_table()
     def prune(self):
         """Remove missing credential files and their session bindings."""
         with self._lock:
             self._ignored_duplicates = {p for p in self._ignored_duplicates if os.path.exists(p)}
+            # A path whose invalid file vanished must warn again when a new file reuses it.
+            self._ignored_invalid = {p: v for p, v in self._ignored_invalid.items() if os.path.exists(p)}
             before = len(self._entries)
             removed = [e for e in self._entries if not os.path.exists(e["id"])]
             for entry in removed:
@@ -861,7 +908,8 @@ class CredentialPool:
         return (exp is None, exp or 0.0)
     def _rescan(self):
         self.prune()
-        paths = find_auth_files() if self._scan else [Path(entry["id"]) for entry in self.entries()]
+        # Explicit mode retries configured paths, including rejected or evicted ones.
+        paths = find_auth_files() if self._scan else [Path(cid) for cid in self._configured]
         self.reload(paths, reset=False)
 
     def _healthy(self, e: dict) -> bool:
