@@ -11,6 +11,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import json
+import time
 import unittest
 from unittest.mock import patch
 
@@ -150,6 +151,54 @@ class DailyChatTests(fixtures.CredentialActionTests):
         self.assertFalse(self.turn(self.entries["cn-work"])["ok"])
         self.assertEqual(self.console.created, [])
 
+    # -- day boundary and staggering -----------------------------------------
+
+    def test_today_uses_the_process_local_calendar_day(self):
+        # The reward day is a local calendar day, so the guard must not key on UTC:
+        # a UTC container would roll it over at 08:00 Beijing and could visit one
+        # Beijing day twice. 16:30 UTC is already 10-01 in Beijing.
+        self.assertEqual(daily_chat.today(), time.strftime("%Y-%m-%d", time.localtime()))
+        self.assertEqual(daily_chat.today(time.mktime((2026, 10, 1, 0, 30, 0, 0, 0, -1))), "2026-10-01")
+
+    def test_staggering_slots_are_stable_and_spread_across_accounts(self):
+        day = "2026-10-01"
+        keys = [f"account-{i}" for i in range(24)]
+        slots = [daily_chat.due_at(key, day) for key in keys]
+        # Stable for the same account and day: a sweep may run many times.
+        self.assertEqual(daily_chat.due_at(keys[0], day), slots[0])
+        self.assertEqual(len(set(slots)), len(slots), "accounts must not share a slot")
+        for slot in slots:
+            self.assertTrue(0 <= slot < 6 * 3600, slot)
+        # A different day reshuffles the order, so no account is always first.
+        other = [daily_chat.due_at(key, "2026-10-02") for key in keys]
+        self.assertNotEqual(slots, other)
+
+    def test_is_due_respects_the_account_slot(self):
+        day = "2026-10-01"
+        midnight = time.mktime((2026, 10, 1, 0, 0, 0, 0, 0, -1))
+        key = "account-x"
+        slot = daily_chat.due_at(key, day)
+        self.assertFalse(daily_chat.is_due(key, day, midnight + max(0, slot - 1)))
+        self.assertTrue(daily_chat.is_due(key, day, midnight + slot))
+
+    def test_zero_window_is_immediately_due(self):
+        day = "2026-10-01"
+        self.assertEqual(daily_chat.due_at("account-x", day, window=0), 0.0)
+        self.assertTrue(daily_chat.is_due("account-x", day, 0, window=0))
+
+    def test_every_slot_is_reachable_by_an_hourly_sweep(self):
+        # The sweep runs hourly (HOUSEKEEP_INTERVAL), so a slot must never fall
+        # between two runs and leave the account unwoken for the day. The window is
+        # bounded well inside the day for exactly this reason.
+        day = "2026-10-01"
+        window = 6 * 3600
+        for index in range(200):
+            key = f"account-{index}"
+            slot = daily_chat.due_at(key, day, window=window)
+            self.assertLess(slot, 24 * 3600, "a slot must stay inside the same day")
+            self.assertTrue(any(run >= slot for run in range(3600, 86400, 3600)),
+                            f"{key} slot {slot} is unreachable by an hourly sweep")
+
     # -- happy path ----------------------------------------------------------
 
     def test_completed_turn_is_confirmed_and_records_cost(self):
@@ -207,9 +256,12 @@ class DailyChatTests(fixtures.CredentialActionTests):
         self.assertEqual(len(self.console.methods), 3)
 
     def test_unconfirmed_send_is_never_replayed(self):
-        self.control.reserve_daily_chat(self.intl["account_key"], "2026-09-30")
-        self.control.transition_daily_chat(self.intl["account_key"], "2026-09-30",
-            self.control.daily_chat_record(self.intl["account_key"], "2026-09-30")["attempt_id"], "sent")
+        # Key the seeded record to the day perform() will actually use, not a fixed
+        # date: a hard-coded day silently stops matching once the clock moves past it.
+        day = daily_chat.today()
+        self.control.reserve_daily_chat(self.intl["account_key"], day)
+        self.control.transition_daily_chat(self.intl["account_key"], day,
+            self.control.daily_chat_record(self.intl["account_key"], day)["attempt_id"], "sent")
         result = self.turn()
         self.assertEqual(result["state"], "pending")
         self.assertTrue(result["skipped"])
@@ -221,9 +273,41 @@ class DailyChatTests(fixtures.CredentialActionTests):
         self.assertFalse(result["ok"])
         self.assertEqual(result["state"], "rejected")
         record = self.control.daily_chat_record(self.intl["account_key"], result["day"])
-        # 'sent' means the request went out: it stays unconfirmed for the rest of the day.
+        # 'sent' means the turn really ran: it stays unconfirmed for the rest of the day.
         self.assertEqual(record["phase"], "sent")
         self.assertFalse(self.control.daily_chat_done(self.intl["account_key"], result["day"]))
+
+    def test_unready_sandbox_retries_then_gives_up_without_sending(self):
+        # A sandbox that never becomes ready must not spend the day: the turn was
+        # never handed to the agent, so the reservation stays retryable.
+        with patch.object(daily_chat, "sandbox_of",
+                          side_effect=daily_chat.ChatFailure("sandbox_pending")), \
+             patch.object(daily_chat, "SANDBOX_SECONDS", 0.3), \
+             patch.object(daily_chat, "SANDBOX_POLL_SECONDS", 0.1):
+            result = self.turn()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "sandbox_timeout")
+        record = self.control.daily_chat_record(self.intl["account_key"], result["day"])
+        # Cancelled, not sent: nothing reached the agent, so the day is not spent.
+        self.assertEqual(record["phase"], "cancelled")
+        self.assertFalse(self.control.daily_chat_done(self.intl["account_key"], result["day"]))
+        self.assertIsNotNone(self.control.reserve_daily_chat(self.intl["account_key"], result["day"]))
+
+    def test_sandbox_readiness_is_retried_until_it_answers(self):
+        attempts = {"n": 0}
+        real = daily_chat.sandbox_of
+
+        def flaky(client, headers, conversation_id):
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise daily_chat.ChatFailure("sandbox_pending")
+            return real(client, headers, conversation_id)
+
+        with patch.object(daily_chat, "sandbox_of", side_effect=flaky), \
+             patch.object(daily_chat, "SANDBOX_POLL_SECONDS", 0.05):
+            result = self.turn()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(attempts["n"], 3)
 
     def test_cancelled_day_can_be_retried_manually(self):
         day = "2026-09-30"
@@ -242,6 +326,32 @@ class DailyChatTests(fixtures.CredentialActionTests):
         record = self.control.daily_chat_record(self.intl["account_key"], result["day"])
         self.assertEqual(record["phase"], "cancelled")
         self.assertEqual(self.console.channel_opens, 0, "no sandbox turn was opened")
+
+    def test_acp_failure_cancels_unsent_reservation(self):
+        # The channel failed before the prompt was posted, so the day is knowably
+        # unspent and must stay retryable instead of stranding as 'pending'.
+        with patch.object(acp_client.AcpChannel, "open",
+                          side_effect=acp_client.AcpError("network")):
+            result = self.turn()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "acp_network")
+        record = self.control.daily_chat_record(self.intl["account_key"], result["day"])
+        self.assertEqual(record["phase"], "cancelled")
+        self.assertFalse(self.control.daily_chat_done(self.intl["account_key"], result["day"]))
+        self.assertIsNotNone(self.control.reserve_daily_chat(self.intl["account_key"], result["day"]))
+
+    def test_acp_failure_after_prompt_keeps_the_day_spent(self):
+        # Once the prompt is posted the turn may have run upstream, so the record
+        # stays 'sent' and is never replayed even though the channel then failed.
+        with patch.object(acp_client.AcpChannel, "post",
+                          side_effect=[None, None, acp_client.AcpError("network")]):
+            result = self.turn()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["state"], "acp_network")
+        record = self.control.daily_chat_record(self.intl["account_key"], result["day"])
+        self.assertEqual(record["phase"], "sent")
+        self.assertIsNone(self.control.reserve_daily_chat(self.intl["account_key"], result["day"]))
+
     def test_timeout_leaves_the_reservation_uncancelled(self):
         self.console.sandbox_status = "working"
         with patch.object(daily_chat, "TURN_SECONDS", 1.0), patch.object(daily_chat, "POLL_SECONDS", 0.4):
@@ -321,6 +431,14 @@ class DailyChatTests(fixtures.CredentialActionTests):
         day = "2026-09-30"
         first = self.control.reserve_daily_chat(self.intl["account_key"], day)
         self.assertIsNotNone(first)
+        # Still 'reserved' (nothing sent yet), so re-reserving is allowed on purpose:
+        # an unsent reservation must not cost the day.
+        second = self.control.reserve_daily_chat(self.intl["account_key"], day)
+        self.assertIsNotNone(second)
+        self.assertNotEqual(first["attempt_id"], second["attempt_id"])
+        # Once sent, the day is spent.
+        self.control.transition_daily_chat(self.intl["account_key"], day,
+                                           second["attempt_id"], "sent")
         self.assertIsNone(self.control.reserve_daily_chat(self.intl["account_key"], day))
 
     def test_transition_rejects_an_unknown_attempt(self):

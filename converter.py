@@ -1476,7 +1476,7 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
             return None  # A path now owned by another account must be rescheduled with its own preferences.
         site = site_for_headers(headers)
         token, uid, domain = _bearer_token(headers), headers.get("X-User-Id", ""), headers.get("X-Domain", "")
-        day = time.strftime("%Y-%m-%d")
+        day = daily_chat.today()
         if checkin and model_policy.credential_auto_checkin(CONFIG, entry) and not ledger.checkin_done(cid, day):
             try:
                 def can_claim():
@@ -1513,9 +1513,11 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
         # A daily-activity turn spends credits on the account and is opt-in, so it runs
-        # before the balance refresh reads back whatever it cost.
+        # before the balance refresh reads back whatever it cost. Each account waits for
+        # its own slot inside the day so the accounts never go out together.
         if (checkin and model_policy.credential_auto_daily_chat(CONFIG, entry)
-                and not _daily_chat_done(entry, day)):
+                and not _daily_chat_done(entry, day)
+                and daily_chat.is_due(entry.get("account_key"), day)):
             try:
                 def can_chat():
                     return (model_policy.credential_auto_daily_chat(CONFIG, entry)
@@ -1776,6 +1778,14 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
         pool._warn_storage("cooldown", pool._cooldowns.last_error is None)
         if CONFIG.get("usage_snapshots") is not None:
             CONFIG["usage_snapshots"].prune()
+        control_store = CONFIG.get("control_store")
+        if control_store is not None:
+            # Daily-activity rows are diagnostic only, so old ones are dropped rather
+            # than kept as history; the day itself is still read back from this table.
+            try:
+                control_store.prune_daily_chats()
+            except Exception as error:
+                _log(f"[housekeeper] 打卡记录清理失败: {_network_error_text(error)}")
         ids = pool.begin_sync(all_entries=not pending_only)
         failed = set()
         try:

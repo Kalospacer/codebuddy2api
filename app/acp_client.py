@@ -205,14 +205,20 @@ class AcpChannel:
             pass
 
 
-def run_turn(link, token, session_id, cwd, prompt):
-    """Open the channel and drive one turn; return it open for console polling."""
+def run_turn(link, token, session_id, cwd, prompt, *, on_prompt=None):
+    """Open the channel and drive one turn; return it open for console polling.
+
+    ``on_prompt`` runs immediately before the prompt is posted, so the caller can
+    record the turn as committed at the last moment where that is still knowable.
+    """
     channel = AcpChannel(link, token).open()
     try:
         channel.post("initialize", {"protocolVersion": PROTOCOL_VERSION,
                                     "clientCapabilities": CLIENT_CAPABILITIES}, 1)
         channel.post("session/load", {"sessionId": session_id, "cwd": cwd,
                                       "mcpServers": []}, 2)
+        if on_prompt is not None:
+            on_prompt()
         channel.post("session/prompt", {"sessionId": session_id,
                                         "prompt": [{"type": "text", "text": prompt}]}, 3)
     except Exception:

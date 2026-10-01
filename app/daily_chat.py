@@ -9,6 +9,7 @@ Every attempt is one-shot per account per day with no retry. A turn can consume
 credits on the account, so the switch defaults to off and international accounts
 opt in explicitly, exactly like the check-in and travel preferences.
 """
+import hashlib
 import json
 import time
 
@@ -30,6 +31,9 @@ CONVERSATION_ORIGIN = "workbuddy-app"
 # maintenance lock free and a wedged sandbox from blocking the whole sweep.
 TURN_SECONDS = 60.0
 POLL_SECONDS = 3.0
+# Sandbox provisioning is asynchronous; these bound the wait before the turn starts.
+SANDBOX_SECONDS = 25.0
+SANDBOX_POLL_SECONDS = 2.5
 REQUEST_TIMEOUT = httpx.Timeout(30, connect=10, write=15, pool=10)
 MAX_BODY_BYTES = 64 * 1024
 TERMINAL_STATES = ("completed",)
@@ -42,9 +46,14 @@ _MESSAGES = {
     "pending": "上次打卡结果尚未确认，可能仍在执行；今日不重复发送",
     "unconfirmed": "打卡未确认成功，今日不重试；请查询会话状态或检查日志",
     "timeout": "会话未在限定时间内跑完，今日不重试；请核验账号状态",
+    "sandbox_timeout": "官方沙箱未在限定时间内就绪，未向会话发送任何内容；今日可重试",
+    "sandbox_pending": "官方沙箱仍在创建中，未向会话发送任何内容；今日可重试",
     "network_error": "连接官方失败或响应中断，今日不重试；请检查服务器网络、DNS 和代理",
     "http_error": "官方返回了错误状态，未确认打卡成功，今日不重试",
     "protocol_error": "官方响应格式无效，未确认打卡成功",
+    "acp_http": "ACP 通道返回了错误状态，未确认打卡成功，今日不重试",
+    "acp_network": "ACP 通道连接失败或中断，未确认打卡成功，今日不重试",
+    "acp_protocol": "ACP 通道响应格式无效（缺少连接标识或会话信息），未确认打卡成功，今日不重试",
     "rejected": "官方未确认本次打卡，资格和额度由官方决定",
     "auth_error": "官方拒绝了当前凭证，请刷新 Token 或重新登录后核对",
     "storage_error": "打卡记录无法读取或保存，已停止操作；请检查数据目录权限和磁盘空间",
@@ -74,6 +83,39 @@ def failure_view():
     return {"ok": False, "state": "storage_error", "message": _MESSAGES["storage_error"],
             "day": None, "at": None, "conversation_id": None, "usage_before": None,
             "usage_after": None, "acp_usage": None}
+
+
+def today(now=None):
+    """The operator's local calendar day, which is the day the reward is granted for.
+
+    ``time.strftime`` follows the process timezone, so a container left on UTC would
+    key the once-per-day guard to a day that turns over at 08:00 Beijing: a Beijing
+    day could then be visited twice. Compose pins TZ, and this reads the same clock.
+    """
+    return time.strftime("%Y-%m-%d", time.localtime(now))
+
+
+def due_at(identity, day, *, window=6 * 3600):
+    """A stable per-account offset inside ``window``, so turns never go out together.
+
+    Random staggering would move on every sweep and could starve an account; hashing
+    identity+day gives each account its own fixed slot that changes daily.
+    """
+    if not identity or window <= 0:
+        return 0.0
+    digest = hashlib.sha256(f"{identity}:{day}".encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") % int(window)
+
+
+def seconds_into_day(now=None):
+    """Seconds elapsed since local midnight."""
+    parts = time.localtime(now)
+    return parts.tm_hour * 3600 + parts.tm_min * 60 + parts.tm_sec
+
+
+def is_due(identity, day, now=None, *, window=6 * 3600):
+    """Whether this account's slot for the day has arrived."""
+    return seconds_into_day(now) >= due_at(identity, day, window=window)
 
 
 def _console_headers(token, uid="", domain=""):
@@ -161,8 +203,26 @@ def sandbox_of(client, headers, conversation_id):
     session_id = _text(data.get("sessionId") or data.get("session_id") or conversation_id, 256)
     cwd = _text(data.get("cwd"), 512) or DEFAULT_CWD
     if link is None or token is None:
-        raise ChatFailure("protocol_error")
+        # The sandbox is still being provisioned; the caller may poll again.
+        raise ChatFailure("sandbox_pending")
     return {"link": link, "token": token, "session_id": session_id, "cwd": cwd}
+
+
+def _await_sandbox(client, headers, conversation_id):
+    """Poll for a ready sandbox, bounded by the same wall clock as the turn."""
+    deadline = time.monotonic() + SANDBOX_SECONDS
+    last = None
+    while True:
+        try:
+            return sandbox_of(client, headers, conversation_id)
+        except ChatFailure as error:
+            last = error
+            if error.diagnostics.get("error_kind") != "sandbox_pending":
+                raise
+        if time.monotonic() >= deadline:
+            raise ChatFailure("sandbox_timeout", None, None) from None
+        time.sleep(SANDBOX_POLL_SECONDS)
+        del last
 
 
 def status_of(client, headers, conversation_id):
@@ -178,14 +238,14 @@ def _usage_credits(token, uid, domain):
         snapshot = credits.fetch_request_usage(token, days=1, uid=uid, domain=domain)
     except Exception:
         return None
-    rows = snapshot.get("by_day", {}).get(time.strftime("%Y-%m-%d"), {})
+    rows = snapshot.get("by_day", {}).get(today(), {})
     return round(sum(rows.values()), 4) if isinstance(rows, dict) and rows else None
 
 
 def perform(token, profile, *, uid="", domain="", can_write=lambda: True,
             store=None, identity=None):
     """Run one daily-activity turn under durable reservation and generation checks."""
-    result = {"ok": False, "state": "unknown", "day": time.strftime("%Y-%m-%d"),
+    result = {"ok": False, "state": "unknown", "day": today(),
               "phase": "verify", "conversation_id": None, "sandbox_status": None,
               "usage_before": None, "usage_after": None, "acp_usage": None}
     day, attempt_id = result["day"], None
@@ -202,6 +262,26 @@ def perform(token, profile, *, uid="", domain="", can_write=lambda: True,
             return getattr(store, method)(identity, *args, **kwargs)
         except Exception:
             raise ChatFailure("storage_error") from None
+
+    def cancel_unless_sent():
+        """Leave a never-posted turn retryable; never reopen one that was sent.
+
+        'sent' is written immediately before the prompt POST, so a record still in
+        'reserved' is knowably unsent and replaying it cannot spend credits twice.
+        Without this an ACP failure would strand the day as an unretryable 'pending'.
+        """
+        if attempt_id is None:
+            return
+        try:
+            current = store.daily_chat_record(identity, day) if store else None
+        except Exception:
+            current = None
+        if current and current.get("phase") == "sent":
+            return
+        try:
+            write_store("transition_daily_chat", day, attempt_id, "cancelled")
+        except ChatFailure:
+            pass
 
     if not supported(profile):
         return unavailable()
@@ -230,19 +310,31 @@ def perform(token, profile, *, uid="", domain="", can_write=lambda: True,
         if not can_write():
             write_store("transition_daily_chat", day, attempt_id, "cancelled")
             return stop("changed", skipped=True)
-        write_store("transition_daily_chat", day, attempt_id, "sent")
         result["phase"] = "conversation"
         result["usage_before"] = _usage_credits(token, uid, domain)
         with httpx.Client(follow_redirects=False) as client:
             headers = _console_headers(token, uid, domain)
             conversation_id = create_conversation(client, headers)
             result["conversation_id"] = conversation_id
-            sandbox = sandbox_of(client, headers, conversation_id)
+            # Record the conversation immediately: if anything fails later, this is
+            # what distinguishes "the turn ran" from "nothing ever reached the agent".
+            write_store("daily_chat_checkpoint", day, conversation_id=conversation_id)
+            # The sandbox is provisioned asynchronously, so an unready response is
+            # retried briefly. Nothing has reached the agent yet, which is why this
+            # failure path stays retryable for the rest of the day.
+            sandbox = _await_sandbox(client, headers, conversation_id)
             if not can_write():
                 raise ChatFailure("changed")
             result["phase"] = "turn"
+
+            def committed():
+                # Last point at which the day is knowably still unspent: the prompt
+                # POST is about to go out and the turn can really run.
+                write_store("transition_daily_chat", day, attempt_id, "sent")
+
             channel = acp_client.run_turn(sandbox["link"], sandbox["token"],
-                                          sandbox["session_id"], sandbox["cwd"], PROMPT)
+                                          sandbox["session_id"], sandbox["cwd"], PROMPT,
+                                          on_prompt=committed)
             try:
                 started = time.monotonic()
                 while True:
@@ -284,19 +376,24 @@ def perform(token, profile, *, uid="", domain="", can_write=lambda: True,
         kind = fields.pop("error_kind", "network_error")
         if kind == "network_error" and fields.get("http_status") in (401, 403):
             kind = "auth_error"
-        # Only a failure before the first upstream write may be cancelled. Once a
-        # conversation exists the turn is unconfirmed, and replaying it would spend
-        # credits twice, so it stays pending until the next local day.
-        if attempt_id is not None and result["phase"] == "conversation":
-            try:
-                write_store("transition_daily_chat", day, attempt_id, "cancelled")
-            except ChatFailure:
-                pass
+        cancel_unless_sent()
         result.update(state=kind, message=_MESSAGES.get(kind, _MESSAGES["network_error"]), **fields)
         return result
+    except acp_client.AcpError as error:
+        # Surface the channel's own reason instead of collapsing every ACP failure
+        # into one opaque state: the diagnostics carry only a kind and a status.
+        # A channel that never delivered the prompt is an unsent day, so it must be
+        # cancelled here too; otherwise the day reads as unretryable 'pending'.
+        fields = dict(error.diagnostics)
+        kind = "acp_" + str(fields.pop("error_kind", "protocol"))
+        cancel_unless_sent()
+        result.update(state=kind, message=_MESSAGES.get(kind, _MESSAGES["protocol_error"]), **fields)
+        return result
     except (httpx.HTTPError, ValueError, TypeError):
+        cancel_unless_sent()
         return stop("network_error" if result["phase"] in {"conversation", "usage"} else "protocol_error")
     except Exception:
+        cancel_unless_sent()
         return stop("storage_error")
 
 

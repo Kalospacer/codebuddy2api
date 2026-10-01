@@ -175,7 +175,7 @@ def _one(gateway, pool, ledger, entry, action, *, automatic=False, consent_revis
             buddy.daily_warning(gateway.CONFIG, entry.get("account_key"), entry.get("profile"), result)
         return result
     if action == "checkin":
-        day = time.strftime("%Y-%m-%d")
+        day = daily_chat.today()
         if ledger.checkin_done(cid, day):
             current = pool.apply_if_current(cm, generation, lambda: None)
             return {"ok": current, "already": current, "state": "already" if current else "changed",

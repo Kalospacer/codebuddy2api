@@ -132,7 +132,7 @@ class Management:
         if store is None:
             return daily_chat.failure_view()
         try:
-            record = store.daily_chat_record(identity, time.strftime("%Y-%m-%d", time.localtime(now)))
+            record = store.daily_chat_record(identity, daily_chat.today(now))
         except Exception:
             return daily_chat.failure_view()
         return daily_chat.view(record)

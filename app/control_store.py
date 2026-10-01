@@ -464,14 +464,19 @@ class ControlStore:
             return dict(zip((column[0] for column in cursor.description), row)) if row else None
 
     def reserve_daily_chat(self, identity, day):
-        """Reserve the single daily turn; a completed or unconfirmed day is never reopened."""
+        """Reserve the single daily turn; a completed or already-sent day is never reopened.
+
+        A ``reserved`` row is retryable because it means nothing was written upstream
+        yet (the caller only marks ``sent`` once the turn can really run), so a crash
+        or a failed sandbox provisioning does not cost the day.
+        """
         _identifier(identity, "账号指纹")
         _day(day)
         with self._lock:
             self._db.execute("BEGIN IMMEDIATE")
             try:
                 previous = self.daily_chat_record(identity, day)
-                if previous and previous["phase"] not in {"cancelled", "reconciled"}:
+                if previous and previous["phase"] not in {"reserved", "cancelled", "reconciled"}:
                     self._db.execute("COMMIT")
                     return None
                 attempt = uuid.uuid4().hex
