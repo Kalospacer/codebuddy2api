@@ -50,7 +50,7 @@ from app.adapters.anthropic_adapter import (
 
 from app import auth_oauth
 from app import trial_rewards
-from app import buddy, checkin as checkin_service, model_policy, travel
+from app import buddy, daily_chat, checkin as checkin_service, model_policy, travel
 from app.credential_cooldowns import CredentialCooldowns
 from app.model_blocks import ModelBlocks
 from app.usage_snapshots import UsageSnapshots
@@ -1411,6 +1411,18 @@ def _sync_error(pool, ledger, entry, generation, phase, error):
     _log(f"[{phase}] {Path(entry['id']).name} 同步失败（保留旧数据）: {message}")
 
 
+def _daily_chat_done(entry, day):
+    """Today's turn already confirmed, so the sweep must not spend another one."""
+    store = CONFIG.get("control_store")
+    if store is None or not entry.get("account_key"):
+        return True
+    try:
+        return store.daily_chat_done(entry["account_key"], day)
+    except Exception:
+        # An unreadable record is treated as done: never guess a turn was free to send.
+        return True
+
+
 def _buddy_context(entry, headers, consent_revision=None):
     def select_model(requested=None):
         from app.audit_store import safe_label
@@ -1498,6 +1510,22 @@ def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=Non
                 buddy.daily_warning(CONFIG, entry.get("account_key"), entry.get("profile"), trip)
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "travel", error)
+        if not model_policy.credential_enabled(CONFIG, entry):
+            return None
+        # A daily-activity turn spends credits on the account and is opt-in, so it runs
+        # before the balance refresh reads back whatever it cost.
+        if (checkin and model_policy.credential_auto_daily_chat(CONFIG, entry)
+                and not _daily_chat_done(entry, day)):
+            try:
+                def can_chat():
+                    return (model_policy.credential_auto_daily_chat(CONFIG, entry)
+                            and pool.apply_if_current(cm, generation, lambda: None))
+                turn = daily_chat.perform(token, profile, uid=uid, domain=domain, can_write=can_chat,
+                                          store=CONFIG.get("control_store"),
+                                          identity=entry.get("account_key"))
+                _log(f"[dailychat] {Path(cid).name}: state={turn.get('state')} ok={turn.get('ok')}")
+            except Exception as error:
+                _sync_error(pool, ledger, entry, generation, "dailychat", error)
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
         balance = credits_mod.fetch_credits(token, uid=uid, domain=domain)
@@ -1889,7 +1917,7 @@ _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
 def _log(msg: str):
     """Persist allowlisted runtime events in SQLite, never free-form text or secrets."""
     audit = CONFIG.get("audit_store")
-    component = re.match(r"\[(cred|credits|models|usage|trial|checkin|housekeeper)\]", msg)
+    component = re.match(r"\[(cred|credits|models|usage|trial|checkin|dailychat|housekeeper)\]", msg)
     if audit is not None and component:
         # Persist event codes, not free-form lines which may contain upstream data.
         code = "cooldown" if "熔断" in msg or "冷却" in msg else "failure" if "失败" in msg or "异常" in msg else "updated"
