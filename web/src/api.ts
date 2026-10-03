@@ -227,8 +227,14 @@ export function credentialResponse(value: unknown): Credential[] {
     const id = c.account_key ?? c.id;
     if (typeof id !== "string" || !id) throw new Error("凭证缺少公开 account_key");
     const name = c.name ?? c.filename;
-    for (const field of ["auto_checkin", "auto_travel", "auto_daily_chat",
-                         "travel_supported", "trial_supported", "daily_chat_supported"])
+    for (const field of [
+      "auto_checkin",
+      "auto_travel",
+      "auto_daily_chat",
+      "travel_supported",
+      "trial_supported",
+      "daily_chat_supported",
+    ])
       if (c[field] !== undefined && typeof c[field] !== "boolean")
         throw new Error("自动任务状态必须为布尔值");
     for (const field of ["checkin", "travel", "trial", "daily_chat"])

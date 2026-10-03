@@ -32,8 +32,11 @@ function fixture() {
       auto_checkin: false,
       auto_travel: false,
       travel_supported: false,
+      daily_chat_supported: true,
+      auto_daily_chat: false,
       checkin: { state: "inactive", date: "2026-09-15", message: "签到活动未开放或已结束" },
       travel: { state: "unknown", message: "尚未查询" },
+      daily_chat: { state: "idle", day: "2026-10-03", message: "尚未执行" },
     },
   ];
   const reload = vi.fn();
@@ -61,6 +64,16 @@ it("renders server preferences, allows international checkin opt-in, but never o
     true,
   );
   expect(screen.queryByRole("button", { name: "旅行领派 intl.info" })).toBeNull();
+  // The daily turn is international-only, so the domestic switch is shown but unusable.
+  expect(screen.getByRole("switch", { name: "自动活跃打卡 cn.info" })).toHaveProperty(
+    "disabled",
+    true,
+  );
+  expect(screen.getByRole("switch", { name: "自动活跃打卡 intl.info" })).toHaveProperty(
+    "checked",
+    false,
+  );
+  expect(screen.getByText("今日打卡：尚未执行")).toBeTruthy();
   await act(async () =>
     fireEvent.click(screen.getByRole("switch", { name: "自动签到 intl.info" })),
   );
@@ -69,9 +82,15 @@ it("renders server preferences, allows international checkin opt-in, but never o
     "checked",
     true,
   );
-  expect(screen.getByText(/保存不会立即领取/)).toBeTruthy();
+  expect(screen.getByText(/保存不会立即执行/)).toBeTruthy();
   expect(reload).toHaveBeenCalled();
   post.mockClear();
+  // Opting into the daily turn only persists; the sweep decides when the turn runs.
+  await act(async () =>
+    fireEvent.click(screen.getByRole("switch", { name: "自动活跃打卡 intl.info" })),
+  );
+  expect(patch).toHaveBeenLastCalledWith("/credentials/intl", { auto_daily_chat: true });
+  expect(post).not.toHaveBeenCalled();
   await act(async () => fireEvent.click(screen.getByRole("switch", { name: "自动旅行 cn.info" })));
   expect(patch).toHaveBeenLastCalledWith("/credentials/cn", { auto_travel: false });
   expect(screen.getByRole("switch", { name: "自动签到 cn.info" })).toHaveProperty("checked", true);

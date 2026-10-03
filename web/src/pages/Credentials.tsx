@@ -212,9 +212,7 @@ export function Credentials() {
           : field === "auto_travel"
             ? "自动旅行"
             : "自动活跃打卡";
-      setNotice(
-        `${label}已${enabled ? "开启" : "关闭"}；保存不会立即执行，后续维护按新设置执行。`,
-      );
+      setNotice(`${label}已${enabled ? "开启" : "关闭"}；保存不会立即执行，后续维护按新设置执行。`);
     });
   };
   const liveSelected = selected.filter((id) => resource.data?.some((c) => c.id === id));
