@@ -70,7 +70,7 @@ test("per-account automation persists with scoped actions, dark mode and mobile 
   await expect(page.getByRole("switch", { name: "自动签到 intl.info" })).not.toBeChecked();
   await expect(page.getByRole("switch", { name: "自动旅行 intl.info" })).toBeDisabled();
   await page.getByRole("switch", { name: "自动签到 intl.info" }).click();
-  await expect(page.getByText(/保存不会立即领取/)).toBeVisible();
+  await expect(page.getByText(/保存不会立即执行/)).toBeVisible();
   expect(writes).toEqual(["PATCH /admin/credentials/intl"]);
   await page.reload();
   await expect(page.getByRole("switch", { name: "自动签到 intl.info" })).toBeChecked();
