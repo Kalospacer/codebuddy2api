@@ -644,16 +644,56 @@ class RealtimeTransportTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsInstance(failure, UpstreamResponseError)
                 self.assertEqual((failure.status, failure.headers.get("Retry-After")), (429, "7"))
 
-    async def test_reasoning_delta_reaches_asgi_client_before_release(self):
-        before, wire = await self.drive(
-            "responses", "realtime", False,
-            first_delta={"reasoning_content": "meaningful reasoning"})
-        self.assertIn(b"response.reasoning_summary_text.delta", before)
-        self.assertIn(b"meaningful reasoning", before)
-        reasoning_deltas = [event["delta"] for event in _events(wire.decode())
-                            if event["type"] == "response.reasoning_summary_text.delta"]
-        self.assertEqual("".join(reasoning_deltas), "meaningful reasoning")
-        self.assertIn(b"response.completed", wire)
+    async def test_reasoning_deltas_are_coalesced_before_visible_output(self):
+        rows = [
+            _line({"reasoning_content": "W"}),
+            _line({"reasoning_content": "line"}),
+            _line({"reasoning_content": "478", "content": "85"}),
+            _line({"content": "done"}),
+            _line({}, "stop", {"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5}),
+            "data: [DONE]\n\n",
+        ]
+        for protocol in ("chat", "responses", "messages"):
+            with self.subTest(protocol=protocol):
+                response = _FixedResponse(rows)
+
+                @asynccontextmanager
+                async def backend(*args, **kwargs):
+                    yield response
+
+                path = {"chat": "/v1/chat/completions", "responses": "/v1/responses",
+                        "messages": "/v1/messages"}[protocol]
+                sent = await self.asgi_post(
+                    path, self.payload(protocol, False), backend,
+                    config={"stream_mode": "realtime"})
+                wire = b"".join(message.get("body", b"") for message in sent
+                                if message["type"] == "http.response.body")
+                if protocol == "chat":
+                    events = [json.loads(line[6:]) for line in wire.decode().splitlines()
+                              if line.startswith("data: ") and line[6:] != "[DONE]"]
+                    reasoning = [event["choices"][0]["delta"].get("reasoning_content")
+                                 for event in events
+                                 if event.get("choices") and event["choices"][0]["delta"].get("reasoning_content")]
+                    content = [event["choices"][0]["delta"].get("content")
+                               for event in events
+                               if event.get("choices") and event["choices"][0]["delta"].get("content")]
+                    self.assertEqual(reasoning, ["Wline478"])
+                    self.assertEqual(content, ["85", "done"])
+                    self.assertLess(
+                        next(i for i, event in enumerate(events)
+                             if event["choices"][0]["delta"].get("reasoning_content")),
+                        next(i for i, event in enumerate(events)
+                             if event["choices"][0]["delta"].get("content")))
+                elif protocol == "responses":
+                    events = _events(wire.decode())
+                    reasoning = [event["delta"] for event in events
+                                 if event["type"] == "response.reasoning_summary_text.delta"]
+                    self.assertEqual(reasoning, ["Wline478"])
+                else:
+                    blocks = _serial_blocks(self, wire.decode())
+                    self.assertEqual([block["type"] for block in blocks], ["thinking", "text"])
+                    self.assertEqual(blocks[0]["thinking"], "Wline478")
+                    self.assertEqual(blocks[1]["text"], "85done")
 
     async def test_hot_mode_change_affects_only_the_next_request(self):
         before, _ = await self.drive("responses", "realtime", True, change_to="compatible")

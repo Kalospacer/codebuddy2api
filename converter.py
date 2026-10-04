@@ -3100,8 +3100,8 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
         return "data: " + json.dumps(payload, ensure_ascii=False)
 
     lines = [_line({"role": "assistant", "content": ""})]
-    for i in range(0, len(reasoning), 48):
-        lines.append(_line({"reasoning_content": reasoning[i:i + 48]}))
+    if reasoning:
+        lines.append(_line({"reasoning_content": reasoning}))
     for i in range(0, len(content), 48):
         lines.append(_line({"content": content[i:i + 48]}))
     refusal = m.get("refusal") or ""
@@ -3122,6 +3122,108 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
 
 def _network_error_text(error: Exception) -> str:
     return sanitize_log_text(f"{type(error).__name__}: {str(error).strip() or 'upstream transport failed'}", 512)
+
+async def _coalesce_reasoning_sse(lines, *, max_bytes=0):
+    """Emit one Chat reasoning delta before visible output for each stream."""
+    pending: list[str] = []
+    template = None
+
+    buffer_budget = StreamOutputBudget(max_bytes)
+    def flush():
+        nonlocal template, pending
+        if not pending:
+            return None
+        source = template or {}
+        payload = dict(source)
+        choices = source.get("choices") or []
+        if choices:
+            choice = dict(choices[0])
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            delta = {key: value for key, value in delta.items() if key == "role"}
+            delta["reasoning_content"] = "".join(pending)
+            choice["delta"] = delta
+            choice["finish_reason"] = None
+            payload["choices"] = [choice]
+        wire = "data: " + json.dumps(payload, ensure_ascii=False)
+        template = None
+        pending = []
+        return wire
+
+    async for raw_line in lines:
+        embedded_boundary = isinstance(raw_line, str) and raw_line.endswith(("\n", "\r"))
+        line = raw_line.rstrip("\r\n") if isinstance(raw_line, str) else raw_line
+        if not line or not line.strip():
+            if pending:
+                continue
+            yield line
+            continue
+        if not line.startswith("data:"):
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+                yield ""
+            yield line
+            if embedded_boundary:
+                yield ""
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+                yield ""
+            yield line
+            if embedded_boundary:
+                yield ""
+            continue
+        try:
+            event = json.loads(data)
+        except (TypeError, ValueError):
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+                yield ""
+            yield line
+            if embedded_boundary:
+                yield ""
+            continue
+        choices = event.get("choices") if isinstance(event, dict) else None
+        choice = choices[0] if isinstance(choices, list) and choices else None
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        reasoning = delta.get("reasoning_content") if isinstance(delta, dict) else None
+        if isinstance(reasoning, str) and reasoning:
+            if template is None:
+                template = event
+            pending.append(reasoning)
+            buffer_budget.charge_text(reasoning)
+            visible = any(delta.get(key) for key in ("content", "refusal", "tool_calls", "function_call"))
+            visible = visible or bool(choice.get("finish_reason"))
+            if not visible:
+                continue
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+                yield ""
+            choice = dict(choice)
+            clean_delta = dict(delta)
+            clean_delta.pop("reasoning_content", None)
+            choice["delta"] = clean_delta
+            event = dict(event)
+            event["choices"] = [choice]
+            if clean_delta or choice.get("finish_reason") is not None:
+                yield "data: " + json.dumps(event, ensure_ascii=False)
+                if embedded_boundary:
+                    yield ""
+            continue
+        flushed = flush()
+        if flushed is not None:
+            yield flushed
+            yield ""
+        yield line
+        if embedded_boundary:
+            yield ""
+
+
 
 def _public_sse_line(line, model_name):
     if CONFIG.get("control_store") is not None and line.startswith("data:"):
@@ -3353,7 +3455,9 @@ async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
     policy = body.pop(_REQUEST_POLICY_KEY, None) or _snapshot_stream_policy("chat", body)
     sent = False
-    upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, policy=policy)
+    upstream = _coalesce_reasoning_sse(_chat_sse_lines(
+        url, headers, body, model_name, t0, rid, cred, policy=policy),
+        max_bytes=policy.max_collect_bytes)
     try:
         try:
             async for line in upstream:
@@ -3773,9 +3877,10 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
                                               parallel_tool_calls=body.get("parallel_tool_calls", True),
                                               tool_registry=tool_registry))
     sent = False
-    upstream = _chat_sse_lines(
+    upstream = _coalesce_reasoning_sse(_chat_sse_lines(
         url, headers, body, model_name, t0, rid, cred,
-        policy=policy, tracker=tracker, state=state)
+        policy=policy, tracker=tracker, state=state),
+        max_bytes=policy.max_collect_bytes)
     try:
         try:
             async for line in upstream:

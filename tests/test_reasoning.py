@@ -73,7 +73,9 @@ class TestChatAggregation(unittest.TestCase):
             reasoning += delta.get("reasoning_content") or ""
             content += delta.get("content") or ""
         self.assertEqual(reasoning, "思考一思考二")
+        self.assertEqual(sum("reasoning_content" in line for line in lines), 1)
         self.assertIn("正文", content)
+        self.assertEqual(sum("reasoning_content" in line for line in lines), 1)
         # Reasoning deltas precede text deltas.
         first_reasoning = next(i for i, l in enumerate(lines) if "reasoning_content" in l)
         first_content = next(i for i, l in enumerate(lines) if '"content": "正' in l or '"content":"正' in l)
