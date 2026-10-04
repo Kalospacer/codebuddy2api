@@ -464,17 +464,24 @@ class ControlStore:
 
     _DAILY_CHAT_PHASES = ("reserved", "sent", "confirmed", "cancelled", "reconciled")
 
-    # Where each transition may read from. The IN (...) fragment beside it is derived once
-    # from these literals at import time and only ever contains "?" placeholders; the
-    # phase names themselves are bound as parameters, never interpolated.
     _DAILY_CHAT_TRANSITIONS = {"sent": ("reserved",),
                                "confirmed": ("sent", "confirmed", "reconciled"),
                                "cancelled": ("reserved", "sent", "cancelled"),
                                "reconciled": ("reserved", "sent", "confirmed", "reconciled")}
-    _DAILY_CHAT_ALLOWED_SQL = {
-        phase: "phase IN (" + ",".join("?" for _ in allowed) + ")"
-        for phase, allowed in _DAILY_CHAT_TRANSITIONS.items()}
-
+    _DAILY_CHAT_UPDATE_SQL = {
+        "sent": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?)",
+        "confirmed": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                     "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                     "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?,?,?)",
+        "cancelled": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                     "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                     "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?,?,?)",
+        "reconciled": "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
+                      "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
+                      "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN (?,?,?,?)",
+    }
     def daily_chat_record(self, identity, day):
         _identifier(identity, "账号指纹")
         _day(day)
@@ -525,10 +532,7 @@ class ControlStore:
         expected = self._DAILY_CHAT_TRANSITIONS[phase]
         with self._lock:
             updated = self._db.execute(
-                "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
-                "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
-                "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND "
-                + self._DAILY_CHAT_ALLOWED_SQL[phase],
+                self._DAILY_CHAT_UPDATE_SQL[phase],
                 (phase, phase, phase, time.time(), time.time(), identity, day, attempt, *expected))
             if updated.rowcount != 1:
                 raise ValueError("打卡预留已变化")
