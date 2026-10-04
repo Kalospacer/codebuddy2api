@@ -449,7 +449,9 @@ class DailyChatTests(fixtures.CredentialActionTests):
         self.assertIsNotNone(attempt)
 
     def test_day_must_be_a_plain_date(self):
-        for bad in ("2026-9-30", "20260930", 20260930, "2026-09-30T00:00:00", ""):
+        for bad in ("2026-9-30", "20260930", 20260930, "2026-09-30T00:00:00", "",
+                    # Syntactically well-shaped but not a real calendar day.
+                    "2026-99-99", "2026-02-31", "2026-13-01", "2026-04-31", "0000-01-01"):
             with self.assertRaises(ValueError, msg=repr(bad)):
                 self.control.daily_chat_record(self.intl["account_key"], bad)
 

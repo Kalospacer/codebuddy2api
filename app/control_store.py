@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import copy
 import json
+from datetime import date
 from pathlib import Path
 import sqlite3
 import threading
@@ -24,10 +25,19 @@ def _identifier(value, label):
 
 
 def _day(value, label="日期"):
-    """Accept only a YYYY-MM-DD local day; never a timestamp or free text."""
+    """Accept only a YYYY-MM-DD local calendar day; never a timestamp or free text.
+
+    The shape check alone admits 2026-02-31 and 2026-99-99, and a day that never
+    happened would become a distinct key that the once-per-day guard could be
+    satisfied against instead of the real day.
+    """
     if (not isinstance(value, str) or len(value) != 10 or value[4] != "-" or value[7] != "-"
             or not value.replace("-", "").isdigit()):
         raise ValueError(f"{label} 无效")
+    try:
+        date.fromisoformat(value)
+    except ValueError:
+        raise ValueError(f"{label} 无效") from None
     return value
 
 
@@ -454,6 +464,17 @@ class ControlStore:
 
     _DAILY_CHAT_PHASES = ("reserved", "sent", "confirmed", "cancelled", "reconciled")
 
+    # Where each transition may read from. The IN (...) fragment beside it is derived once
+    # from these literals at import time and only ever contains "?" placeholders; the
+    # phase names themselves are bound as parameters, never interpolated.
+    _DAILY_CHAT_TRANSITIONS = {"sent": ("reserved",),
+                               "confirmed": ("sent", "confirmed", "reconciled"),
+                               "cancelled": ("reserved", "sent", "cancelled"),
+                               "reconciled": ("reserved", "sent", "confirmed", "reconciled")}
+    _DAILY_CHAT_ALLOWED_SQL = {
+        phase: "phase IN (" + ",".join("?" for _ in allowed) + ")"
+        for phase, allowed in _DAILY_CHAT_TRANSITIONS.items()}
+
     def daily_chat_record(self, identity, day):
         _identifier(identity, "账号指纹")
         _day(day)
@@ -501,16 +522,13 @@ class ControlStore:
         _identifier(attempt, "尝试 ID")
         if phase not in self._DAILY_CHAT_PHASES:
             raise ValueError("打卡阶段无效")
-        expected = {"sent": ("reserved",),
-                    "confirmed": ("sent", "confirmed", "reconciled"),
-                    "cancelled": ("reserved", "sent", "cancelled"),
-                    "reconciled": ("reserved", "sent", "confirmed", "reconciled")}[phase]
+        expected = self._DAILY_CHAT_TRANSITIONS[phase]
         with self._lock:
             updated = self._db.execute(
                 "UPDATE daily_chats SET phase=CASE WHEN phase='reconciled' AND ?='confirmed' THEN phase ELSE ? END, "
                 "confirmed_at=CASE WHEN ? IN ('confirmed','reconciled') THEN COALESCE(confirmed_at,?) ELSE confirmed_at END, "
-                "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND phase IN ("
-                + ",".join("?" for _ in expected) + ")",
+                "updated_at=? WHERE account_key=? AND day=? AND attempt_id=? AND "
+                + self._DAILY_CHAT_ALLOWED_SQL[phase],
                 (phase, phase, phase, time.time(), time.time(), identity, day, attempt, *expected))
             if updated.rowcount != 1:
                 raise ValueError("打卡预留已变化")
