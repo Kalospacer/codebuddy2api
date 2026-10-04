@@ -3124,11 +3124,11 @@ def _network_error_text(error: Exception) -> str:
     return sanitize_log_text(f"{type(error).__name__}: {str(error).strip() or 'upstream transport failed'}", 512)
 
 async def _coalesce_reasoning_sse(lines, *, max_bytes=0):
-    """Emit one Chat reasoning delta before visible output for each stream."""
+    """Coalesce normalized Chat SSE reasoning before downstream protocol adapters."""
     pending: list[str] = []
     template = None
-
     buffer_budget = StreamOutputBudget(max_bytes)
+
     def flush():
         nonlocal template, pending
         if not pending:
@@ -3136,14 +3136,20 @@ async def _coalesce_reasoning_sse(lines, *, max_bytes=0):
         source = template or {}
         payload = dict(source)
         choices = source.get("choices") or []
-        if choices:
-            choice = dict(choices[0])
-            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-            delta = {key: value for key, value in delta.items() if key == "role"}
-            delta["reasoning_content"] = "".join(pending)
-            choice["delta"] = delta
-            choice["finish_reason"] = None
-            payload["choices"] = [choice]
+        transformed = []
+        for index, raw_choice in enumerate(choices):
+            if not isinstance(raw_choice, dict):
+                transformed.append(raw_choice)
+                continue
+            choice = dict(raw_choice)
+            if index == 0:
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                delta = {key: value for key, value in delta.items() if key == "role"}
+                delta["reasoning_content"] = "".join(pending)
+                choice["delta"] = delta
+                choice["finish_reason"] = None
+            transformed.append(choice)
+        payload["choices"] = transformed
         wire = "data: " + json.dumps(payload, ensure_ascii=False)
         template = None
         pending = []
@@ -3158,10 +3164,7 @@ async def _coalesce_reasoning_sse(lines, *, max_bytes=0):
             yield line
             continue
         if not line.startswith("data:"):
-            flushed = flush()
-            if flushed is not None:
-                yield flushed
-                yield ""
+            # SSE comments and event/control lines do not end a reasoning run.
             yield line
             if embedded_boundary:
                 yield ""
@@ -3204,13 +3207,22 @@ async def _coalesce_reasoning_sse(lines, *, max_bytes=0):
             if flushed is not None:
                 yield flushed
                 yield ""
-            choice = dict(choice)
-            clean_delta = dict(delta)
-            clean_delta.pop("reasoning_content", None)
-            choice["delta"] = clean_delta
+            transformed_choices = []
+            for index, raw_choice in enumerate(choices):
+                if not isinstance(raw_choice, dict):
+                    transformed_choices.append(raw_choice)
+                    continue
+                clean_choice = dict(raw_choice)
+                if index == 0:
+                    clean_delta = dict(delta)
+                    clean_delta.pop("reasoning_content", None)
+                    clean_choice["delta"] = clean_delta
+                transformed_choices.append(clean_choice)
             event = dict(event)
-            event["choices"] = [choice]
-            if clean_delta or choice.get("finish_reason") is not None:
+            event["choices"] = transformed_choices
+            if any(isinstance(item, dict) and
+                   (item.get("delta") or item.get("finish_reason") is not None)
+                   for item in transformed_choices):
                 yield "data: " + json.dumps(event, ensure_ascii=False)
                 if embedded_boundary:
                     yield ""

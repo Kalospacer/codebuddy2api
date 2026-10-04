@@ -648,6 +648,7 @@ class RealtimeTransportTests(unittest.IsolatedAsyncioTestCase):
         rows = [
             _line({"reasoning_content": "W"}),
             _line({"reasoning_content": "line"}),
+            ": ping\n\n",
             _line({"reasoning_content": "478", "content": "85"}),
             _line({"content": "done"}),
             _line({}, "stop", {"prompt_tokens": 1, "completion_tokens": 4, "total_tokens": 5}),
