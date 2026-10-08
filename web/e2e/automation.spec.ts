@@ -10,8 +10,10 @@ test("per-account automation persists with scoped actions, dark mode and mobile 
       enabled: true,
       profile: "cn-cli",
       health: "ready",
+      auto_checkin: true,
       auto_travel: true,
       travel_supported: true,
+      checkin: { state: "already", date: "2026-09-15", message: "今日已签到" },
       travel: { state: "traveling", message: "Buddy 旅行中" },
     },
     {
@@ -20,8 +22,10 @@ test("per-account automation persists with scoped actions, dark mode and mobile 
       enabled: true,
       profile: "intl-work",
       health: "ready",
+      auto_checkin: false,
       auto_travel: false,
       travel_supported: false,
+      checkin: { state: "inactive", date: "2026-09-15", message: "签到活动未开放或已结束" },
       travel: { state: "unknown", message: "尚未查询" },
     },
   ];
@@ -61,20 +65,23 @@ test("per-account automation persists with scoped actions, dark mode and mobile 
     return route.fulfill({ status: 404, json: {} });
   });
   await page.goto("/dashboard/credentials");
-  await expect(page.getByRole("switch", { name: /自动签到/ })).toHaveCount(0);
-  await expect(page.getByRole("button", { name: /签到/ })).toHaveCount(0);
+  await expect(page.getByRole("switch", { name: "自动签到 cn.info" })).toBeChecked();
   await expect(page.getByRole("switch", { name: "自动旅行 cn.info" })).toBeChecked();
+  await expect(page.getByRole("switch", { name: "自动签到 intl.info" })).not.toBeChecked();
   await expect(page.getByRole("switch", { name: "自动旅行 intl.info" })).toBeDisabled();
-  await page.getByRole("switch", { name: "自动旅行 cn.info" }).click();
-  await expect(page.getByText(/保存不会立即领取/)).toBeVisible();
-  expect(writes).toEqual(["PATCH /admin/credentials/cn"]);
+  await page.getByRole("switch", { name: "自动签到 intl.info" }).click();
+  await expect(page.getByText(/保存不会立即执行/)).toBeVisible();
+  expect(writes).toEqual(["PATCH /admin/credentials/intl"]);
   await page.reload();
-  await expect(page.getByRole("switch", { name: "自动旅行 cn.info" })).not.toBeChecked();
+  await expect(page.getByRole("switch", { name: "自动签到 intl.info" })).toBeChecked();
+  await page.getByRole("switch", { name: "自动旅行 cn.info" }).click();
+  await expect(page.getByText(/自动旅行已关闭/)).toBeVisible();
   await page.getByRole("button", { name: "旅行状态 cn.info" }).click();
   await expect(page.getByText("部分完成")).toBeVisible();
   await page.getByRole("button", { name: "旅行领派 cn.info" }).click();
   await expect(page.getByText(/领取已确认，后续状态查询失败/)).toBeVisible();
   expect(writes).toEqual([
+    "PATCH /admin/credentials/intl",
     "PATCH /admin/credentials/cn",
     "POST /admin/credentials/cn/travel-status",
     "POST /admin/credentials/cn/travel",
@@ -83,7 +90,7 @@ test("per-account automation persists with scoped actions, dark mode and mobile 
   await page.emulateMedia({ colorScheme: "dark", reducedMotion: "reduce" });
   await page.setViewportSize({ width: 390, height: 844 });
   await expect(page.locator("html")).toHaveAttribute("data-theme", "dark");
-  await page.getByRole("switch", { name: "自动旅行 cn.info" }).scrollIntoViewIfNeeded();
+  await page.getByRole("switch", { name: "自动签到 cn.info" }).scrollIntoViewIfNeeded();
   expect(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth)).toBe(true);
   await page.screenshot({ path: "test-results/automation-mobile-dark.png", fullPage: true });
   expect(errors).toEqual([]);

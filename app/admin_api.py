@@ -42,6 +42,15 @@ async def _body(request, maximum=65536, *, allow_empty=False):
     return value
 
 
+def _unbind_requested(query: str) -> bool:
+    """Mirror the delete route's Boolean query parsing for the unbind confirmation flag."""
+    for pair in (query or "").split("&"):
+        key, _, value = pair.partition("=")
+        if key == "unbind" and value.lower() in ("1", "true", "on", "yes"):
+            return True
+    return False
+
+
 def _public_credential(item):
     # Never pass arbitrary credential manager fields through to the browser.
     fields = {"id", "account_key", "name", "filename", "enabled", "label", "profile", "region", "site",
@@ -49,8 +58,9 @@ def _public_credential(item):
               "credits_by_profile", "catalog", "catalog_sync", "sync", "generation", "auth_broken",
               "models", "remaining", "enterprise_id", "product", "status", "sync_pending", "sync_error",
               "fail_until", "cooldown_until", "cooldown_remaining", "last_failure_at", "catalog_ready", "bindings",
-              "auto_travel", "travel_supported", "travel",
+              "auto_checkin", "auto_travel", "travel_supported", "checkin", "travel",
               "trial_supported", "trial",
+              "daily_chat_supported", "auto_daily_chat", "daily_chat",
               "token_expired", "token_expires_at", "last_refresh_time", "sessions", "sticky_sessions", "last_error_code"}
     result = {key: value for key, value in item.items() if key in fields}
     identity = item.get("account_key") or item.get("id")
@@ -73,6 +83,8 @@ def install_admin(app, config, gateway):
     # otherwise never clear a snapshot belonging to a superseded key.
     auth.reconcile()
     mutation_lock = threading.RLock()
+    # The confirmed credential delete shares this lock so rule edits cannot interleave.
+    config["admin_mutation_lock"] = mutation_lock
     oauth_lock = threading.RLock()
     oauth_tasks = OrderedDict()
 
@@ -173,10 +185,11 @@ def install_admin(app, config, gateway):
             name = path.removeprefix("/admin/credentials/")
             if not _valid_name(name):
                 return error_response(400, "凭证文件名无效")
-            try:
-                await run_in_threadpool(gateway.admin_delete_guard, name)
-            except (ValueError, HTTPException):
-                return error_response(409, "凭证仍被模型策略引用，请先移除绑定")
+            if not _unbind_requested(request.url.query):
+                try:
+                    await run_in_threadpool(gateway.admin_delete_guard, name)
+                except (ValueError, HTTPException):
+                    return error_response(409, "凭证仍被模型策略引用，请先移除绑定")
         return None
 
     # Middleware is deliberately installed only here, never on module import.
@@ -356,8 +369,8 @@ def install_admin(app, config, gateway):
     @route("PATCH", "/admin/credentials/{id}")
     async def credentials_patch(request):
         data = await _body(request)
-        if set(data) not in ({"enabled"}, {"auto_travel"}) or any(type(value) is not bool for value in data.values()):
-            raise ValueError("仅接受一个布尔字段：enabled 或 auto_travel")
+        if set(data) not in ({"enabled"}, {"auto_checkin"}, {"auto_travel"}, {"auto_daily_chat"}) or any(type(value) is not bool for value in data.values()):
+            raise ValueError("仅接受一个布尔字段：enabled、auto_checkin、auto_travel 或 auto_daily_chat")
         field, value = next(iter(data.items()))
         identity = request.path_params["id"]
         def apply():
@@ -367,6 +380,10 @@ def install_admin(app, config, gateway):
                 # The gateway persists under the pool lock before publishing routing state.
                 if field == "enabled":
                     gateway.admin_set_credential_enabled(identity, value)
+                elif field == "auto_checkin":
+                    gateway.admin_set_auto_checkin(identity, value)
+                elif field == "auto_daily_chat":
+                    gateway.admin_set_auto_daily_chat(identity, value)
                 else:
                     gateway.admin_set_auto_travel(identity, value)
             event("credential." + field, {"credential": identity, field: value})

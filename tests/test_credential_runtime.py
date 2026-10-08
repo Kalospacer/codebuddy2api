@@ -264,6 +264,116 @@ class CredentialRuntimeTests(unittest.TestCase):
         pool._rescan()
         self.assertEqual([e["id"] for e in pool.entries()], [str(second)])
 
+    def test_encrypted_envelope_tokens_fail_fast_and_stay_out_of_pool(self):
+        valid = self.credential("valid.info", uid="valid", age=0)
+        envelope = self.root / "envelope.info"
+        envelope.write_text(json.dumps({"account": {"uid": "envelope"}, "auth": {
+            "accessToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+            "refreshToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+            "domain": "www.workbuddy.ai", "expiresAt": (time.time() + 86400) * 1000}}),
+            encoding="utf-8")
+        pool = converter.CredentialPool([valid, envelope])
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["valid.info"])
+        rejected = [c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("accessToken", rejected[0].args[0])
+        pool.reload([valid, envelope], reset=False)  # Repeat reloads neither re-log nor admit.
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["valid.info"])
+        self.assertEqual(len([c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]), 1)
+        with self.assertRaises(converter.auth_oauth.AuthTokenTypeError):  # Direct use fails fast.
+            converter.CredentialManager(envelope).get_headers()
+
+    def test_envelope_refresh_token_alone_is_rejected(self):
+        path = self.credential("rt.info", uid="rt", age=0)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["refreshToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool = converter.CredentialPool([path])
+        self.assertEqual(pool.entries(), [])
+        rejected = [c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]
+        self.assertEqual(len(rejected), 1)
+        self.assertIn("refreshToken", rejected[0].args[0])
+
+
+    def test_replaced_envelope_file_at_same_path_logs_again(self):
+        envelope = self.root / "churn.info"
+        def write_envelope(uid):
+            envelope.write_text(json.dumps({"account": {"uid": uid}, "auth": {
+                "accessToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+                "domain": "www.workbuddy.ai", "expiresAt": (time.time() + 86400) * 1000}}),
+                encoding="utf-8")
+        def rejections():
+            return len([c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]])
+        write_envelope("churn")
+        pool = converter.CredentialPool([envelope], scan=True)
+        self.assertEqual(rejections(), 1)
+        envelope.unlink()
+        write_envelope("other-account")  # A different credential, no scan ran while missing.
+        pool._rescan()
+        self.assertEqual(pool.entries(), [])
+        self.assertEqual(rejections(), 2)
+        pool._rescan()  # Identical content on the next scan stays silent.
+        self.assertEqual(rejections(), 2)
+    def test_recreated_envelope_file_at_same_path_logs_again(self):
+        envelope = self.root / "reuse.info"
+        def write_envelope():
+            envelope.write_text(json.dumps({"account": {"uid": "reuse"}, "auth": {
+                "accessToken": {"$wbEncrypted": 1, "envelope": "c3lu"},
+                "domain": "www.workbuddy.ai", "expiresAt": (time.time() + 86400) * 1000}}),
+                encoding="utf-8")
+        def rejections():
+            return len([c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]])
+        write_envelope()
+        pool = converter.CredentialPool([envelope], scan=True)
+        self.assertEqual(pool.entries(), [])
+        self.assertEqual(rejections(), 1)
+        envelope.unlink()
+        pool._rescan()  # Prune drops the suppressed path once the file is gone.
+        write_envelope()
+        pool._rescan()  # A new invalid file at the same path must warn again.
+        self.assertEqual(pool.entries(), [])
+        self.assertEqual(rejections(), 2)
+
+    def test_swapped_envelope_file_fails_fast_on_next_use(self):
+        path = self.credential(age=0)
+        pool = converter.CredentialPool([path])
+        self.assertEqual(len(pool.entries()), 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["accessToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool.reload([path], reset=True)  # A damaged file must not block other credentials.
+        self.assertEqual(pool.entries(), [])  # The stale identity is evicted, not retained.
+        with self.assertRaises(converter.auth_oauth.AuthTokenTypeError):  # Direct use fails fast.
+            converter.CredentialManager(path).get_headers()
+        pool.reload([path], reset=False)  # The next scan rejects it once like any new file.
+        self.assertEqual(pool.entries(), [])
+        rejected = [c for c in self.logs.call_args_list if "拒绝入池" in c.args[0]]
+        self.assertEqual(len(rejected), 1)
+
+    def test_rejected_explicit_path_recovers_when_repaired(self):
+        path = self.credential("explicit.info", uid="explicit", age=0)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["accessToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool = converter.CredentialPool([path])  # Explicit mode (scan=False).
+        self.assertEqual(pool.entries(), [])
+        self.credential("explicit.info", uid="explicit", age=0)  # Repair the same file.
+        pool._rescan()
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["explicit.info"])
+
+    def test_evicted_explicit_path_recovers_when_repaired(self):
+        path = self.credential("evicted.info", uid="evicted", age=0)
+        pool = converter.CredentialPool([path])
+        self.assertEqual(len(pool.entries()), 1)
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["auth"]["refreshToken"] = {"$wbEncrypted": 1, "envelope": "c3lu"}
+        path.write_text(json.dumps(data), encoding="utf-8")
+        pool.reload([path], reset=True)  # The envelope replacement evicts the entry.
+        self.assertEqual(pool.entries(), [])
+        self.credential("evicted.info", uid="evicted", age=0)  # Repair the same file.
+        pool._rescan()
+        self.assertEqual([Path(e["id"]).name for e in pool.entries()], ["evicted.info"])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

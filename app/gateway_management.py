@@ -8,7 +8,7 @@ from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.staticfiles import StaticFiles
 
-from . import model_policy, travel, trial_management
+from . import checkin, daily_chat, model_policy, travel, trial_management
 
 
 class Management:
@@ -26,6 +26,7 @@ class Management:
         pool._rescan()
         now = time.time()
         trials = trial_management.inventory(self.CONFIG.get("trial_ledger"))
+        daily_chats = self.CONFIG.get("control_store")
         with pool._lock:
             entries = {entry["id"]: entry for entry in pool.entries()}
             result = []
@@ -44,6 +45,8 @@ class Management:
                 state = ("disabled" if not enabled else "error" if row.get("error") else
                          "circuit_open" if until > now else "expired" if row.get("token_expired") else "ready")
                 row.update(id=identity, name=Path(path).name, enabled=enabled, health=state,
+                           auto_checkin=model_policy.credential_auto_checkin(self.CONFIG, entry),
+                           checkin=checkin.view(balance.get("checkin") or {}),
                            auto_travel=model_policy.credential_auto_travel(self.CONFIG, entry),
                            travel_supported=travel.supported(entry.get("profile")),
                            travel=balance.get("travel") or {"state": "unknown", "message": "尚未查询旅行状态"},
@@ -51,12 +54,16 @@ class Management:
                            trial=(trial_management.view(trials.get(identity), now=now) if trials is not None
                                   else trial_management.failure("storage_error"))
                                  if entry.get("profile") == "intl-work" else trial_management.failure("not_applicable"),
+                           daily_chat_supported=daily_chat.supported(entry.get("profile")),
+                           auto_daily_chat=model_policy.credential_auto_daily_chat(self.CONFIG, entry),
+                           daily_chat=self._daily_chat_view(daily_chats, identity, now),
                            fail_until=until, cooldown_until=until,
                            cooldown_remaining=max(0, round(until - now)),
                            last_error_code=("http_401" if entry.get("last_error") == "backend HTTP 401" else
                                             "http_403" if entry.get("last_error") == "backend HTTP 403" else
                                             "credential_error" if entry.get("last_error") else None),
                            last_failure_at=entry.get("last_failure_at"),
+                           sync_error=(balance.get("error") or entry.get("last_error") or None),
                            cooldowns=cooldowns, credits=balance.get("credits") or None,
                            sync_pending=path in pool._sync_pending or path in pool._syncing or path in pool._sync_retry,
                            catalog_ready=(self.CONFIG.get("account_catalogs") or {}).get(identity, {}).get("models") is not None,
@@ -85,6 +92,16 @@ class Management:
             self.gateway.invalidate_model_table()
         return next(row for row in self.admin_credential_inventory() if row["id"] == identity)
 
+    def admin_set_auto_checkin(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            if not any(entry.get("account_key") == identity for entry in pool.entries()):
+                raise HTTPException(404, "凭证不存在")
+            self.CONFIG["control_store"].set_auto_checkin(identity, enabled)
+        # Persist only: enabling does not launch a claim or enqueue unrelated synchronization.
+
     def admin_set_auto_travel(self, identity, enabled):
         pool = self.CONFIG.get("cred_pool")
         if pool is None:
@@ -97,12 +114,53 @@ class Management:
                 raise HTTPException(400, "旅行仅适用于国内账号")
             self.CONFIG["control_store"].set_auto_travel(identity, enabled)
 
-    def admin_delete_guard(self, name):
+    def admin_set_auto_daily_chat(self, identity, enabled):
+        pool = self.CONFIG.get("cred_pool")
+        if pool is None:
+            raise HTTPException(404, "凭证不存在")
+        with pool._lock:
+            entry = next((entry for entry in pool.entries() if entry.get("account_key") == identity), None)
+            if entry is None:
+                raise HTTPException(404, "凭证不存在")
+            if enabled and not daily_chat.supported(entry.get("profile")):
+                raise HTTPException(400, "活跃打卡仅适用于国际 WorkBuddy 账号")
+            self.CONFIG["control_store"].set_auto_daily_chat(identity, enabled)
+        # Persist only: enabling never launches a turn; the sweep decides when to run it.
+
+    @staticmethod
+    def _daily_chat_view(store, identity, now):
+        """Today's turn state, or the availability prompt when nothing is recorded yet."""
+        if store is None:
+            return daily_chat.failure_view()
+        try:
+            record = store.daily_chat_record(identity, daily_chat.today(now))
+        except Exception:
+            return daily_chat.failure_view()
+        return daily_chat.view(record)
+
+    def admin_delete_guard(self, name, *, unbind=False):
+        """Block a still-bound delete, or return the identity to unbind after removal."""
         rows = self.admin_credential_inventory()
         row = next((row for row in rows if row["name"] == name or row["id"] == name), None)
-        if row and row["bindings"]:
+        if row is None or not row["bindings"]:
+            return None
+        if not unbind:
             raise HTTPException(status_code=409, detail={"message": "凭证仍被模型规则引用，请先移除绑定",
                                                         "models": row["bindings"]})
+        return row["id"]
+
+    def admin_unbind_credential(self, identity):
+        """Unbind now and return the rollback record used when removal fails."""
+        control = self.CONFIG.get("control_store")
+        if control is None:
+            return {}
+        return {"identity": identity, "rules": control.unbind_credential(identity)}
+
+    def admin_restore_bindings(self, rollback):
+        """Put bindings back after a failed removal so routing never widens silently."""
+        control = self.CONFIG.get("control_store")
+        if control is not None:
+            control.restore_bindings(rollback["identity"], rollback["rules"])
 
     def admin_model_inventory(self):
         pool = self.CONFIG.get("cred_pool")
@@ -164,6 +222,8 @@ class Management:
                     if (self.CONFIG.get("account_catalogs") is not None or self.CONFIG.get("model_cache") is not None) and (
                             models is None or account.get("profile") != profile):
                         reason = "目录尚未就绪"
+                    elif not (pool._has_credit(entry, profile) or pool._model_free(entry, upstream)):
+                        reason = "额度不足或未知"
                     else:
                         reason = "账号自身目录不支持模型"
                 item = {"id": identity, "name": Path(entry["id"]).name, "profile": profile}

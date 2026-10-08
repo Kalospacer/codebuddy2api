@@ -11,7 +11,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # Allow direct exe
 
 import httpx
 
-from converter import _collect_stream, _merge_chat_sse_text, _chat_result_to_sse_lines
+from converter import (_chat_result_to_sse_lines, _coalesce_reasoning_sse, _collect_stream,
+                     _merge_chat_sse_text)
 from app.adapters.anthropic_adapter import AnthropicStreamConverter
 from app.adapters.responses_adapter import ResponsesStreamConverter
 
@@ -73,11 +74,40 @@ class TestChatAggregation(unittest.TestCase):
             reasoning += delta.get("reasoning_content") or ""
             content += delta.get("content") or ""
         self.assertEqual(reasoning, "思考一思考二")
+        self.assertEqual(sum("reasoning_content" in line for line in lines), 1)
         self.assertIn("正文", content)
+        self.assertEqual(sum("reasoning_content" in line for line in lines), 1)
         # Reasoning deltas precede text deltas.
         first_reasoning = next(i for i, l in enumerate(lines) if "reasoning_content" in l)
         first_content = next(i for i, l in enumerate(lines) if '"content": "正' in l or '"content":"正' in l)
         self.assertLess(first_reasoning, first_content)
+
+    def test_reasoning_coalescer_preserves_multiple_choices(self):
+        rows = [
+            "data: " + json.dumps({"id": "c", "choices": [
+                {"index": 0, "delta": {"reasoning_content": "思考"}, "finish_reason": None},
+                {"index": 1, "delta": {"content": "旁路"}, "finish_reason": None},
+            ]}),
+            "data: " + json.dumps({"id": "c", "choices": [
+                {"index": 0, "delta": {"content": "正文"}, "finish_reason": None},
+                {"index": 1, "delta": {"content": "继续"}, "finish_reason": None},
+            ]}),
+            "data: [DONE]",
+        ]
+
+        async def source():
+            for row in rows:
+                yield row
+
+        async def collect():
+            return [line async for line in _coalesce_reasoning_sse(source())]
+
+        events = [json.loads(line[6:]) for line in asyncio.run(collect())
+                  if line.startswith("data: ") and line[6:] != "[DONE]"]
+        self.assertTrue(events)
+        self.assertTrue(all(len(event["choices"]) == 2 for event in events))
+        self.assertEqual(events[0]["choices"][0]["delta"]["reasoning_content"], "思考")
+
 
 
 class TestReplayEnvelope(unittest.TestCase):

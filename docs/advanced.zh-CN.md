@@ -73,7 +73,7 @@ Responses 投影不再修改工具定义或 schema。启用脱敏时，默认剥
 `stream_mode` 默认 `compatible`，可通过 `--stream-mode compatible|realtime`、`CODEBUDDY2API_STREAM_MODE` 或 WebUI 枚举配置；显式 CLI/环境来源会锁定该项。所有生成请求（含非流式）均在选路前冻结模式及 `max_collect_bytes`，并记录所选模式。热更新只影响后续请求，不改变在途请求及换号；非流式仍返回聚合 JSON，客户端不能按请求覆盖模式。
 
 - `compatible` 保持现有行为：Responses 流式先聚合；Chat/Messages 带工具时先聚合，无工具时沿用上游增量。聚合结果先校验，再按片段重放。两种模式下，非流式请求始终走已校验的聚合路径。
-- `realtime` 让三个协议都增量发送思考、正文、拒绝及工具参数。Responses 在输出项开始时分配稳定索引，Anthropic 使用稳定 block index。适配器在参数阶段或结束标记处确认工具身份，缺失时暂缓工具输出；元数据分片按顺序追加，不按字符串前缀猜测，输出项开始后禁止更换身份。`max_collect_bytes` 约束所保留的 UTF-8 输出，`0` 不限制。
+- `realtime` 让三个协议都增量发送正文、拒绝及工具参数，并在正文开始前合并思考增量为一个事件，避免客户端显示多个思考段。Responses 在输出项开始时分配稳定索引，Anthropic 使用稳定 block index。适配器在参数阶段或结束标记处确认工具身份，缺失时暂缓工具输出；元数据分片按顺序追加，不按字符串前缀猜测，输出项开始后禁止更换身份。`max_collect_bytes` 约束所保留的 UTF-8 输出，`0` 不限制。
 
 实时 Messages 同时只打开一个内容块：当前工具仍增量输出，后续工具、正文或思考块可能等待上游结束，暂存事件字节计入 `max_collect_bytes`。尚未确认身份、未开始内容块的工具不会阻塞其它正文。
 

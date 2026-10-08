@@ -17,8 +17,10 @@ function fixture() {
       profile: "cn-cli",
       enabled: true,
       health: "ready",
+      auto_checkin: true,
       auto_travel: true,
       travel_supported: true,
+      checkin: { state: "success", date: "2026-09-15", message: "签到成功" },
       travel: { state: "traveling", message: "Buddy 旅行中" },
     },
     {
@@ -27,9 +29,14 @@ function fixture() {
       profile: "intl-work",
       enabled: true,
       health: "ready",
+      auto_checkin: false,
       auto_travel: false,
       travel_supported: false,
+      daily_chat_supported: true,
+      auto_daily_chat: false,
+      checkin: { state: "inactive", date: "2026-09-15", message: "签到活动未开放或已结束" },
       travel: { state: "unknown", message: "尚未查询" },
+      daily_chat: { state: "idle", day: "2026-10-03", message: "尚未执行" },
     },
   ];
   const reload = vi.fn();
@@ -37,7 +44,7 @@ function fixture() {
   return { rows, reload };
 }
 
-it("saves domestic travel without claims and never offers checkin", async () => {
+it("renders server preferences, allows international checkin opt-in, but never offers domestic travel there", async () => {
   const { rows, reload } = fixture();
   const patch = vi.spyOn(api, "patch").mockImplementation(async (url, body) => {
     const target = rows.find((r) => url === `/credentials/${r.id}`)!;
@@ -46,18 +53,47 @@ it("saves domestic travel without claims and never offers checkin", async () => 
   });
   const post = vi.spyOn(api, "post");
   render(<Credentials />);
-  expect(screen.queryByRole("switch", { name: /自动签到/ })).toBeNull();
-  expect(screen.queryByRole("button", { name: /签到/ })).toBeNull();
+  expect(screen.getByRole("switch", { name: "自动签到 cn.info" })).toHaveProperty("checked", true);
   expect(screen.getByRole("switch", { name: "自动旅行 cn.info" })).toHaveProperty("checked", true);
+  expect(screen.getByRole("switch", { name: "自动签到 intl.info" })).toHaveProperty(
+    "checked",
+    false,
+  );
   expect(screen.getByRole("switch", { name: "自动旅行 intl.info" })).toHaveProperty(
     "disabled",
     true,
   );
   expect(screen.queryByRole("button", { name: "旅行领派 intl.info" })).toBeNull();
-  await act(async () => fireEvent.click(screen.getByRole("switch", { name: "自动旅行 cn.info" })));
-  expect(patch).toHaveBeenCalledWith("/credentials/cn", { auto_travel: false });
-  expect(screen.getByText(/保存不会立即领取/)).toBeTruthy();
+  // The daily turn is international-only, so the domestic switch is shown but unusable.
+  expect(screen.getByRole("switch", { name: "自动活跃打卡 cn.info" })).toHaveProperty(
+    "disabled",
+    true,
+  );
+  expect(screen.getByRole("switch", { name: "自动活跃打卡 intl.info" })).toHaveProperty(
+    "checked",
+    false,
+  );
+  expect(screen.getByText("今日打卡：尚未执行")).toBeTruthy();
+  await act(async () =>
+    fireEvent.click(screen.getByRole("switch", { name: "自动签到 intl.info" })),
+  );
+  expect(patch).toHaveBeenCalledWith("/credentials/intl", { auto_checkin: true });
+  expect(screen.getByRole("switch", { name: "自动签到 intl.info" })).toHaveProperty(
+    "checked",
+    true,
+  );
+  expect(screen.getByText(/保存不会立即执行/)).toBeTruthy();
   expect(reload).toHaveBeenCalled();
+  post.mockClear();
+  // Opting into the daily turn only persists; the sweep decides when the turn runs.
+  await act(async () =>
+    fireEvent.click(screen.getByRole("switch", { name: "自动活跃打卡 intl.info" })),
+  );
+  expect(patch).toHaveBeenLastCalledWith("/credentials/intl", { auto_daily_chat: true });
+  expect(post).not.toHaveBeenCalled();
+  await act(async () => fireEvent.click(screen.getByRole("switch", { name: "自动旅行 cn.info" })));
+  expect(patch).toHaveBeenLastCalledWith("/credentials/cn", { auto_travel: false });
+  expect(screen.getByRole("switch", { name: "自动签到 cn.info" })).toHaveProperty("checked", true);
   expect(post).not.toHaveBeenCalled();
 });
 
@@ -65,15 +101,20 @@ it("does not pretend a failed or malformed save succeeded", async () => {
   fixture();
   const patch = vi.spyOn(api, "patch").mockResolvedValue({ data: { id: "intl", revision: 1 } });
   render(<Credentials />);
-  await act(async () => fireEvent.click(screen.getByRole("switch", { name: "自动旅行 cn.info" })));
+  await act(async () =>
+    fireEvent.click(screen.getByRole("switch", { name: "自动签到 intl.info" })),
+  );
   expect(screen.getByText(/设置保存结果未确认/)).toBeTruthy();
-  expect(screen.getByRole("switch", { name: "自动旅行 cn.info" })).toHaveProperty("checked", true);
+  expect(screen.getByRole("switch", { name: "自动签到 intl.info" })).toHaveProperty(
+    "checked",
+    false,
+  );
   patch.mockRejectedValueOnce(new Error("network unavailable"));
   await act(async () => fireEvent.click(screen.getByRole("switch", { name: "自动旅行 cn.info" })));
   expect(screen.getByRole("switch", { name: "自动旅行 cn.info" })).toHaveProperty("checked", true);
 });
 
-it("keeps manual travel separate from the automation preference writes", async () => {
+it("keeps manual checkin and travel separate from the automation preference writes", async () => {
   fixture();
   const post = vi.spyOn(api, "post").mockResolvedValue({
     data: {
@@ -92,6 +133,7 @@ it("keeps manual travel separate from the automation preference writes", async (
   for (const [label, path] of [
     ["旅行状态 cn.info", "/credentials/cn/travel-status"],
     ["旅行领派 cn.info", "/credentials/cn/travel"],
+    ["签到 intl.info", "/credentials/intl/checkin"],
   ]) {
     await act(async () => fireEvent.click(screen.getByRole("button", { name: label })));
     expect(post).toHaveBeenLastCalledWith(
@@ -100,6 +142,29 @@ it("keeps manual travel separate from the automation preference writes", async (
       expect.objectContaining({ timeout: 300000 }),
     );
   }
+  expect(screen.getByText("部分完成")).toBeTruthy();
+  expect(screen.getByText(/签到活动未开放或已结束/)).toBeTruthy();
+});
+
+it("shows partial completion when checkin is unavailable but departure succeeded", async () => {
+  fixture();
+  vi.spyOn(api, "post").mockResolvedValue({
+    data: {
+      results: [
+        {
+          id: "cn",
+          name: "cn.info",
+          ok: false,
+          skipped: true,
+          checkin_ok: false,
+          travel: { departed: true },
+          message: "活动未开放；Buddy 已派出",
+        },
+      ],
+    },
+  });
+  render(<Credentials />);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "签到 cn.info" })));
   expect(screen.getByText("部分完成")).toBeTruthy();
 });
 
@@ -111,11 +176,11 @@ it("disables switches when an older backend omits them and rejects malformed typ
     error: null,
   });
   render(<Credentials />);
-  expect(screen.getByRole("switch", { name: "自动旅行 old.info" })).toHaveProperty(
+  expect(screen.getByRole("switch", { name: "自动签到 old.info" })).toHaveProperty(
     "disabled",
     true,
   );
-  expect(() => credentialResponse({ credentials: [{ id: "bad", auto_travel: "false" }] })).toThrow(
+  expect(() => credentialResponse({ credentials: [{ id: "bad", auto_checkin: "false" }] })).toThrow(
     "自动任务状态必须为布尔值",
   );
 });
@@ -185,6 +250,30 @@ it("keeps confirmed departure visible when its status read fails", async () => {
   expect(screen.getByText(/HTTP 503/)).toBeTruthy();
   expect(screen.getByText(/业务码 123/)).toBeTruthy();
   expect(screen.queryByText(/查询时剩余/)).toBeNull();
+});
+
+it("shows nested travel diagnostics independently from checkin", async () => {
+  fixture();
+  vi.spyOn(api, "post").mockResolvedValue({
+    data: {
+      results: [
+        {
+          id: "cn",
+          name: "cn.info",
+          action: "checkin",
+          ok: false,
+          checkin_ok: true,
+          message: "签到成功；地点配置查询失败，未派出",
+          travel: { phase: "config", http_status: 404, error_kind: "http", code: 12 },
+        },
+      ],
+    },
+  });
+  render(<Credentials />);
+  await act(async () => fireEvent.click(screen.getByRole("button", { name: "签到 cn.info" })));
+  expect(screen.getByText("部分完成")).toBeTruthy();
+  expect(screen.getByText("地点配置")).toBeTruthy();
+  expect(screen.getByText(/HTTP 404/)).toBeTruthy();
 });
 
 it("does not invent a duration or a claimed credit amount", () => {

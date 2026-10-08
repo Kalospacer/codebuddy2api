@@ -77,6 +77,35 @@ def test_validate_cred_data():
     print("✅ test_validate_cred_data")
 
 
+def test_plaintext_token_guard():
+    from app.auth_oauth import AuthTokenTypeError, ensure_plaintext_tokens
+    ensure_plaintext_tokens({})
+    ensure_plaintext_tokens({"accessToken": "t", "refreshToken": "r"})
+    for field in ("accessToken", "refreshToken"):
+        for bad in ({"$wbEncrypted": 1, "envelope": "x"}, 5, ["x"], True):
+            try:
+                ensure_plaintext_tokens({field: bad})
+                raise AssertionError((field, bad))
+            except AuthTokenTypeError as e:
+                assert field in str(e)
+    # Import validation keeps rejecting envelope files before persistence,
+    # including a plaintext accessToken paired with an envelope refreshToken or alias.
+    envelope = _cred(domain="www.workbuddy.ai")
+    envelope["auth"]["accessToken"] = {"$wbEncrypted": 1, "envelope": "x"}
+    uid, err = validate_cred_data(envelope)
+    assert uid is None and "accessToken" in err
+    for field in ("refreshToken", "refresh_token", "access_token", "token"):
+        c = _cred(domain="www.workbuddy.ai")
+        c["auth"][field] = {"$wbEncrypted": 1, "envelope": "x"}
+        uid, err = validate_cred_data(c)
+        assert uid is None and field in err, field
+    alias = _cred(domain="www.workbuddy.ai")
+    alias["auth"].pop("accessToken")
+    alias["auth"]["access_token"] = "plain-token"
+    assert validate_cred_data(alias) == ("u1", None)
+    print("✅ test_plaintext_token_guard")
+
+
 def test_helpers():
     assert _normalize_origin("www.codebuddy.cn") == "https://www.codebuddy.cn"
     assert _normalize_origin("https://WWW.workbuddy.ai/x") == "https://www.workbuddy.ai"
@@ -361,6 +390,7 @@ def test_oauth_endpoint_import(tmp_path=None):
 
 if __name__ == "__main__":
     test_validate_cred_data()
+    test_plaintext_token_guard()
     test_helpers()
     test_build_auth_file()
     test_merge_existing_accounts()

@@ -18,7 +18,7 @@ import time
 import uuid
 from collections import OrderedDict
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -50,7 +50,7 @@ from app.adapters.anthropic_adapter import (
 
 from app import auth_oauth
 from app import trial_rewards
-from app import buddy, model_policy, travel
+from app import buddy, daily_chat, checkin as checkin_service, model_policy, travel
 from app.credential_cooldowns import CredentialCooldowns
 from app.model_blocks import ModelBlocks
 from app.usage_snapshots import UsageSnapshots
@@ -268,7 +268,12 @@ class CredentialManager:
         self._load_if_stale()
         if self._cached is None:
             raise RuntimeError(f"无法读取 auth 文件：{self.path}")
-        return self._cached
+        s = self._cached
+        auth = s.get("auth")
+        if isinstance(auth, dict):
+            # Encrypted envelope tokens must fail fast instead of leaking into upstream headers.
+            auth_oauth.ensure_plaintext_tokens(auth)
+        return s
 
     def _is_expired(self) -> bool:
         s = self._session()
@@ -517,7 +522,10 @@ class CredentialPool:
         self._ledger = None              # Prefer credits expiring sooner.
         self._capacity = AccountCapacity()
         self._scan = scan                # Rescan credentials before selection.
+        # Explicit paths must survive rejection or eviction so a repaired file re-enters.
+        self._configured: list[str] = []
         self._ignored_duplicates: set[str] = set()
+        self._ignored_invalid: dict[str, str | None] = {}
         self._sync_pending: set[str] = set()
         self._syncing: set[str] = set()
         self._sync_event = threading.Event()
@@ -535,6 +543,8 @@ class CredentialPool:
                          for entry in self._entries if entry.get("uid")}
             for path in paths:
                 cid = str(Path(path).resolve())
+                if cid not in self._configured:
+                    self._configured.append(cid)
                 if not os.path.exists(cid):
                     continue
                 entry = by_id.get(cid)
@@ -543,6 +553,13 @@ class CredentialPool:
                         entry["cm"].invalidate()
                     try:
                         summary = entry["cm"].summary()
+                    except auth_oauth.AuthTokenTypeError:
+                        # An envelope replacement must not keep serving the stale identity.
+                        by_id.pop(cid, None)
+                        if entry.get("uid"):
+                            have_uids.pop(entry.get("account_key"), None)
+                        self._drop_entry(entry)
+                        continue
                     except Exception:
                         continue  # A damaged file must not block other credentials.
                     generation = entry["cm"]._generation
@@ -576,6 +593,18 @@ class CredentialPool:
                 manager = CredentialManager(Path(cid))
                 try:
                     summary = manager.summary()
+                except auth_oauth.AuthTokenTypeError as error:
+                    # Envelope tokens cannot be refreshed or used; keep such files out of the pool.
+                    try:
+                        digest = hashlib.sha256(Path(cid).read_bytes()).hexdigest()
+                    except OSError:
+                        digest = None
+                    if self._ignored_invalid.get(cid) != digest:
+                        # Suppression is content-keyed so a different invalid credential
+                        # reusing the path warns again even without a scan while missing.
+                        _log(f"[cred] 拒绝入池（入库校验失败：{error}）: {Path(cid).name}")
+                        self._ignored_invalid[cid] = digest
+                    continue
                 except Exception:
                     summary = {}
                 uid = summary.get("uid")
@@ -594,6 +623,7 @@ class CredentialPool:
                 self._entries.append(entry)
                 by_id[cid] = entry
                 self._ignored_duplicates.discard(cid)
+                self._ignored_invalid.pop(cid, None)
                 if uid:
                     have_uids[identity_key] = cid
                 self._queue_sync(cid)
@@ -664,10 +694,27 @@ class CredentialPool:
             update()
             return True
 
+
+    def _drop_entry(self, entry):
+        """Purge one entry whose file became unusable, mirroring prune()'s cleanup."""
+        cid = entry["id"]
+        if self._ledger is not None:
+            self._ledger.remove(cid)
+        self.forget_credential_state(entry)
+        self._entries = [e for e in self._entries if e is not entry]
+        self._model_fail = {key: until for key, until in self._model_fail.items() if key[0] != cid}
+        self._sticky = OrderedDict((key, value) for key, value in self._sticky.items() if value[0] != cid)
+        self._sync_pending.discard(cid)
+        self._syncing.discard(cid)
+        self._sync_retry.pop(cid, None)
+        self._sync_attempts.pop(cid, None)
+        invalidate_model_table()
     def prune(self):
         """Remove missing credential files and their session bindings."""
         with self._lock:
             self._ignored_duplicates = {p for p in self._ignored_duplicates if os.path.exists(p)}
+            # A path whose invalid file vanished must warn again when a new file reuses it.
+            self._ignored_invalid = {p: v for p, v in self._ignored_invalid.items() if os.path.exists(p)}
             before = len(self._entries)
             removed = [e for e in self._entries if not os.path.exists(e["id"])]
             for entry in removed:
@@ -861,7 +908,8 @@ class CredentialPool:
         return (exp is None, exp or 0.0)
     def _rescan(self):
         self.prune()
-        paths = find_auth_files() if self._scan else [Path(entry["id"]) for entry in self.entries()]
+        # Explicit mode retries configured paths, including rejected or evicted ones.
+        paths = find_auth_files() if self._scan else [Path(cid) for cid in self._configured]
         self.reload(paths, reset=False)
 
     def _healthy(self, e: dict) -> bool:
@@ -878,6 +926,27 @@ class CredentialPool:
     def _entry_site(cls, entry):
         profile = cls._entry_profile(entry)
         return profile_site(profile) if profile else None
+
+    def _zero_balance(self, entry, profile) -> bool:
+        """Restrict a confirmed zero-balance account to its advertised zero-rate models."""
+        balance = (self._ledger.entry(entry["id"]).get("credits") or {}) if self._ledger else {}
+        if not balance:
+            return False
+        try:
+            return (bool(balance.get("intl")) == (profile_region(profile) == "intl")
+                    and float(balance.get("credits") or 0) <= 0)
+        except (TypeError, ValueError):
+            return False
+
+    def _has_credit(self, entry, profile):
+        balance = (self._ledger.entry(entry["id"]).get("credits") or {}) if self._ledger else {}
+        if not balance:
+            return profile_region(profile) == "cn"
+        try:
+            return (bool(balance.get("intl")) == (profile_region(profile) == "intl")
+                    and float(balance.get("credits") or 0) > 0)
+        except (TypeError, ValueError):
+            return False
 
     def _eligible(self, entry, model, *, region=None, profile=None, rule=None):
         if not model_policy.route_allowed(CONFIG, entry, model, rule=rule):
@@ -911,7 +980,9 @@ class CredentialPool:
                            and len(configured) == 1)
             if model and not (supported or cli_auto or passthrough):
                 return False
-        return True
+        # Zero-balance accounts may only use their own advertised zero-rate models.
+        return (not model or self._has_credit(entry, profile)
+                or self._model_free(entry, model, profile=profile))
 
     def _model_free(self, entry, model: str | None, *, profile=None) -> bool:
         """Check whether this account advertises the model as zero-rate."""
@@ -1323,7 +1394,7 @@ def _refresher_loop(pool: CredentialPool):
         except Exception as e:
             _log(f"[cred] 刷新线程异常: {e}")
 
-HOUSEKEEP_FIRST_DELAY = 30     # Initial account maintenance delay in seconds
+CHECKIN_FIRST_DELAY = 30     # Initial check-in delay in seconds
 HOUSEKEEP_INTERVAL = 3600    # Account maintenance interval in seconds
 
 
@@ -1338,6 +1409,18 @@ def _sync_error(pool, ledger, entry, generation, phase, error):
     message = f"{phase}: {_network_error_text(error)}"
     pool.apply_if_current(entry["cm"], generation, lambda: ledger.note_error(entry["id"], message))
     _log(f"[{phase}] {Path(entry['id']).name} 同步失败（保留旧数据）: {message}")
+
+
+def _daily_chat_done(entry, day):
+    """Today's turn already confirmed, so the sweep must not spend another one."""
+    store = CONFIG.get("control_store")
+    if store is None or not entry.get("account_key"):
+        return True
+    try:
+        return store.daily_chat_done(entry["account_key"], day)
+    except Exception:
+        # An unreadable record is treated as done: never guess a turn was free to send.
+        return True
 
 
 def _buddy_context(entry, headers, consent_revision=None):
@@ -1372,7 +1455,7 @@ def _buddy_context(entry, headers, consent_revision=None):
     return buddy.context(CONFIG, entry, consent_revision, headers=headers, task_model=select_model)
 
 
-def _sync_credits(pool, ledger, entry, *, automatic, failed, expected_identity=None):
+def _sync_credits(pool, ledger, entry, *, checkin, failed, expected_identity=None):
     if not model_policy.credential_enabled(CONFIG, entry):
         return None
     cm, cid = entry["cm"], entry["id"]
@@ -1393,9 +1476,28 @@ def _sync_credits(pool, ledger, entry, *, automatic, failed, expected_identity=N
             return None  # A path now owned by another account must be rescheduled with its own preferences.
         site = site_for_headers(headers)
         token, uid, domain = _bearer_token(headers), headers.get("X-User-Id", ""), headers.get("X-Domain", "")
+        day = daily_chat.today()
+        if checkin and model_policy.credential_auto_checkin(CONFIG, entry) and not ledger.checkin_done(cid, day):
+            try:
+                def can_claim():
+                    return (model_policy.credential_auto_checkin(CONFIG, entry)
+                            and pool.apply_if_current(cm, generation, lambda: None))
+                result = checkin_service.perform(token, uid=uid, domain=domain, can_claim=can_claim)
+                if result["state"] == "cancelled":
+                    if not pool.apply_if_current(cm, generation, lambda: None):
+                        failed.add(cid)
+                        return None
+                    # A preference-only cancellation must not interrupt balance refresh.
+                elif not pool.apply_if_current(cm, generation, lambda: ledger.mark_checkin(
+                        cid, day, result["ok"], result.get("code"), result["message"], state=result["state"])):
+                    failed.add(cid)
+                    return None
+                _log(f"[checkin] {Path(cid).name}: ok={result['ok']} already={result.get('already')} code={result.get('code')}")
+            except Exception as error:
+                _sync_error(pool, ledger, entry, generation, "checkin", error)
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
-        if automatic and model_policy.credential_auto_travel(CONFIG, entry):
+        if checkin and model_policy.credential_auto_travel(CONFIG, entry):
             try:
                 def can_travel():
                     return (model_policy.credential_auto_travel(CONFIG, entry)
@@ -1408,6 +1510,24 @@ def _sync_credits(pool, ledger, entry, *, automatic, failed, expected_identity=N
                 buddy.daily_warning(CONFIG, entry.get("account_key"), entry.get("profile"), trip)
             except Exception as error:
                 _sync_error(pool, ledger, entry, generation, "travel", error)
+        if not model_policy.credential_enabled(CONFIG, entry):
+            return None
+        # A daily-activity turn spends credits on the account and is opt-in, so it runs
+        # before the balance refresh reads back whatever it cost. Each account waits for
+        # its own slot inside the day so the accounts never go out together.
+        if (checkin and model_policy.credential_auto_daily_chat(CONFIG, entry)
+                and not _daily_chat_done(entry, day)
+                and daily_chat.is_due(entry.get("account_key"), day)):
+            try:
+                def can_chat():
+                    return (model_policy.credential_auto_daily_chat(CONFIG, entry)
+                            and pool.apply_if_current(cm, generation, lambda: None))
+                turn = daily_chat.perform(token, profile, uid=uid, domain=domain, can_write=can_chat,
+                                          store=CONFIG.get("control_store"),
+                                          identity=entry.get("account_key"))
+                _log(f"[dailychat] {Path(cid).name}: state={turn.get('state')} ok={turn.get('ok')}")
+            except Exception as error:
+                _sync_error(pool, ledger, entry, generation, "dailychat", error)
         if not model_policy.credential_enabled(CONFIG, entry):
             return None
         balance = credits_mod.fetch_credits(token, uid=uid, domain=domain)
@@ -1658,6 +1778,14 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
         pool._warn_storage("cooldown", pool._cooldowns.last_error is None)
         if CONFIG.get("usage_snapshots") is not None:
             CONFIG["usage_snapshots"].prune()
+        control_store = CONFIG.get("control_store")
+        if control_store is not None:
+            # Daily-activity rows are diagnostic only, so old ones are dropped rather
+            # than kept as history; the day itself is still read back from this table.
+            try:
+                control_store.prune_daily_chats()
+            except Exception as error:
+                _log(f"[housekeeper] 打卡记录清理失败: {_network_error_text(error)}")
         ids = pool.begin_sync(all_entries=not pending_only)
         failed = set()
         try:
@@ -1665,7 +1793,7 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
             for entry in pool.entries():
                 if entry["id"] not in ids:
                     continue
-                result = _sync_credits(pool, ledger, entry, automatic=not pending_only, failed=failed)
+                result = _sync_credits(pool, ledger, entry, checkin=not pending_only, failed=failed)
                 if result is not None:
                     refs[entry["id"]] = result
             _sync_model_catalogs(pool, ledger, refs, failed)
@@ -1680,7 +1808,7 @@ def _housekeep_once(pool: CredentialPool, ledger, *, pending_only=False):
 
 def _housekeeper_loop(pool: CredentialPool, ledger) -> None:
     """Wake for new credentials, retry failed work with backoff, and run hourly maintenance."""
-    next_full = time.monotonic() + HOUSEKEEP_FIRST_DELAY
+    next_full = time.monotonic() + CHECKIN_FIRST_DELAY
     while True:
         pool._sync_event.wait(pool.sync_wait(next_full - time.monotonic()))
         full_due = time.monotonic() >= next_full
@@ -1799,7 +1927,7 @@ _OAUTH = auth_oauth.OAuthManager(user_agent=USER_AGENT)
 def _log(msg: str):
     """Persist allowlisted runtime events in SQLite, never free-form text or secrets."""
     audit = CONFIG.get("audit_store")
-    component = re.match(r"\[(cred|credits|models|usage|trial|housekeeper)\]", msg)
+    component = re.match(r"\[(cred|credits|models|usage|trial|checkin|dailychat|housekeeper)\]", msg)
     if audit is not None and component:
         # Persist event codes, not free-form lines which may contain upstream data.
         code = "cooldown" if "熔断" in msg or "冷却" in msg else "failure" if "失败" in msg or "异常" in msg else "updated"
@@ -2043,15 +2171,29 @@ async def admin_add_credential(request: Request,
 
 @app.delete("/admin/credentials/{name}")
 def admin_del_credential(name: str,
+                         unbind: bool = False,
                          authorization: Optional[str] = Header(default=None),
                          x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """Delete the named .info file and remove its credential from the pool."""
+    """Delete the named .info file, unbinding model rules only after removal succeeds."""
     _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
-    if CONFIG.get("management") is not None:
-        CONFIG["management"].admin_delete_guard(os.path.basename(name))
-    if pool is None or not pool.remove_file(os.path.basename(name)):
-        raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
+    rollback = {}
+    identity = None
+    management = CONFIG.get("management")
+    # Serialize with model-rule edits so a rebind cannot slip between unbind and removal.
+    with CONFIG.get("admin_mutation_lock") or nullcontext():
+        if management is not None:
+            identity = management.admin_delete_guard(os.path.basename(name), unbind=unbind)
+            if identity is not None:
+                rollback = management.admin_unbind_credential(identity)
+        if pool is None or not pool.remove_file(os.path.basename(name)):
+            # A failed removal rolls the unbind back so routing never widens silently.
+            if management is not None and rollback:
+                management.admin_restore_bindings(rollback)
+            raise HTTPException(status_code=404, detail={"error": {"message": f"凭据不在池中: {name}", "type": "invalid_request_error"}})
+        if identity is not None and management is not None:
+            # Sweep any rebind that raced the removal from outside the shared lock.
+            management.admin_unbind_credential(identity)
     return {"removed": os.path.basename(name)}
 
 
@@ -2126,7 +2268,7 @@ def admin_oauth_poll(login_id: str = "",
 @app.get("/admin/credits")
 def admin_credits(authorization: Optional[str] = Header(default=None),
                   x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
-    """Return cached balances and credit expiry segments."""
+    """Return cached balances, credit expiry segments and check-in status."""
     _check_admin_auth(authorization, x_api_key)
     ledger = CONFIG.get("ledger")
     return {"credits": ledger.snapshot() if ledger else {}}
@@ -2139,6 +2281,14 @@ def admin_model_blocks(authorization: Optional[str] = Header(default=None),
     _check_admin_auth(authorization, x_api_key)
     pool = CONFIG.get("cred_pool")
     return {"model_blocks": pool.model_blocks_detail() if pool is not None else []}
+
+
+@app.post("/admin/checkin")
+def admin_checkin(authorization: Optional[str] = Header(default=None),
+                  x_api_key: Optional[str] = Header(default=None, alias="X-Api-Key")):
+    """Run daily-idempotent manual check-in without implicitly syncing balances or usage."""
+    _check_admin_auth(authorization, x_api_key)
+    return _admin_credential_action("checkin")
 
 
 def _admin_credential_action(action, identity=None, *, consent_revision=None):
@@ -2464,6 +2614,19 @@ def _catalog_pending(region: str | None = None) -> bool:
     return not any(_catalog_for(profile) is not None for profile in _configured_profiles(region))
 
 
+def _profile_has_credits(profile: str) -> bool:
+    pool = CONFIG.get("cred_pool")
+    if pool is None:
+        if profile_region(profile) == "cn":
+            return True
+        ledger = CONFIG.get("ledger")
+        return bool(ledger and any((entry.get("credits") or {}).get("intl")
+                                   and float((entry.get("credits") or {}).get("credits") or 0) > 0
+                                   for entry in ledger.snapshot().values()))
+    return any(pool._entry_profile(entry) == profile and pool._has_credit(entry, profile)
+               for entry in pool.entries() if model_policy.credential_enabled(CONFIG, entry))
+
+
 def current_models(region: str | None = None) -> list[str]:
     """Merge models eligible for current accounts without region-specific client URLs."""
     pool = CONFIG.get("cred_pool")
@@ -2481,18 +2644,31 @@ def current_models(region: str | None = None) -> list[str]:
                 profile = entry.get("profile")
                 if not profile or not _in_region(profile, region):
                     continue
+                # Publish only advertised zero-rate models for empty accounts.
+                zero = pool._zero_balance(entry, profile)
+                if not zero and not pool._has_credit(entry, profile):
+                    continue
                 account = accounts.get(entry.get("account_key")) or {}
                 if account.get("profile") != profile:
                     continue
                 models = _usable_models(_effective_account_scope(account, "serves"))
+                if zero:
+                    models = [model for model in models if _free_multiplier(model.get("credits"))]
                 out.extend(model["id"] for model in models)
                 if profile in auto_profiles and models:
                     has_auto |= profile == "cn-cli" or any(model["id"] == _upstream_model("auto", profile) for model in models)
         else:
             for profile in sorted(configured):
-                models = _models_for_profile(profile, configured)
-                out.extend(model["id"] for model in models)
-                has_auto |= bool(models) and profile in auto_profiles
+                entries = ([entry for entry in pool.entries() if pool._entry_profile(entry) == profile]
+                           if pool is not None else [])
+                # Empty products may publish only their advertised zero-rate models.
+                zero_only = bool(entries) and all(pool._zero_balance(entry, profile) for entry in entries)
+                if _profile_has_credits(profile) or zero_only:
+                    models = _models_for_profile(profile, configured)
+                    if zero_only:
+                        models = [model for model in models if _free_multiplier(model.get("credits"))]
+                    out.extend(model["id"] for model in models)
+                    has_auto |= bool(models) and profile in auto_profiles
         if has_auto:
             out.append("auto")
         return list(dict.fromkeys(out))
@@ -2510,10 +2686,12 @@ def current_model_details(region: str | None = None) -> list[dict]:
     if pool is None:
         return [{**item, **model_capabilities.describe_models(())} for item in details.values()]
     with pool._lock:
-        def record(profile: str, item: dict) -> None:
+        def record(profile: str, item: dict, *, zero: bool) -> None:
             name = item.get("id")
             if name not in details:
                 return
+            if zero and not _free_multiplier(item.get("credits")):
+                return  # Empty accounts cannot supply paid model rates.
             declarations.setdefault(name, []).append((profile, item))
             value = _multiplier_value(item.get("credits"))
             if value is None:
@@ -2530,16 +2708,23 @@ def current_model_details(region: str | None = None) -> list[dict]:
                 profile = entry.get("profile")
                 if not profile or not _in_region(profile, region):
                     continue
+                zero = pool._zero_balance(entry, profile)
+                if not zero and not pool._has_credit(entry, profile):
+                    continue
                 account = accounts.get(entry.get("account_key")) or {}
                 if account.get("profile") != profile:
                     continue
                 for item in _usable_models(_effective_account_scope(account, "serves")):
-                    record(profile, item)
+                    record(profile, item, zero=zero)
         else:
             configured = _configured_profiles(region)
             for profile in sorted(configured):
+                entries = [entry for entry in pool.entries() if pool._entry_profile(entry) == profile]
+                zero_only = bool(entries) and all(pool._zero_balance(entry, profile) for entry in entries)
+                if not (_profile_has_credits(profile) or zero_only):
+                    continue
                 for item in _models_for_profile(profile, configured):
-                    record(profile, item)
+                    record(profile, item, zero=zero_only)
     return [{**item, **model_capabilities.describe_models(declarations.get(item["id"], []))} for item in details.values()]
 
 
@@ -2953,8 +3138,8 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
         return "data: " + json.dumps(payload, ensure_ascii=False)
 
     lines = [_line({"role": "assistant", "content": ""})]
-    for i in range(0, len(reasoning), 48):
-        lines.append(_line({"reasoning_content": reasoning[i:i + 48]}))
+    if reasoning:
+        lines.append(_line({"reasoning_content": reasoning}))
     for i in range(0, len(content), 48):
         lines.append(_line({"content": content[i:i + 48]}))
     refusal = m.get("refusal") or ""
@@ -2975,6 +3160,120 @@ def _chat_result_to_sse_lines(m: dict) -> list[str]:
 
 def _network_error_text(error: Exception) -> str:
     return sanitize_log_text(f"{type(error).__name__}: {str(error).strip() or 'upstream transport failed'}", 512)
+
+async def _coalesce_reasoning_sse(lines, *, max_bytes=0):
+    """Coalesce normalized Chat SSE reasoning before downstream protocol adapters."""
+    pending: list[str] = []
+    template = None
+    buffer_budget = StreamOutputBudget(max_bytes)
+
+    def flush():
+        nonlocal template, pending
+        if not pending:
+            return None
+        source = template or {}
+        payload = dict(source)
+        choices = source.get("choices") or []
+        transformed = []
+        for index, raw_choice in enumerate(choices):
+            if not isinstance(raw_choice, dict):
+                transformed.append(raw_choice)
+                continue
+            choice = dict(raw_choice)
+            if index == 0:
+                delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+                delta = {key: value for key, value in delta.items() if key == "role"}
+                delta["reasoning_content"] = "".join(pending)
+                choice["delta"] = delta
+                choice["finish_reason"] = None
+            transformed.append(choice)
+        payload["choices"] = transformed
+        wire = "data: " + json.dumps(payload, ensure_ascii=False)
+        template = None
+        pending = []
+        return wire
+
+    async for raw_line in lines:
+        embedded_boundary = isinstance(raw_line, str) and raw_line.endswith(("\n", "\r"))
+        line = raw_line.rstrip("\r\n") if isinstance(raw_line, str) else raw_line
+        if not line or not line.strip():
+            if pending:
+                continue
+            yield line
+            continue
+        if not line.startswith("data:"):
+            # SSE comments and event/control lines do not end a reasoning run.
+            yield line
+            if embedded_boundary:
+                yield ""
+            continue
+        data = line[5:].strip()
+        if data == "[DONE]":
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+                yield ""
+            yield line
+            if embedded_boundary:
+                yield ""
+            continue
+        try:
+            event = json.loads(data)
+        except (TypeError, ValueError):
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+                yield ""
+            yield line
+            if embedded_boundary:
+                yield ""
+            continue
+        choices = event.get("choices") if isinstance(event, dict) else None
+        choice = choices[0] if isinstance(choices, list) and choices else None
+        delta = choice.get("delta") if isinstance(choice, dict) else None
+        reasoning = delta.get("reasoning_content") if isinstance(delta, dict) else None
+        if isinstance(reasoning, str) and reasoning:
+            if template is None:
+                template = event
+            pending.append(reasoning)
+            buffer_budget.charge_text(reasoning)
+            visible = any(delta.get(key) for key in ("content", "refusal", "tool_calls", "function_call"))
+            visible = visible or bool(choice.get("finish_reason"))
+            if not visible:
+                continue
+            flushed = flush()
+            if flushed is not None:
+                yield flushed
+                yield ""
+            transformed_choices = []
+            for index, raw_choice in enumerate(choices):
+                if not isinstance(raw_choice, dict):
+                    transformed_choices.append(raw_choice)
+                    continue
+                clean_choice = dict(raw_choice)
+                if index == 0:
+                    clean_delta = dict(delta)
+                    clean_delta.pop("reasoning_content", None)
+                    clean_choice["delta"] = clean_delta
+                transformed_choices.append(clean_choice)
+            event = dict(event)
+            event["choices"] = transformed_choices
+            if any(isinstance(item, dict) and
+                   (item.get("delta") or item.get("finish_reason") is not None)
+                   for item in transformed_choices):
+                yield "data: " + json.dumps(event, ensure_ascii=False)
+                if embedded_boundary:
+                    yield ""
+            continue
+        flushed = flush()
+        if flushed is not None:
+            yield flushed
+            yield ""
+        yield line
+        if embedded_boundary:
+            yield ""
+
+
 
 def _public_sse_line(line, model_name):
     if CONFIG.get("control_store") is not None and line.startswith("data:"):
@@ -3205,11 +3504,10 @@ async def _chat_sse_lines(url, headers, body, model_name, t0, rid, cred=None, *,
 async def _stream_upstream(url: str, headers: dict, body: dict,
                            model_name: str = "?", t0: float = 0.0, rid: str = "", cred=None):
     policy = body.pop(_REQUEST_POLICY_KEY, None) or _snapshot_stream_policy("chat", body)
-    if body.get("tools") and policy.mode == "compatible" and CONFIG.get("tool_stream_passthrough", True):
-        # Fork behavior: tool-bearing Chat streams forward frames by default; --tool-stream aggregate opts out.
-        policy = replace(policy, aggregate=False)
     sent = False
-    upstream = _chat_sse_lines(url, headers, body, model_name, t0, rid, cred, policy=policy)
+    upstream = _coalesce_reasoning_sse(_chat_sse_lines(
+        url, headers, body, model_name, t0, rid, cred, policy=policy),
+        max_bytes=policy.max_collect_bytes)
     try:
         try:
             async for line in upstream:
@@ -3629,9 +3927,10 @@ async def _stream_adapted(url, headers, body, model_name, t0, rid, cred=None, *,
                                               parallel_tool_calls=body.get("parallel_tool_calls", True),
                                               tool_registry=tool_registry))
     sent = False
-    upstream = _chat_sse_lines(
+    upstream = _coalesce_reasoning_sse(_chat_sse_lines(
         url, headers, body, model_name, t0, rid, cred,
-        policy=policy, tracker=tracker, state=state)
+        policy=policy, tracker=tracker, state=state),
+        max_bytes=policy.max_collect_bytes)
     try:
         try:
             async for line in upstream:
@@ -4001,13 +4300,7 @@ def main():
                          "重试与 --failover-max 换凭证重放）")
     ap.add_argument("--auto-trial", type=_boolean_arg, nargs="?", const=True,
                     default=None, help=argparse.SUPPRESS)
-    ap.add_argument("--tool-stream", choices=("passthrough", "aggregate"),
-                    default=os.environ.get("CODEBUDDY2API_TOOL_STREAM", "passthrough"),
-                    help="带 tools 的流式请求：passthrough 逐帧直出（默认）；aggregate 聚合校验后返回")
     args = ap.parse_args()
-    if args.tool_stream not in ("passthrough", "aggregate"):
-        ap.error("CODEBUDDY2API_TOOL_STREAM 必须为 passthrough 或 aggregate")
-    CONFIG["tool_stream_passthrough"] = args.tool_stream == "passthrough"
     if args.auto_trial is not None or "CODEBUDDY2API_AUTO_TRIAL" in os.environ:
         sys.stderr.write("[trial] AUTO_TRIAL / --auto-trial 已停用；请在 WebUI 凭证页手动领取体验积分。\n")
     del args.auto_trial
@@ -4086,10 +4379,11 @@ def main():
     sys.stderr.write("   GET/POST/DELETE /admin/credentials  (凭证池管理)\n")
     sys.stderr.write("   添加账号：python3 converter.py login（自动等待扫码并保存）\n")
     if credits_mod is not None:
-        sys.stderr.write("   GET  /admin/credits           (积分余额)\n")
+        sys.stderr.write("   GET  /admin/credits           (积分/签到状态)\n")
+        sys.stderr.write("   POST /admin/checkin           (仅签到，按日幂等)\n")
         sys.stderr.write("   POST /admin/sync              (同步余额、目录与用量，不签到)\n")
         sys.stderr.write("   POST /admin/credentials/{id}/reset-cooldown  (清除该账号冷却，仅本地)\n")
-        sys.stderr.write("   快过期积分优先调度已启用\n")
+        sys.stderr.write("   每日签到 + 快过期积分优先调度已启用\n")
     if args.api_key:
         sys.stderr.write("   鉴权已启用（API key 已设置）\n")
     if not CONFIG["admin_csrf"]:

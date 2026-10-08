@@ -70,6 +70,18 @@ def loads_strict(text):
     return json.loads(text, parse_constant=_reject_constant)
 
 
+class AuthTokenTypeError(ValueError):
+    """A credential token field is not a plaintext string (e.g. an encrypted envelope)."""
+
+
+def ensure_plaintext_tokens(auth: dict) -> None:
+    """Reject non-string token fields so encrypted envelope objects never reach upstream headers."""
+    for field in ("accessToken", "refreshToken"):
+        value = auth.get(field)
+        if value is not None and not isinstance(value, str):
+            raise AuthTokenTypeError(
+                f"auth.{field} 不是明文字符串（可能为加密信封格式），请改用 OAuth 登录获取明文凭据")
+
 def validate_cred_data(data) -> tuple[str | None, str | None]:
     """Validate credentials and return either the account UID or a safe failure reason."""
     if not isinstance(data, dict):
@@ -85,6 +97,11 @@ def validate_cred_data(data) -> tuple[str | None, str | None]:
     token = auth.get("accessToken") or auth.get("access_token") or auth.get("token")
     if not isinstance(token, str) or not token:
         return None, "缺少有效的 accessToken"
+    # Envelope objects must be rejected before persistence, including token aliases.
+    for field in ("accessToken", "access_token", "token", "refreshToken", "refresh_token"):
+        value = auth.get(field)
+        if value is not None and not isinstance(value, str):
+            return None, f"{field} 不是明文字符串（可能为加密信封格式）"
     for field in ("expiresAt", "lastRefreshTime"):
         value = auth.get(field)
         if value is None:
